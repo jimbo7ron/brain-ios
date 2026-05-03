@@ -13,12 +13,13 @@
 // Do NOT construct ad-hoc instances inside views — that would split the
 // auth state and break sync.
 //
-// M31 implements only `health()` — proves the URLSession plumbing works
-// end-to-end. Other methods are declared with their final signatures and
-// throw `BrainAPIClient.Error.notImplemented`. M32 wires login, M33 wires
-// sync, etc. Keeping the signatures pinned now means callers (sync
-// engine, login view) don't have to chase compile errors when each
-// method is filled in.
+// M31 wired `health()` to prove the URLSession plumbing works.
+// M32 wires `login()` and `revokeApiKey()` for the auth flow. Other
+// methods are declared with their final signatures and throw
+// `BrainAPIClient.Error.notImplemented` until their milestone lands —
+// M33 wires sync, etc. Keeping the signatures pinned means callers
+// (sync engine, login view) don't have to chase compile errors when
+// each method is filled in.
 
 import Foundation
 import SwiftUI
@@ -81,9 +82,25 @@ actor BrainAPIClient {
     private let session: URLSession
     private let decoder: JSONDecoder
     private let encoder: JSONEncoder
-    /// JWT or named API key. Sent as `Authorization: Bearer <key>`.
-    /// Either auth method is accepted by the server; iOS uses the named
-    /// API key minted at login (M30/M32).
+    /// The named API key minted at login (M30/M32) — the plaintext
+    /// `api_key.key` returned once on `/auth/login`. Sent as
+    /// `X-API-Key: <key>` on every authenticated request.
+    ///
+    /// Why API key (not JWT) for ongoing requests: after login we get
+    /// back both a JWT and a freshly-minted named API key. We persist
+    /// and use the API key because (a) it's what the user revokes when
+    /// they sign out, (b) it's longer-lived than the JWT (12 months
+    /// vs minutes), and (c) it produces clean per-device audit
+    /// attribution server-side — `get_api_key_user` sets
+    /// `request.state.api_key_id` and bumps `last_used_at` on the
+    /// device-key row, neither of which the JWT path does. The JWT is
+    /// discarded after the login response is consumed.
+    ///
+    /// Why `X-API-Key` (not `Authorization: Bearer`): the server's
+    /// bearer path runs `decode_jwt_token` first and 401s on a 32-byte
+    /// hex API key (it's not a JWT). Using `X-API-Key` routes through
+    /// `get_api_key_user`, which is the only path that emits audit
+    /// attribution and updates `last_used_at`.
     private var apiKey: String?
 
     // MARK: - Init
@@ -105,7 +122,8 @@ actor BrainAPIClient {
         self.encoder = encoder
     }
 
-    /// Update the bearer token after login (M32) or rotation.
+    /// Update the named API key after login (M32) or rotation. Sent as
+    /// `X-API-Key` on subsequent authenticated requests.
     func setApiKey(_ key: String?) {
         self.apiKey = key
     }
@@ -117,17 +135,43 @@ actor BrainAPIClient {
         try await get("/health", as: HealthResponse.self, requiresAuth: false)
     }
 
-    /// `POST /api/v1/auth/login` — implemented in M32.
+    /// `POST /api/v1/auth/login` — exchange email + password for a JWT
+    /// and (when `device_name` is supplied) a freshly-minted named API
+    /// key. The plaintext key on the response is shown exactly once;
+    /// callers must stash it in Keychain immediately. iOS always passes
+    /// a `deviceName` so the M30 server inlines the key on the response.
     func login(email: String, password: String, deviceName: String?) async throws -> LoginResponse {
-        _ = (email, password, deviceName)
-        throw Error.notImplemented("login")
+        let body = LoginRequest(email: email, password: password, deviceName: deviceName)
+        let payload: Data
+        do {
+            payload = try encoder.encode(body)
+        } catch {
+            // Encoding our own struct shouldn't fail; surface as a generic
+            // unknown error if it ever does so callers can show *something*.
+            throw Error.unknown(statusCode: -1, body: "failed to encode login body: \(error)")
+        }
+        let request = try makeRequest(
+            method: "POST",
+            path: "/api/v1/auth/login",
+            body: payload,
+            requiresAuth: false
+        )
+        return try await perform(request, as: LoginResponse.self)
     }
 
-    /// `DELETE /api/v1/auth/api-keys/{id}` — implemented in M32 (logout
-    /// revokes the device key server-side).
+    /// `DELETE /api/v1/auth/api-keys/{id}` — revoke a named API key
+    /// server-side. Used by sign-out to retire the device key before we
+    /// wipe Keychain. Authenticates with the current `apiKey` via
+    /// `X-API-Key` so the server can authorise the deletion against
+    /// the same user.
     func revokeApiKey(id: String) async throws {
-        _ = id
-        throw Error.notImplemented("revokeApiKey")
+        let request = try makeRequest(
+            method: "DELETE",
+            path: "/api/v1/auth/api-keys/\(id)",
+            body: nil,
+            requiresAuth: true
+        )
+        try await performIgnoringBody(request)
     }
 
     /// `GET /api/v1/sync` — implemented in M33.
@@ -199,7 +243,14 @@ actor BrainAPIClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if requiresAuth, let apiKey = apiKey {
-            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            // Use `X-API-Key` (not `Authorization: Bearer`) so the
+            // server routes through `get_api_key_user`, which sets
+            // `request.state.api_key_id` for audit logging and updates
+            // `last_used_at` on the device key row. The bearer path
+            // runs `decode_jwt_token` first and 401s on a non-JWT key.
+            // See the `apiKey` doc-comment above for the full
+            // rationale.
+            request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
         }
         if let idempotencyKey = idempotencyKey {
             request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
@@ -239,6 +290,36 @@ actor BrainAPIClient {
         }
     }
 
+    /// Like `perform`, but for endpoints that return no body we care
+    /// about (e.g. `DELETE /auth/api-keys/{id}`). Maps non-2xx statuses
+    /// onto the same typed error cases as `perform` so callers don't
+    /// need to special-case revocation failures.
+    private func performIgnoringBody(_ request: URLRequest) async throws {
+        let (data, response) = try await sessionData(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw Error.unknown(statusCode: -1, body: "non-HTTP response")
+        }
+        switch http.statusCode {
+        case 200..<300:
+            return
+        case 401:
+            throw Error.unauthorized
+        case 404:
+            throw Error.notFound
+        case 422:
+            let detail = (try? decoder.decode(ErrorEnvelope.self, from: data))?.detail
+                ?? String(data: data, encoding: .utf8)
+                ?? "validation failed"
+            throw Error.validationError(detail: detail)
+        case 429:
+            let retry = http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
+            throw Error.rateLimited(retryAfter: retry)
+        default:
+            let body = String(data: data, encoding: .utf8) ?? ""
+            throw Error.unknown(statusCode: http.statusCode, body: body)
+        }
+    }
+
     /// Wraps `URLSession.data(for:)` to convert URLError into our typed
     /// error case. Kept as a separate method so tests can override it.
     private func sessionData(for request: URLRequest) async throws -> (Data, URLResponse) {
@@ -246,6 +327,39 @@ actor BrainAPIClient {
             return try await session.data(for: request)
         } catch let urlError as URLError {
             throw Error.network(urlError)
+        }
+    }
+}
+
+// MARK: - User-facing error copy
+
+extension BrainAPIClient.Error {
+    /// Friendly one-liner suitable for surfacing in a SwiftUI error view.
+    /// Falls back to `description` for cases where the raw text is
+    /// already presentable (network errors, validation details).
+    var userFacingMessage: String {
+        switch self {
+        case .unauthorized:
+            return "That email and password didn't match. Try again."
+        case .notFound:
+            return "Server endpoint not found. Check the server URL in Settings."
+        case .rateLimited(let retry):
+            if let retry = retry {
+                return "Too many attempts — try again in \(Int(retry))s."
+            }
+            return "Too many attempts — try again soon."
+        case .validationError(let detail):
+            return detail
+        case .network:
+            return "Couldn't reach the server. Check your connection."
+        case .decoding:
+            return "Got an unexpected response from the server."
+        case .unknown(_, _):
+            return "Something went wrong. Try again."
+        case .notImplemented:
+            return "This feature isn't available yet."
+        case .invalidURL:
+            return "The configured server URL is invalid."
         }
     }
 }

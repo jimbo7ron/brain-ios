@@ -1,70 +1,91 @@
 // ContentView.swift
 // brain-ios
 //
-// Root view. For M31 this is a placeholder: we show a "not signed in"
-// state with a Sign In button (opens LoginPlaceholderView) and a gear
-// icon to reach Settings. M32 will gate this on a Keychain-stored API
-// key and route to the actual app once authenticated.
+// Root view. Auth-state-driven routing: present `LoginView` when the
+// session is signed out, otherwise show `SignedInPlaceholderView`
+// (replaced by the real Today view in M34). The single source of
+// truth is `AuthSession`, owned by `BrainApp` and injected via
+// `\.environment(AuthSession.self)`. ContentView observes the
+// session and re-renders when transitions fire — login flips the
+// session via `didSignIn(...)`, sign-out via `signedOut()`, and a
+// future M33 401-handler does the same. Keeping auth state out of
+// this view's `@State` means non-view callers can flip the UI
+// without owning a binding to it.
 
 import SwiftUI
 
 struct ContentView: View {
 
-    @State private var showingLogin = false
-    @State private var showingSettings = false
+    @Environment(\.brainAPIClient) private var apiClient
+    @Environment(AuthSession.self) private var authSession
+
+    @State private var showingSettings: Bool = false
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 24) {
-                Spacer()
-
-                Image(systemName: BrainSymbols.appGlyph)
-                    .font(.system(size: 72, weight: .regular))
-                    .foregroundStyle(BrainColors.violet.color)
-                    .accessibilityHidden(true)
-
-                Text("brain")
-                    .font(.system(size: 40, weight: .semibold, design: .rounded))
-
-                Text("Not signed in")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-
-                Button {
-                    showingLogin = true
-                } label: {
-                    Text("Sign in")
-                        .font(.headline)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
+        Group {
+            switch authSession.state {
+            case .signedOut:
+                NavigationStack {
+                    LoginView()
+                        .toolbar { settingsToolbarItem }
+                        .sheet(isPresented: $showingSettings) {
+                            SettingsView()
+                        }
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(BrainColors.violet.color)
-                .padding(.horizontal, 32)
-                .padding(.top, 16)
-
-                Spacer()
-            }
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showingSettings = true
-                    } label: {
-                        Image(systemName: BrainSymbols.settings)
-                    }
-                    .accessibilityLabel("Settings")
+            case .signedIn:
+                SignedInPlaceholderView {
+                    Task { @MainActor in await signOut() }
                 }
-            }
-            .sheet(isPresented: $showingLogin) {
-                LoginPlaceholderView()
-            }
-            .sheet(isPresented: $showingSettings) {
-                SettingsView()
             }
         }
+    }
+
+    // MARK: - Toolbar
+
+    @ToolbarContentBuilder
+    private var settingsToolbarItem: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            Button {
+                showingSettings = true
+            } label: {
+                Image(systemName: BrainSymbols.settings)
+            }
+            .accessibilityLabel("Settings")
+        }
+    }
+
+    // MARK: - Auth state
+
+    /// Sign-out flow: best-effort revoke the device key server-side,
+    /// then wipe Keychain, clear the in-memory API key on the
+    /// shared `BrainAPIClient`, and flip the session to
+    /// `.signedOut`. The revoke is best-effort because we always
+    /// want logout to succeed locally — if the device is offline or
+    /// the key was already revoked, the user is still effectively
+    /// signed out.
+    ///
+    /// Order matters: revoke (network) → wipe Keychain → clear API
+    /// client → flip session. The session flip lands last so any
+    /// view that re-renders on `.signedOut` (e.g. LoginView) reads a
+    /// consistent post-wipe state.
+    @MainActor
+    private func signOut() async {
+        // Capture the id before wiping Keychain, otherwise we'd revoke
+        // nothing.
+        let keyId = (try? KeychainStore.load(.apiKeyId)) ?? nil
+
+        if let keyId, let apiClient {
+            try? await apiClient.revokeApiKey(id: keyId)
+        }
+
+        // Local wipe always runs, even if the revoke threw.
+        try? KeychainStore.wipe()
+        await apiClient?.setApiKey(nil)
+        authSession.signedOut()
     }
 }
 
 #Preview {
     ContentView()
+        .environment(AuthSession(state: .signedOut))
 }

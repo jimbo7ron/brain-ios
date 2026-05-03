@@ -1,14 +1,14 @@
 // SettingsView.swift
 // brain-ios
 //
-// M31 settings screen. Users can:
-//   - View / edit the server URL (default https://api.mindkeeper.io)
-//   - "Sign out" — clears Keychain (no server-side revoke yet; M32 adds
-//     the DELETE /auth/api-keys/{id} call)
+// Settings screen. Users can view / edit the server URL (default
+// https://api.mindkeeper.io). The server URL is persisted in Keychain
+// alongside the API key so it survives app reinstalls and lives next
+// to the credential it pairs with.
 //
-// The server URL is persisted in Keychain alongside the (eventual) API
-// key so it survives app reinstalls and lives next to the credential
-// it pairs with.
+// Sign-out moved to the signed-in placeholder view in M32 so it can
+// own the full revoke + wipe + auth-state-flip flow; keeping it in
+// two places risked partial-revoke states.
 
 import SwiftUI
 
@@ -45,14 +45,8 @@ struct SettingsView: View {
                     .disabled(serverURL == savedServerURL || serverURL.isEmpty)
                 }
 
-                Section {
-                    Button(role: .destructive) {
-                        signOut()
-                    } label: {
-                        Label("Sign out", systemImage: BrainSymbols.signOut)
-                    }
-                } footer: {
-                    if let status = statusMessage {
+                if let status = statusMessage {
+                    Section {
                         Text(status)
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -61,7 +55,7 @@ struct SettingsView: View {
 
                 Section {
                     LabeledContent("Bundle id", value: "io.mindkeeper.brain")
-                    LabeledContent("Roadmap milestone", value: "M31")
+                    LabeledContent("Roadmap milestone", value: "M32")
                 }
             }
             .navigationTitle("Settings")
@@ -101,18 +95,6 @@ struct SettingsView: View {
         }
     }
 
-    private func signOut() {
-        // M32 will issue a DELETE /auth/api-keys/{id} before wiping
-        // Keychain so the device key is revoked server-side. For now,
-        // the local wipe is a no-op for the user (nothing's stored yet)
-        // but the call exercises the code path.
-        do {
-            try KeychainStore.wipe()
-            statusMessage = "Signed out (local wipe only — server revoke lands in M32)."
-        } catch {
-            statusMessage = "Couldn't sign out: \(error)"
-        }
-    }
 }
 
 #Preview {

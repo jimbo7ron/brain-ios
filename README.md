@@ -6,8 +6,9 @@ knowledge / todo / appointment system at [mindkeeper.io](https://mindkeeper.io).
 This repo is mirrored from the brain server's data model and uses the public
 HTTP API at `https://api.mindkeeper.io`. SwiftUI + SwiftData, iOS 17+.
 
-> **Status:** M31 (project foundation). Builds and launches but doesn't do
-> anything yet. See the [iOS roadmap](https://github.com/jimbo7ron/brain/blob/main/docs/ios-roadmap.md)
+> **Status:** M32 (login flow). Email/password sign-in mints a named device
+> API key against the brain server (M30) and stashes it in Keychain. Sync
+> engine lands in M33. See the [iOS roadmap](https://github.com/jimbo7ron/brain/blob/main/docs/ios-roadmap.md)
 > for the full milestone plan.
 
 ## Prerequisites
@@ -31,8 +32,10 @@ xcodegen generate
 open Brain.xcodeproj
 ```
 
-Then in Xcode: pick an iPhone simulator and hit Run. The app launches to a
-placeholder login screen. Nothing else is wired up yet — login lands in M32.
+Then in Xcode: pick an iPhone simulator and hit Run. The app launches to the
+login screen — sign in with your brain account email + password and the
+server auto-mints a device API key for the app to use. Sync engine + UI
+content lands in M33/M34.
 
 ## Configuring the server
 
@@ -54,11 +57,11 @@ brain-ios/
 ├── .swiftlint.yml                # lint config
 ├── Sources/Brain/
 │   ├── BrainApp.swift            # @main, sets up SwiftData ModelContainer
-│   ├── ContentView.swift         # placeholder root view
+│   ├── ContentView.swift         # auth-state-driven root router
 │   ├── Networking/               # BrainAPIClient (actor), DTOs
 │   ├── Storage/                  # KeychainStore, SwiftData models
 │   ├── Theme/                    # color palette, SF Symbol map
-│   └── Views/                    # LoginPlaceholderView, SettingsView
+│   └── Views/                    # LoginView, SignedInPlaceholderView, SettingsView
 └── .github/workflows/ci.yml      # SwiftLint on PRs
 ```
 
