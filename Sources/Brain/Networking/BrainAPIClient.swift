@@ -188,7 +188,16 @@ actor BrainAPIClient {
     /// client, and the call sites.
     func executeMutation(_ item: MutationQueueItem) async throws {
         let key = item.idempotencyKey.uuidString
-        let resourceId = item.resourceId
+        // Validate `resourceId` shape before splicing into a URL path.
+        // The queue is local-only and SwiftData rows can't be tampered
+        // with by a remote attacker, but defence-in-depth: a future
+        // bug that lets a non-UUID slip in (e.g. a typo'd literal in a
+        // call site) shouldn't be able to inject path segments. UUIDs
+        // are the only legal shape for the resources the queue
+        // currently mutates.
+        guard let resourceId = Self.validateResourceId(item.resourceId) else {
+            throw Error.validationError(detail: "invalid resourceId on queue row: \(item.resourceId)")
+        }
         guard let op = MutationOp(rawValue: item.op) else {
             // Unknown slug — almost certainly a downgrade from a build
             // that introduced a new op. Surface as `notImplemented` so
@@ -413,6 +422,17 @@ actor BrainAPIClient {
             let body = String(data: data, encoding: .utf8) ?? ""
             throw Error.unknown(statusCode: http.statusCode, body: body)
         }
+    }
+
+    /// Validate that `raw` is a UUID before it gets spliced into a URL
+    /// path. Returns the canonical (lowercased, hyphenated) string on
+    /// success or nil if the input doesn't parse as a UUID. We don't
+    /// just trust `UUID.init?` because it accepts both upper- and
+    /// lower-case input; canonicalising here keeps server-side caches
+    /// (Idempotency-Key dedupe, audit logs) keyed off a single shape.
+    fileprivate static func validateResourceId(_ raw: String) -> String? {
+        guard let uuid = UUID(uuidString: raw) else { return nil }
+        return uuid.uuidString.lowercased()
     }
 
     /// Wraps `URLSession.data(for:)` to convert URLError into our typed

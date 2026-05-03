@@ -22,6 +22,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.brainAPIClient) private var apiClient
     @Environment(AuthSession.self) private var authSession
+    @Environment(\.mutationQueue) private var mutationQueue
 
     @State private var serverURL: String = ""
     @State private var savedServerURL: String = ""
@@ -138,16 +139,38 @@ struct SettingsView: View {
     }
 
     /// Sign-out flow lifted from the M32 ContentView. Order matters:
-    /// best-effort revoke (network) → wipe Keychain → clear API
-    /// client → flip session. The session flip lands last so any
-    /// view that re-renders on `.signedOut` (e.g. LoginView) reads a
-    /// consistent post-wipe state.
+    /// best-effort revoke (network) -> wipe queue -> wipe Keychain
+    /// -> clear API client -> flip session. The session flip lands
+    /// last so any view that re-renders on `.signedOut` (e.g.
+    /// LoginView) reads a consistent post-wipe state.
+    ///
+    /// Queue-wipe placement: we clear the queue between the revoke
+    /// and the Keychain wipe so that a network-revoke failure (which
+    /// short-circuits before we reach `clear()`) leaves the queue
+    /// intact — the user might tap "Sign out" again after the
+    /// network recovers. Once revoke succeeds we commit to the
+    /// local wipe; the queue must go with it, otherwise User A's
+    /// queued mutations would replay against User B's tenant after
+    /// a sign-in switch. We also wipe if there's no key id to
+    /// revoke (already-broken state) since there's nothing to
+    /// preserve.
     @MainActor
     private func signOut() async {
         let keyId = (try? KeychainStore.load(.apiKeyId)) ?? nil
         if let keyId, let apiClient {
-            try? await apiClient.revokeApiKey(id: keyId)
+            do {
+                try await apiClient.revokeApiKey(id: keyId)
+            } catch {
+                // Revoke failed — leave the queue and Keychain
+                // alone so the user can retry sign-out once the
+                // network is healthy again. Surface the failure as
+                // an inline message so the button isn't a silent
+                // no-op.
+                statusMessage = "Couldn't sign out (revoke failed): \(error). Try again."
+                return
+            }
         }
+        mutationQueue?.clear()
         try? KeychainStore.wipe()
         await apiClient?.setApiKey(nil)
         authSession.signedOut()

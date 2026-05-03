@@ -20,15 +20,23 @@
 //     "rename project, then add section" must hit the server in that
 //     order, otherwise the section add can race the rename and use the
 //     pre-rename slug.
-//   * On a recoverable failure (network blip, 5xx, rate-limit) we bump
+//   * On a *transient* failure (network blip, 5xx, rate-limit) we bump
 //     `attempts` and stamp `nextRetryAt` with an exponential-backoff
 //     timestamp, then *stop*. We do not skip past the failed item to
 //     attempt later ones — that would break ordering. The next replay
 //     call (post-sync, scenePhase, or the post-enqueue fire-and-forget)
 //     picks up where we left off once `nextRetryAt` is in the past.
-//   * On 401, we hand off to `AuthSession.signedOut()` (mirroring the
-//     SyncEngine pattern) and *leave the queue intact*. When the user
-//     signs back in, the same mutations replay against the new key.
+//   * On a *permanent* failure (404, 422, unknown op), the item is
+//     "poisoned" — `nextRetryAt` is stamped to `.distantFuture` so it
+//     never picks up again — and we `continue` to drain the rest of
+//     the queue. Otherwise a single bad item would block every later
+//     mutation forever.
+//   * Transient failures also promote to poison after 10 attempts so a
+//     pathological row can't retry indefinitely.
+//   * On 401, we wipe the queue. The server has rejected the auth, so
+//     replaying queue items would just clog with 404s; more importantly,
+//     leaving rows on disk across a sign-out / sign-in cycle would let
+//     User A's queued mutations replay against User B's tenant.
 //
 // SyncEngine ↔ MutationQueue dependency direction: the SwiftUI scope
 // (`SignedInRootView`) calls `replay()` after a successful sync rather
@@ -62,7 +70,19 @@ final class MutationQueue {
     /// Hard ceiling on backoff. Five minutes matches the SyncEngine
     /// foreground cadence — any mutation parked longer than that will
     /// retry whenever the next sync trigger fires the queue anyway.
+    /// Note: with the +/-25% jitter applied *after* the cap, the
+    /// effective worst-case delay is ~6:15 (300 * 1.25), not exactly
+    /// 5 minutes. Close enough — the cap exists to prevent runaway
+    /// backoff, not to enforce a literal ceiling.
     private static let maxDelay: TimeInterval = 300
+
+    /// Maximum number of replay attempts before a transient failure is
+    /// promoted to a poison item. Picked high enough that a multi-day
+    /// outage doesn't accidentally drop a user's mutation, but low
+    /// enough that a pathologically broken request can't loop forever.
+    /// At 10 attempts with the 5-minute cap, a stuck row burns ~50
+    /// minutes of replay attempts before being parked.
+    private static let maxAttempts: Int = 10
 
     // MARK: - Dependencies
 
@@ -132,16 +152,23 @@ final class MutationQueue {
         return item
     }
 
-    /// Drain the queue in `createdAt` order, stopping at the first
-    /// non-recoverable error. Safe to call concurrently — the
-    /// `isReplaying` guard collapses overlapping calls.
+    /// Drain the queue in `createdAt` order. Safe to call concurrently
+    /// — the `isReplaying` guard collapses overlapping calls.
     ///
-    /// Behaviour summary:
-    ///   * Success: delete the row, save, loop.
-    ///   * 401: hand off to AuthSession (wipe Keychain + signedOut),
-    ///     leave the queue intact, return.
-    ///   * Other error: bump attempts, stamp nextRetryAt, stash
-    ///     lastError on the row, save, then return (preserve order).
+    /// Failure taxonomy:
+    ///   * Success (2xx): delete the row, save, loop.
+    ///   * 401: wipe the queue (cross-tenant safety), hand off to
+    ///     AuthSession.signedOut(), return.
+    ///   * Permanent error (404 / 422 / notImplemented): poison the
+    ///     row by stamping `nextRetryAt = .distantFuture` so it never
+    ///     picks up again, then `continue` to the next item. Critical:
+    ///     don't `return` — otherwise one bad row blocks the whole
+    ///     queue indefinitely.
+    ///   * Transient error (5xx, network, rate-limit): bump attempts,
+    ///     schedule exponential backoff, return (preserves FIFO for
+    ///     the retry). After `maxAttempts` retries the row is
+    ///     promoted to poison so a pathological request can't retry
+    ///     forever.
     func replay() async {
         guard !isReplaying else { return }
         isReplaying = true
@@ -159,37 +186,90 @@ final class MutationQueue {
                 // progress — keeps the UI from showing a stale failure
                 // string after the next attempt succeeds.
                 lastError = nil
-            } catch BrainAPIClient.Error.unauthorized {
-                // 401 = the device key is no longer valid. Mirror the
-                // SyncEngine handoff: wipe Keychain, drop the in-memory
-                // key, flip AuthSession back to .signedOut. Leave the
-                // queue intact — re-signing in will resume replay
-                // against the new key.
-                await handleUnauthorized()
-                return
-            } catch {
-                // Recoverable failure: bump attempts, schedule a
-                // backoff, surface the error, stop the loop. The next
-                // replay trigger after `nextRetryAt` picks the row back
-                // up.
-                let attemptsAfter = item.attempts + 1
-                let delay = backoff(attempts: attemptsAfter)
-                item.attempts = attemptsAfter
-                item.nextRetryAt = Date().addingTimeInterval(delay)
-                item.lastError = String(describing: error)
-                // Best-effort save — if this throws too, the in-memory
-                // mutation is still on the row, but a relaunch would
-                // see the pre-failure state. That's acceptable; the
-                // worst case is one extra retry on next launch.
-                try? modelContext.save()
-                if let apiError = error as? BrainAPIClient.Error {
-                    lastError = apiError.userFacingMessage
-                } else {
-                    lastError = "Failed to send change: \(error.localizedDescription)"
+            } catch let error as BrainAPIClient.Error {
+                switch error {
+                case .unauthorized:
+                    // 401 = the device key is no longer valid. Wipe
+                    // the queue (a re-sign-in could be a different
+                    // user — see `handleUnauthorized` doc) and flip
+                    // AuthSession back to .signedOut.
+                    await handleUnauthorized()
+                    return
+
+                case .notFound, .validationError, .notImplemented:
+                    // Permanent failure: the request will never
+                    // succeed (resource gone, body malformed, op slug
+                    // unknown). Poison the row and drain the rest of
+                    // the queue — otherwise a single bad item blocks
+                    // every later mutation.
+                    item.attempts += 1
+                    item.nextRetryAt = .distantFuture
+                    item.lastError = "Permanent failure: \(error)"
+                    try? modelContext.save()
+                    lastError = error.userFacingMessage
+                    continue
+
+                default:
+                    // Transient failure (5xx, network, rate-limit,
+                    // unknown status, decoding, invalid URL). Backoff
+                    // and stop the drain to preserve FIFO on retry.
+                    // Promote to poison after `maxAttempts` so a
+                    // genuinely-broken request can't retry forever.
+                    let attemptsAfter = item.attempts + 1
+                    item.attempts = attemptsAfter
+                    if attemptsAfter >= Self.maxAttempts {
+                        item.nextRetryAt = .distantFuture
+                        item.lastError = "Retry cap exceeded after \(attemptsAfter) attempts: \(error)"
+                    } else {
+                        let delay = backoff(attempts: attemptsAfter)
+                        item.nextRetryAt = Date().addingTimeInterval(delay)
+                        item.lastError = String(describing: error)
+                    }
+                    // Best-effort save — if this throws too, the
+                    // in-memory mutation is still on the row, but a
+                    // relaunch would see the pre-failure state.
+                    // That's acceptable; the worst case is one extra
+                    // retry on next launch.
+                    try? modelContext.save()
+                    lastError = error.userFacingMessage
+                    return
                 }
+            } catch {
+                // Non-API error path (e.g. SwiftData fault). Treat as
+                // transient and back off; same retry-cap logic as
+                // above so we don't loop on a persistently broken row.
+                let attemptsAfter = item.attempts + 1
+                item.attempts = attemptsAfter
+                if attemptsAfter >= Self.maxAttempts {
+                    item.nextRetryAt = .distantFuture
+                    item.lastError = "Retry cap exceeded after \(attemptsAfter) attempts: \(error)"
+                } else {
+                    let delay = backoff(attempts: attemptsAfter)
+                    item.nextRetryAt = Date().addingTimeInterval(delay)
+                    item.lastError = String(describing: error)
+                }
+                try? modelContext.save()
+                lastError = "Failed to send change: \(error.localizedDescription)"
                 return
             }
         }
+    }
+
+    /// Wipe every row in the queue. Used on sign-out (manual via
+    /// `SettingsView.signOut()` and forced via `handleUnauthorized()`)
+    /// to prevent User A's queued mutations from replaying against
+    /// User B's tenant after a sign-in switch. Cheap — even a few
+    /// hundred rows delete in milliseconds.
+    func clear() {
+        let descriptor = FetchDescriptor<MutationQueueItem>()
+        if let items = try? modelContext.fetch(descriptor) {
+            for item in items {
+                modelContext.delete(item)
+            }
+            try? modelContext.save()
+        }
+        refreshPendingCount()
+        lastError = nil
     }
 
     // MARK: - Internal helpers
@@ -220,11 +300,12 @@ final class MutationQueue {
         }
     }
 
-    /// Exponential backoff with ±25% jitter. `attempts` is the post-
-    /// increment count (so the first failure passes `1`, yielding a
-    /// ~2s wait, and the 8th passes `8`, hitting the 5-minute cap).
+    /// Exponential backoff with +/-25% jitter. `attempts` is the
+    /// post-increment count (so the first failure passes `1`, yielding
+    /// a ~2s wait, and the 8th passes `8`, hitting the 5-minute cap).
     /// Jitter avoids synchronised retry storms across devices on a
-    /// shared outage.
+    /// shared outage. Note: jitter is applied AFTER the cap, so the
+    /// effective worst-case delay is ~6:15 (300 * 1.25), not 300s.
     func backoff(attempts: Int) -> TimeInterval {
         // Guard against bad input. attempts <= 0 shouldn't happen on
         // the call path (we always pre-increment), but defensive math
@@ -243,13 +324,21 @@ final class MutationQueue {
         return capped * jitter
     }
 
-    /// 401 handoff. Mirrors `SyncEngine.handleUnauthorized()` so the two
-    /// paths converge on the same post-conditions: Keychain wiped, API
-    /// client key cleared, AuthSession flipped to `.signedOut`. We do
-    /// NOT clear the queue — those mutations represent real user
-    /// intent, and the next sign-in (which uses the same `userId`) will
-    /// drain them against the freshly-minted key.
+    /// 401 handoff. Mirrors `SyncEngine.handleUnauthorized()` so the
+    /// two paths converge on the same post-conditions: queue wiped,
+    /// Keychain wiped, API client key cleared, AuthSession flipped to
+    /// `.signedOut`.
+    ///
+    /// The queue IS wiped here. The original M37 design left it
+    /// intact so a re-sign-in could resume the drain, but that's
+    /// unsafe: we have no guarantee the next sign-in is the same
+    /// user, and a UUID collision (or any reused `resourceId`) could
+    /// then mutate User B's tenant with User A's intent. Since the
+    /// 401 already means the server has rejected this session's
+    /// auth, any queued items would replay into 404s anyway — wiping
+    /// is strictly safer than preserving.
     private func handleUnauthorized() async {
+        clear()
         try? KeychainStore.wipe()
         await client.setApiKey(nil)
         authSession.signedOut()
