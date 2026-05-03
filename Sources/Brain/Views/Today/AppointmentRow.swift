@@ -22,11 +22,12 @@ struct AppointmentRow: View {
 
     /// "10:00 AM – 11:00 AM" (or "10:00 – 11:00" depending on locale)
     /// if both ends present, "10:00 AM" if only the start, empty
-    /// string if neither. The server emits ISO-8601 UTC timestamps
-    /// (`2026-05-03T10:00:00Z`); we parse them through
-    /// `ISO8601DateFormatter` and render with `DateFormatter` in the
-    /// user's current locale + timezone so a 10:00 UTC appointment
-    /// shows as 11:00 in BST, 03:00 in PT, etc.
+    /// string if neither. Server emits naive
+    /// `yyyy-MM-dd'T'HH:mm:ss[.SSSSSS][Z]` timestamps; production
+    /// server is pinned to UTC (per roadmap M28), so we parse them
+    /// in UTC and render with `DateFormatter` in the user's current
+    /// locale + `TimeZone.current` — a 10:00 UTC appointment shows
+    /// as 11:00 in BST, 03:00 in PT, etc.
     private var timeRange: String {
         let start = formatClock(note.appointmentStartTime)
         let end = formatClock(note.appointmentEndTime)
@@ -34,31 +35,26 @@ struct AppointmentRow: View {
         return start
     }
 
-    /// Parse a server-emitted ISO-8601 timestamp and format it as a
-    /// short locale-aware time. Falls back to the raw string if the
+    /// Parse a server-emitted timestamp and format it as a short
+    /// locale-aware time. Falls back to the raw string if the
     /// payload doesn't parse — better to show something than crash
     /// on malformed input.
     private func formatClock(_ raw: String?) -> String {
         guard let raw, !raw.isEmpty else { return "" }
-        guard let date = AppointmentRow.iso8601.date(from: raw) else { return raw }
-        return AppointmentRow.timeFormatter.string(from: date)
+        guard let date = ServerDate.parse(raw) else { return raw }
+        return AppointmentRow.displayTimeFormatter.string(from: date)
     }
-
-    /// Shared parser for the server's ISO-8601 timestamps. `Z`
-    /// suffix is required, which the server always emits.
-    private static let iso8601: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter
-    }()
 
     /// Shared short-time formatter. Picks up the user's current
     /// locale and timezone automatically (e.g. "10:00 AM" in en_US,
-    /// "10:00" in en_GB).
-    private static let timeFormatter: DateFormatter = {
+    /// "10:00" in en_GB) — `TimeZone.current` is the explicit
+    /// reminder that we're crossing the UTC → local boundary here.
+    private static let displayTimeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.timeStyle = .short
         formatter.dateStyle = .none
+        formatter.timeZone = TimeZone.current
+        formatter.locale = Locale.current
         return formatter
     }()
 

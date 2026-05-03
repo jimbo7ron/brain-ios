@@ -50,10 +50,11 @@ struct TodayView: View {
     private var openTodos: [LocalNote]
 
     /// All non-archived appointments. We filter to "today" in Swift
-    /// because the appointment start time is stored as a full ISO
-    /// UTC timestamp string and "today" depends on the user's local
-    /// timezone — a server-side date prefix won't be correct in
-    /// non-UTC zones, so we parse and compare via `Calendar`.
+    /// because the appointment start time is a server-emitted naive
+    /// `yyyy-MM-dd'T'HH:mm:ss[.SSSSSS][Z]` string — the production
+    /// server is pinned to UTC (per roadmap M28), so we parse it as
+    /// UTC and compare via `Calendar.current` to land on the user's
+    /// local "today".
     @Query(
         filter: #Predicate<LocalNote> {
             $0.type == "appointment" && $0.archived == false && $0.appointmentStartTime != nil
@@ -115,23 +116,23 @@ struct TodayView: View {
 
     private var appointmentsToday: [LocalNote] {
         let calendar = Calendar.current
-        return appointments.filter {
-            guard let raw = $0.appointmentStartTime,
-                  let date = TodayView.iso8601.date(from: raw)
-            else { return false }
-            // Compare in the user's local timezone — a UTC-suffixed
-            // ISO timestamp can land on a different calendar day in
-            // BST, PT, JST, etc. than its date prefix suggests.
-            return calendar.isDateInToday(date)
-        }
+        return appointments
+            .compactMap { note -> (LocalNote, Date)? in
+                guard
+                    let raw = note.appointmentStartTime,
+                    let date = ServerDate.parse(raw),
+                    calendar.isDateInToday(date)
+                else { return nil }
+                return (note, date)
+            }
+            // Sort by parsed instant — `appointmentStartTime`'s raw
+            // string sort almost works, but a row missing a
+            // fractional component would order before one that has
+            // one at the same wall-clock minute. Sorting by the
+            // parsed `Date` makes the order TZ-correct and stable.
+            .sorted { $0.1 < $1.1 }
+            .map { $0.0 }
     }
-
-    /// Shared parser for the server's ISO-8601 UTC timestamps.
-    private static let iso8601: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter
-    }()
 
     var body: some View {
         NavigationStack {
