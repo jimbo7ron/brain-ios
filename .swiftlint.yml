@@ -1,0 +1,54 @@
+# SwiftLint configuration for brain-ios.
+# See https://realm.github.io/SwiftLint/rule-directory.html
+
+included:
+  - Sources
+
+excluded:
+  - .build
+  - DerivedData
+  - Brain.xcodeproj
+
+disabled_rules:
+  # We use trailing commas in multi-line collections; Xcode auto-format does too.
+  - trailing_comma
+  # SwiftUI ViewBuilders create lots of visually nested closures; the default
+  # depth limits are too tight in practice.
+  - function_body_length
+
+opt_in_rules:
+  - empty_count
+  - explicit_init
+  - first_where
+  - force_unwrapping
+  - implicit_return
+  - last_where
+  - prefer_self_type_over_type_of_self
+  - sorted_first_last
+  - toggle_bool
+  - unused_import
+
+line_length:
+  warning: 120
+  error: 160
+  ignores_comments: true
+  ignores_urls: true
+
+type_body_length:
+  warning: 400
+  error: 600
+
+file_length:
+  warning: 600
+  error: 1000
+
+identifier_name:
+  min_length:
+    warning: 2
+  excluded:
+    - id
+    - i
+    - x
+    - y
+
+reporter: "xcode"
