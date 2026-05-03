@@ -174,6 +174,60 @@ actor BrainAPIClient {
         try await performIgnoringBody(request)
     }
 
+    /// Replay one queued mutation (M37). The replayer hands us the queue
+    /// row; we route by `MutationOp` to the matching endpoint and thread
+    /// the row's `idempotencyKey` UUID into the `Idempotency-Key` header
+    /// so retries are server-deduped.
+    ///
+    /// Currently only the `.completeTodo` op is wired end-to-end — M36
+    /// is the first feature that will exercise the queue, and it only
+    /// needs `POST /api/v1/notes/{id}/complete`. The other cases throw
+    /// `notImplemented` until the milestones that own them (M38+) fill
+    /// them in. The dispatch shape is fixed now so those milestones
+    /// don't have to chase compile errors across the queue, the API
+    /// client, and the call sites.
+    func executeMutation(_ item: MutationQueueItem) async throws {
+        let key = item.idempotencyKey.uuidString
+        let resourceId = item.resourceId
+        guard let op = MutationOp(rawValue: item.op) else {
+            // Unknown slug — almost certainly a downgrade from a build
+            // that introduced a new op. Surface as `notImplemented` so
+            // the replayer parks the row with `lastError` set; the user
+            // can drop the queue from a debug menu if needed.
+            throw Error.notImplemented(item.op)
+        }
+        switch op {
+        case .completeTodo:
+            // POST with no body — the server reads `{note_id}` from the
+            // path. We still pass `body: nil` (not an empty `Data()`) so
+            // URLSession doesn't send a 0-byte payload that confuses
+            // some intermediaries.
+            let request = try makeRequest(
+                method: "POST",
+                path: "/api/v1/notes/\(resourceId)/complete",
+                body: nil,
+                requiresAuth: true,
+                idempotencyKey: key
+            )
+            try await performIgnoringBody(request)
+        case .uncompleteTodo,
+             .createTodo,
+             .updateTodo,
+             .archiveNote,
+             .createProject,
+             .updateProject,
+             .addSection:
+            // TODO(M38+): Wire each of these to its server endpoint.
+            // The shape is the same as `.completeTodo`: build a request
+            // via `makeRequest(...)` with `idempotencyKey: key`, then
+            // perform/perfomIgnoringBody depending on whether the caller
+            // cares about the response body. Keep `body` typed via the
+            // structs in `DTOs.swift` (e.g. `UpdateNotePayload`) and
+            // decode `item.payload` into them at the dispatch site.
+            throw Error.notImplemented("executeMutation(\(op.rawValue))")
+        }
+    }
+
     /// `GET /api/v1/sync` — incremental delta feed implemented in M33.
     ///
     /// `since` is the `server_time` cursor returned by the previous call

@@ -45,6 +45,15 @@ struct BrainApp: App {
     /// view layer doesn't have to manage that lifetime.
     @StateObject private var syncEngine: SyncEngine
 
+    /// Single shared mutation queue (M37). Drains queued offline writes
+    /// and threads `Idempotency-Key` on every replay so the server
+    /// dedupes retries. Held as `@State` (not `@StateObject`) because
+    /// `MutationQueue` is `@Observable` rather than `ObservableObject`
+    /// — that's the modern Swift 5.9+ flavour and matches `AuthSession`.
+    /// Same lifetime as `syncEngine`: built once in `init`, shared
+    /// across the scene tree via `\.mutationQueue`.
+    @State private var mutationQueue: MutationQueue
+
     /// `@MainActor` because `AuthSession` and `SyncEngine` are both
     /// main-actor-isolated and we construct them here. SwiftUI
     /// already runs `App.init` on the main thread; this just makes
@@ -61,7 +70,7 @@ struct BrainApp: App {
                 LocalNote.self,
                 LocalAppointment.self,
                 LocalSyncState.self,
-                LocalMutationQueueItem.self,
+                MutationQueueItem.self,
             ])
             let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
             modelContainer = try ModelContainer(for: schema, configurations: [configuration])
@@ -113,6 +122,19 @@ struct BrainApp: App {
             authSession: authSession
         )
         _syncEngine = StateObject(wrappedValue: engine)
+
+        // Mutation queue (M37) gets its own `ModelContext` for the same
+        // reason as the sync engine: lifetime tied to the app, not the
+        // view tree. Sharing the SwiftData container is what makes the
+        // `MutationQueueItem` rows visible to a future debug surface
+        // running from a different context (e.g. a Settings inspector).
+        let queueContext = ModelContext(modelContainer)
+        let queue = MutationQueue(
+            modelContext: queueContext,
+            client: apiClient,
+            authSession: authSession
+        )
+        _mutationQueue = State(initialValue: queue)
     }
 
     var body: some Scene {
@@ -122,6 +144,10 @@ struct BrainApp: App {
                 .environment(authSession)
                 .environment(\.syncEngine, syncEngine)
                 .environmentObject(syncEngine)
+                // M37: expose the mutation queue so views can `enqueue`
+                // and so `SignedInRootView` can call `replay()` after a
+                // successful sync / on scenePhase resume.
+                .environment(\.mutationQueue, mutationQueue)
         }
         .modelContainer(modelContainer)
     }
