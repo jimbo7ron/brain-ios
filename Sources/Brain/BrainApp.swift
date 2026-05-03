@@ -39,7 +39,7 @@ struct BrainApp: App {
     /// `GET /api/v1/sync` (M33). `@StateObject` keeps it alive across
     /// SwiftUI re-renders and lets views observe `isSyncing` etc. via
     /// `@EnvironmentObject` or `\.syncEngine`. We build it in `init`
-    /// rather than lazily so `SignedInPlaceholderView`'s `.task` can
+    /// rather than lazily so the M34 `SignedInRootView`'s `.task` can
     /// trigger the first sync without an extra plumbing hop. The
     /// engine owns the foreground 5-minute Timer internally so the
     /// view layer doesn't have to manage that lifetime.
