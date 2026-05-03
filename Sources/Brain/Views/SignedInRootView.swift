@@ -29,6 +29,7 @@ import SwiftUI
 struct SignedInRootView: View {
 
     @Environment(\.syncEngine) private var syncEngine
+    @Environment(\.mutationQueue) private var mutationQueue
     @Environment(\.scenePhase) private var scenePhase
 
     @State private var selectedTab: Tab = .today
@@ -60,15 +61,26 @@ struct SignedInRootView: View {
             // First sync of the signed-in session. Safe to call
             // unconditionally — `SyncEngine.sync()` debounces against
             // the .task + scenePhase + Timer triple-trigger and
-            // de-dupes overlapping calls.
+            // de-dupes overlapping calls. After the read pass returns,
+            // drain any mutations the user enqueued offline (M37). The
+            // queue's own `isReplaying` guard de-dupes overlapping
+            // replays, so it's safe even if a replay is already in
+            // flight from a `enqueue`'s fire-and-forget Task.
             await syncEngine?.sync()
+            await mutationQueue?.replay()
         }
         .onChange(of: scenePhase) { _, newPhase in
             // Resume sync on foreground re-entry. The same debounce
             // covers the rapid .task → scenePhase sequence on cold
-            // launch.
+            // launch. Mutation queue replay rides on the same trigger
+            // — backgrounded mutations (alarms, push, etc.) become
+            // possible in M41, but for now scenePhase is the right
+            // moment to nudge the queue.
             if newPhase == .active {
-                Task { await syncEngine?.sync() }
+                Task {
+                    await syncEngine?.sync()
+                    await mutationQueue?.replay()
+                }
             }
         }
     }

@@ -70,6 +70,17 @@ final class SyncEngine: ObservableObject {
     private let modelContext: ModelContext
     private let authSession: AuthSession
 
+    /// Optional back-reference to the mutation queue. Set once via
+    /// `attach(mutationQueue:)` after both engines are constructed —
+    /// we can't pass it via init because `MutationQueue` itself doesn't
+    /// exist yet at the moment `BrainApp` builds the SyncEngine. Two
+    /// uses: (a) the foreground Timer fires `replay()` alongside
+    /// `sync()` so queue draining isn't gated solely on `.task` /
+    /// scenePhase; (b) on a 401 we wipe the queue so a re-sign-in by
+    /// a different user can't replay the prior session's mutations.
+    /// `weak` to avoid the engines retaining each other.
+    private weak var mutationQueue: MutationQueue?
+
     /// Wall-clock timestamp of the last successful sync. Surfaces as a
     /// "Synced 2m ago" hint in the placeholder view; nil before the
     /// first successful pull this launch.
@@ -98,6 +109,13 @@ final class SyncEngine: ObservableObject {
         self.client = client
         self.modelContext = modelContext
         self.authSession = authSession
+    }
+
+    /// Wire the mutation queue back-reference. Called once from
+    /// `BrainApp.init` after both engines are constructed. See
+    /// `mutationQueue` for the rationale.
+    func attach(mutationQueue: MutationQueue) {
+        self.mutationQueue = mutationQueue
     }
 
     // Note: we deliberately do NOT invalidate the Timer in `deinit`.
@@ -184,6 +202,13 @@ final class SyncEngine: ObservableObject {
         let timer = Timer.scheduledTimer(withTimeInterval: Self.foregroundInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 await self?.sync()
+                // Drain any queued offline mutations on the same
+                // cadence. The `.task` and scenePhase triggers in
+                // `SignedInRootView` cover startup and foreground
+                // re-entry; this Timer is the third path that fires
+                // while the app stays in the foreground for >5
+                // minutes (e.g. user is reading a long note).
+                await self?.mutationQueue?.replay()
             }
         }
         timer.tolerance = 30
@@ -199,15 +224,18 @@ final class SyncEngine: ObservableObject {
     }
 
     /// 401 handoff. Order: stop the Timer (no more retries), wipe
-    /// Keychain (revokes the local copy of the dead key), clear the
-    /// API client's in-memory key (so any in-flight tail callers
-    /// don't immediately re-401), then flip AuthSession to
-    /// `.signedOut` (which causes ContentView to render LoginView).
-    /// Cursor stays put — when the user signs back in, sync resumes
-    /// from the same point. Clean `lastError = nil` because the user
-    /// is about to see LoginView, not the sync status pill.
+    /// the mutation queue (cross-tenant safety — a re-sign-in might
+    /// be a different user), wipe Keychain (revokes the local copy
+    /// of the dead key), clear the API client's in-memory key (so
+    /// any in-flight tail callers don't immediately re-401), then
+    /// flip AuthSession to `.signedOut` (which causes ContentView to
+    /// render LoginView). Cursor stays put — when the user signs
+    /// back in, sync resumes from the same point. Clean
+    /// `lastError = nil` because the user is about to see LoginView,
+    /// not the sync status pill.
     private func handleUnauthorized() async {
         stopForegroundTimer()
+        mutationQueue?.clear()
         try? KeychainStore.wipe()
         await client.setApiKey(nil)
         authSession.signedOut()

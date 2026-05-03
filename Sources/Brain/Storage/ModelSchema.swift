@@ -246,46 +246,8 @@ final class LocalSyncState {
     }
 }
 
-// MARK: - Mutation queue (M37 — minimal scaffold)
-
-/// Pending API mutation captured while offline. The replayer in M37 walks
-/// these in `createdAt` order and POSTs them with `Idempotency-Key:
-/// idempotencyKey` so retries are safe.
-@Model
-final class LocalMutationQueueItem {
-    @Attribute(.unique) var id: String
-    /// Operation discriminator, e.g. "createTodo", "completeTodo", "archiveNote".
-    var op: String
-    var resourceType: String
-    var resourceId: String?
-    /// JSON-encoded request body, decoded by the replayer per `op`.
-    var payload: Data
-    /// Idempotency key sent with every replay attempt. Generated once
-    /// when the mutation is enqueued and never rotated.
-    var idempotencyKey: String
-    var attempts: Int
-    var nextRetryAt: Date?
-    var createdAt: Date
-
-    init(
-        id: String = UUID().uuidString,
-        op: String,
-        resourceType: String,
-        resourceId: String? = nil,
-        payload: Data,
-        idempotencyKey: String = UUID().uuidString,
-        attempts: Int = 0,
-        nextRetryAt: Date? = nil,
-        createdAt: Date = .now
-    ) {
-        self.id = id
-        self.op = op
-        self.resourceType = resourceType
-        self.resourceId = resourceId
-        self.payload = payload
-        self.idempotencyKey = idempotencyKey
-        self.attempts = attempts
-        self.nextRetryAt = nextRetryAt
-        self.createdAt = createdAt
-    }
-}
+// Note: the `MutationQueueItem` SwiftData model lives in
+// `Sources/Brain/Storage/MutationQueueItem.swift` (M37). It's registered
+// in the schema list in `BrainApp.swift` alongside the read-path models
+// above. Keeping the model file separate keeps this file focused on the
+// read-path SwiftData shapes that mirror the server's JSON DTOs.
