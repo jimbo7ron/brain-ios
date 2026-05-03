@@ -20,7 +20,7 @@ struct ContentView: View {
 
                 Image(systemName: BrainSymbols.appGlyph)
                     .font(.system(size: 72, weight: .regular))
-                    .foregroundStyle(BrainColors.violet)
+                    .foregroundStyle(BrainColors.violet.color)
                     .accessibilityHidden(true)
 
                 Text("brain")
@@ -39,7 +39,7 @@ struct ContentView: View {
                         .padding(.vertical, 12)
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(BrainColors.violet)
+                .tint(BrainColors.violet.color)
                 .padding(.horizontal, 32)
                 .padding(.top, 16)
 
