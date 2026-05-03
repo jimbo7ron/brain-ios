@@ -6,9 +6,8 @@
 // land on. Three tabs:
 //
 //   * Today — the M34 surface, mirroring the web `/` page.
-//   * Projects — placeholder until M35 wires up the real project
-//     picker. Shipping the tab now keeps the chrome stable so M35 is
-//     a content-only swap.
+//   * Projects — the M35 surface. `ProjectListView` is a
+//     `NavigationSplitView` (sidebar on iPad, push-stack on iPhone).
 //   * Settings — hosts the server URL editor and the sign-out
 //     button. In M32 those lived in a sheet behind a toolbar gear;
 //     promoting Settings to a tab here means the user always has a
@@ -46,7 +45,7 @@ struct SignedInRootView: View {
                 .tabItem { Label("Today", systemImage: BrainSymbols.dueToday) }
                 .tag(Tab.today)
 
-            ProjectsPlaceholderView()
+            ProjectListView()
                 .tabItem { Label("Projects", systemImage: "folder") }
                 .tag(Tab.projects)
 
@@ -71,23 +70,6 @@ struct SignedInRootView: View {
             if newPhase == .active {
                 Task { await syncEngine?.sync() }
             }
-        }
-    }
-}
-
-/// M35 placeholder. Kept here (rather than as a free-standing file)
-/// so M35 can replace the contents in one focused diff without
-/// having to also rewire `SignedInRootView`.
-@MainActor
-struct ProjectsPlaceholderView: View {
-    var body: some View {
-        NavigationStack {
-            ContentUnavailableView {
-                Label("Projects", systemImage: "folder")
-            } description: {
-                Text("Project navigation lands in M35.")
-            }
-            .navigationTitle("Projects")
         }
     }
 }
