@@ -1,67 +1,91 @@
 // ContentView.swift
 // brain-ios
 //
-// Root view. For M31 this is a placeholder: we show a "not signed in"
-// state with a Sign In button (opens LoginPlaceholderView) and a gear
-// icon to reach Settings. M32 will gate this on a Keychain-stored API
-// key and route to the actual app once authenticated.
+// Root view. Auth-state-driven routing: present `LoginView` when there's
+// no API key in Keychain, otherwise show `SignedInPlaceholderView`
+// (replaced by the real Today view in M34). The single source of truth
+// is the `apiKey` @State here — `LoginView` flips it on success via
+// `onSignedIn`, and sign-out from the placeholder flips it back after
+// the server-side revoke + Keychain wipe.
 
 import SwiftUI
 
 struct ContentView: View {
 
-    @State private var showingLogin = false
-    @State private var showingSettings = false
+    @Environment(\.brainAPIClient) private var apiClient
+
+    /// Initial value comes from Keychain at view-construction time so
+    /// the first render lands on the correct branch (no flicker through
+    /// the login screen on warm launches).
+    @State private var apiKey: String?
+    @State private var showingSettings: Bool = false
+
+    init() {
+        let stored = (try? KeychainStore.load(.apiKey)) ?? nil
+        _apiKey = State(initialValue: stored)
+    }
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 24) {
-                Spacer()
-
-                Image(systemName: BrainSymbols.appGlyph)
-                    .font(.system(size: 72, weight: .regular))
-                    .foregroundStyle(BrainColors.violet.color)
-                    .accessibilityHidden(true)
-
-                Text("brain")
-                    .font(.system(size: 40, weight: .semibold, design: .rounded))
-
-                Text("Not signed in")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-
-                Button {
-                    showingLogin = true
-                } label: {
-                    Text("Sign in")
-                        .font(.headline)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
+        Group {
+            if apiKey == nil {
+                NavigationStack {
+                    LoginView(onSignedIn: { refreshAuthState() })
+                        .toolbar { settingsToolbarItem }
+                        .sheet(isPresented: $showingSettings) {
+                            SettingsView()
+                        }
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(BrainColors.violet.color)
-                .padding(.horizontal, 32)
-                .padding(.top, 16)
-
-                Spacer()
-            }
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showingSettings = true
-                    } label: {
-                        Image(systemName: BrainSymbols.settings)
-                    }
-                    .accessibilityLabel("Settings")
+            } else {
+                SignedInPlaceholderView {
+                    Task { @MainActor in await signOut() }
                 }
-            }
-            .sheet(isPresented: $showingLogin) {
-                LoginPlaceholderView()
-            }
-            .sheet(isPresented: $showingSettings) {
-                SettingsView()
             }
         }
+    }
+
+    // MARK: - Toolbar
+
+    @ToolbarContentBuilder
+    private var settingsToolbarItem: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            Button {
+                showingSettings = true
+            } label: {
+                Image(systemName: BrainSymbols.settings)
+            }
+            .accessibilityLabel("Settings")
+        }
+    }
+
+    // MARK: - Auth state
+
+    /// Re-reads Keychain after `LoginView` finishes its writes. Pulling
+    /// from Keychain (rather than threading the key through the
+    /// callback) keeps a single source of truth: whatever's persisted
+    /// is what we route on.
+    private func refreshAuthState() {
+        apiKey = (try? KeychainStore.load(.apiKey)) ?? nil
+    }
+
+    /// Sign-out flow: best-effort revoke the device key server-side,
+    /// then wipe Keychain and clear the in-memory bearer token. The
+    /// revoke is best-effort because we always want logout to succeed
+    /// locally — if the device is offline or the key was already
+    /// revoked, the user is still effectively signed out.
+    @MainActor
+    private func signOut() async {
+        // Capture the id before wiping Keychain, otherwise we'd revoke
+        // nothing.
+        let keyId = (try? KeychainStore.load(.apiKeyId)) ?? nil
+
+        if let keyId, let apiClient {
+            try? await apiClient.revokeApiKey(id: keyId)
+        }
+
+        // Local wipe always runs, even if the revoke threw.
+        try? KeychainStore.wipe()
+        await apiClient?.setApiKey(nil)
+        apiKey = nil
     }
 }
 

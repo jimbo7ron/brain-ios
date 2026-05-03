@@ -13,12 +13,13 @@
 // Do NOT construct ad-hoc instances inside views — that would split the
 // auth state and break sync.
 //
-// M31 implements only `health()` — proves the URLSession plumbing works
-// end-to-end. Other methods are declared with their final signatures and
-// throw `BrainAPIClient.Error.notImplemented`. M32 wires login, M33 wires
-// sync, etc. Keeping the signatures pinned now means callers (sync
-// engine, login view) don't have to chase compile errors when each
-// method is filled in.
+// M31 wired `health()` to prove the URLSession plumbing works.
+// M32 wires `login()` and `revokeApiKey()` for the auth flow. Other
+// methods are declared with their final signatures and throw
+// `BrainAPIClient.Error.notImplemented` until their milestone lands —
+// M33 wires sync, etc. Keeping the signatures pinned means callers
+// (sync engine, login view) don't have to chase compile errors when
+// each method is filled in.
 
 import Foundation
 import SwiftUI
@@ -117,17 +118,42 @@ actor BrainAPIClient {
         try await get("/health", as: HealthResponse.self, requiresAuth: false)
     }
 
-    /// `POST /api/v1/auth/login` — implemented in M32.
+    /// `POST /api/v1/auth/login` — exchange email + password for a JWT
+    /// and (when `device_name` is supplied) a freshly-minted named API
+    /// key. The plaintext key on the response is shown exactly once;
+    /// callers must stash it in Keychain immediately. iOS always passes
+    /// a `deviceName` so the M30 server inlines the key on the response.
     func login(email: String, password: String, deviceName: String?) async throws -> LoginResponse {
-        _ = (email, password, deviceName)
-        throw Error.notImplemented("login")
+        let body = LoginRequest(email: email, password: password, deviceName: deviceName)
+        let payload: Data
+        do {
+            payload = try encoder.encode(body)
+        } catch {
+            // Encoding our own struct shouldn't fail; surface as a generic
+            // unknown error if it ever does so callers can show *something*.
+            throw Error.unknown(statusCode: -1, body: "failed to encode login body: \(error)")
+        }
+        let request = try makeRequest(
+            method: "POST",
+            path: "/api/v1/auth/login",
+            body: payload,
+            requiresAuth: false
+        )
+        return try await perform(request, as: LoginResponse.self)
     }
 
-    /// `DELETE /api/v1/auth/api-keys/{id}` — implemented in M32 (logout
-    /// revokes the device key server-side).
+    /// `DELETE /api/v1/auth/api-keys/{id}` — revoke a named API key
+    /// server-side. Used by sign-out to retire the device key before we
+    /// wipe Keychain. Sent with the current `apiKey` as a bearer token
+    /// so the server can authorise the deletion against the same user.
     func revokeApiKey(id: String) async throws {
-        _ = id
-        throw Error.notImplemented("revokeApiKey")
+        let request = try makeRequest(
+            method: "DELETE",
+            path: "/api/v1/auth/api-keys/\(id)",
+            body: nil,
+            requiresAuth: true
+        )
+        try await performIgnoringBody(request)
     }
 
     /// `GET /api/v1/sync` — implemented in M33.
@@ -239,6 +265,36 @@ actor BrainAPIClient {
         }
     }
 
+    /// Like `perform`, but for endpoints that return no body we care
+    /// about (e.g. `DELETE /auth/api-keys/{id}`). Maps non-2xx statuses
+    /// onto the same typed error cases as `perform` so callers don't
+    /// need to special-case revocation failures.
+    private func performIgnoringBody(_ request: URLRequest) async throws {
+        let (data, response) = try await sessionData(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw Error.unknown(statusCode: -1, body: "non-HTTP response")
+        }
+        switch http.statusCode {
+        case 200..<300:
+            return
+        case 401:
+            throw Error.unauthorized
+        case 404:
+            throw Error.notFound
+        case 422:
+            let detail = (try? decoder.decode(ErrorEnvelope.self, from: data))?.detail
+                ?? String(data: data, encoding: .utf8)
+                ?? "validation failed"
+            throw Error.validationError(detail: detail)
+        case 429:
+            let retry = http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
+            throw Error.rateLimited(retryAfter: retry)
+        default:
+            let body = String(data: data, encoding: .utf8) ?? ""
+            throw Error.unknown(statusCode: http.statusCode, body: body)
+        }
+    }
+
     /// Wraps `URLSession.data(for:)` to convert URLError into our typed
     /// error case. Kept as a separate method so tests can override it.
     private func sessionData(for request: URLRequest) async throws -> (Data, URLResponse) {
@@ -246,6 +302,39 @@ actor BrainAPIClient {
             return try await session.data(for: request)
         } catch let urlError as URLError {
             throw Error.network(urlError)
+        }
+    }
+}
+
+// MARK: - User-facing error copy
+
+extension BrainAPIClient.Error {
+    /// Friendly one-liner suitable for surfacing in a SwiftUI error view.
+    /// Falls back to `description` for cases where the raw text is
+    /// already presentable (network errors, validation details).
+    var userFacingMessage: String {
+        switch self {
+        case .unauthorized:
+            return "That email and password didn't match. Try again."
+        case .notFound:
+            return "Server endpoint not found. Check the server URL in Settings."
+        case .rateLimited(let retry):
+            if let retry = retry {
+                return "Too many attempts — try again in \(Int(retry))s."
+            }
+            return "Too many attempts — try again soon."
+        case .validationError(let detail):
+            return detail
+        case .network:
+            return "Couldn't reach the server. Check your connection."
+        case .decoding:
+            return "Got an unexpected response from the server."
+        case .unknown(_, _):
+            return "Something went wrong. Try again."
+        case .notImplemented:
+            return "This feature isn't available yet."
+        case .invalidURL:
+            return "The configured server URL is invalid."
         }
     }
 }
