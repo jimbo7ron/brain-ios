@@ -206,6 +206,49 @@ struct NoteListResponse: Codable {
     let total: Int
 }
 
+/// Patch body for `PATCH /api/v1/notes/{id}` — mirrors `NoteUpdate` in
+/// `brain/src/brain/schemas.py`. Every field is optional; the server
+/// applies whatever is present and ignores keys that aren't sent. We use
+/// explicit `CodingKeys` (rather than `keyEncodingStrategy =
+/// .convertToSnakeCase`) so the wire shape stays obvious in source and
+/// is greppable against the Python schema.
+///
+/// Note: completing a todo uses a dedicated endpoint (`POST /notes/{id}/
+/// complete`) and is not modelled here — `NoteUpdate` on the server has
+/// no `completed` field.
+struct UpdateNotePayload: Encodable, Hashable {
+    var content: String?
+    var title: String?
+    /// Use the literal string `"none"` to clear an existing due date —
+    /// matches the server's convention.
+    var dueDate: String?
+    /// "low" | "medium" | "high".
+    var priority: String?
+    /// Project name, short id, or `"unassigned"` to clear.
+    var project: String?
+    /// Section slug.
+    var section: String?
+    /// Empty string clears the URL.
+    var url: String?
+    // Appointment fields
+    var startTime: String?
+    var endTime: String?
+    var location: String?
+
+    enum CodingKeys: String, CodingKey {
+        case content
+        case title
+        case dueDate = "due_date"
+        case priority
+        case project
+        case section
+        case url
+        case startTime = "start_time"
+        case endTime = "end_time"
+        case location
+    }
+}
+
 // MARK: - Sync feed (M28)
 
 struct SyncTombstones: Codable, Hashable {

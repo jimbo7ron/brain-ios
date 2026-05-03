@@ -48,18 +48,20 @@ enum BrainColors {
     }
 }
 
-// MARK: - HSL → HSB
+// MARK: - HSL → display-P3 RGB
 
-/// Build a `BrainColor` from CSS HSL values. SwiftUI's `Color` initialiser
-/// takes HSB, so we convert; the conversion is pure math from the standard
-/// HSL ↔ HSV formula.
+/// Build a `BrainColor` from CSS HSL values, rendered in display-P3.
+///
+/// We deliberately avoid `Color(hue:saturation:brightness:)` because that
+/// initialiser uses the device's RGB colour space (sRGB on legacy
+/// displays). On wide-gamut iPhone/iPad screens that compresses the
+/// palette into the sRGB sub-volume and makes the swatches look duller
+/// than the web app, which renders the same HSL values through CSS in
+/// display-P3. Going HSL → HSB → display-P3 RGB explicitly keeps the
+/// iOS and web swatches visually aligned.
 private func makeColor(slug: String, name: String, h: Double, s: Double, l: Double) -> BrainColor {
     let hsb = hslToHsb(h: h, s: s / 100.0, l: l / 100.0)
-    let color = Color(
-        hue: h / 360.0,
-        saturation: hsb.saturation,
-        brightness: hsb.brightness
-    )
+    let color = displayP3FromHSB(h: h / 360.0, s: hsb.saturation, b: hsb.brightness)
     let cssValue = "hsl(\(Int(h)) \(Int(s))% \(Int(l))%)"
     return BrainColor(id: slug, name: name, color: color, cssValue: cssValue)
 }
@@ -69,4 +71,35 @@ private func hslToHsb(h: Double, s: Double, l: Double) -> (saturation: Double, b
     let value = l + s * min(l, 1 - l)
     let saturation = value == 0 ? 0 : 2 * (1 - l / value)
     return (saturation: saturation, brightness: value)
+}
+
+/// HSB → display-P3 `Color`. `h` is normalised to `0...1` (a fraction of
+/// 360°), `s` and `b` are `0...1`. Implements the standard HSV → RGB
+/// formula, then hands the components to the display-P3 `Color`
+/// initialiser so the swatch is rendered in the wider gamut on capable
+/// displays and gracefully clamped on sRGB ones.
+private func displayP3FromHSB(h: Double, s: Double, b: Double) -> Color {
+    let chroma = b * s
+    // Hue sector in [0, 6).
+    let sector = (h.truncatingRemainder(dividingBy: 1) + 1)
+        .truncatingRemainder(dividingBy: 1) * 6
+    let xComponent = chroma * (1 - abs(sector.truncatingRemainder(dividingBy: 2) - 1))
+    let match = b - chroma
+    let (rPrime, gPrime, bPrime): (Double, Double, Double) = {
+        switch sector {
+        case 0..<1: return (chroma, xComponent, 0)
+        case 1..<2: return (xComponent, chroma, 0)
+        case 2..<3: return (0, chroma, xComponent)
+        case 3..<4: return (0, xComponent, chroma)
+        case 4..<5: return (xComponent, 0, chroma)
+        default:    return (chroma, 0, xComponent)
+        }
+    }()
+    return Color(
+        .displayP3,
+        red: rPrime + match,
+        green: gPrime + match,
+        blue: bPrime + match,
+        opacity: 1
+    )
 }

@@ -76,19 +76,32 @@ final class LocalProject {
 
 @Model
 final class LocalSection {
+    /// Composite primary key: `"<projectId>:<slug>"`. The server returns
+    /// sections as `{slug, name, position}` scoped to a project — `slug`
+    /// alone collides across projects, so we mint a globally-unique id
+    /// at insert time so SwiftData can dedupe with `@Attribute(.unique)`.
+    /// This lets the M33 sync engine upsert by id instead of doing a
+    /// per-project slug scan on every batch.
+    @Attribute(.unique) var id: String
     /// Stable section slug (server-generated from name). Unique within a
-    /// project, not globally — composite uniqueness isn't expressible on
-    /// SwiftData yet so we enforce it on insert.
+    /// project, not globally — see `id` for the composite form.
     var slug: String
     var name: String
     var position: Int
     var project: LocalProject?
 
-    init(slug: String, name: String, position: Int, project: LocalProject? = nil) {
+    init(id: String, slug: String, name: String, position: Int, project: LocalProject? = nil) {
+        self.id = id
         self.slug = slug
         self.name = name
         self.position = position
         self.project = project
+    }
+
+    /// Build the composite id used for `@Attribute(.unique)`. Centralised
+    /// so callers (sync engine, tests) don't reinvent the format.
+    static func makeID(projectID: String, slug: String) -> String {
+        "\(projectID):\(slug)"
     }
 }
 
