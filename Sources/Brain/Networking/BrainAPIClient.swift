@@ -244,6 +244,33 @@ actor BrainAPIClient {
         throw Error.notImplemented("updateNote")
     }
 
+    /// `POST /api/v1/notes/{id}/complete` — flip a todo to completed.
+    /// Implemented in M36. The server returns the updated `NoteResponse`
+    /// (including authoritative `completed_at` timestamp) but callers
+    /// in the M36 toggle path discard the body — they've already done
+    /// the optimistic flip locally and the next M33 sync will reconcile
+    /// the server-side timestamp. Wiring the response through means M37
+    /// can replumb this through the mutation queue without changing the
+    /// signature.
+    ///
+    /// There is intentionally no sibling `uncompleteTodo`: the brain
+    /// server has no `/uncomplete` endpoint as of the M28 contract, so
+    /// re-opening a completed todo from the iOS client is deferred to
+    /// M40. `TodoRow`'s tap handler treats a completed-row tap as a
+    /// no-op until then.
+    func completeTodo(noteId: String) async throws -> Note {
+        let request = try makeRequest(
+            method: "POST",
+            // Empty JSON body — the server endpoint takes no payload but
+            // `Content-Type: application/json` is set unconditionally
+            // by `makeRequest`, and FastAPI is happy with `{}` there.
+            path: "/api/v1/notes/\(noteId)/complete",
+            body: Data("{}".utf8),
+            requiresAuth: true
+        )
+        return try await perform(request, as: Note.self)
+    }
+
     // MARK: - Internal HTTP
 
     /// Generic GET helper. `path` should start with `/`.
