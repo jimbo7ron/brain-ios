@@ -20,36 +20,47 @@ struct AppointmentRow: View {
         return note.content
     }
 
-    /// "10:00 – 11:00" if both ends present, "10:00" if only the
-    /// start, empty string if neither. The server emits ISO-8601
-    /// timestamps, but we keep them as strings here so we don't
-    /// have to round-trip through Date for a row that's not
-    /// time-sorted. M40 may upgrade this to a localized formatter.
+    /// "10:00 AM – 11:00 AM" (or "10:00 – 11:00" depending on locale)
+    /// if both ends present, "10:00 AM" if only the start, empty
+    /// string if neither. The server emits ISO-8601 UTC timestamps
+    /// (`2026-05-03T10:00:00Z`); we parse them through
+    /// `ISO8601DateFormatter` and render with `DateFormatter` in the
+    /// user's current locale + timezone so a 10:00 UTC appointment
+    /// shows as 11:00 in BST, 03:00 in PT, etc.
     private var timeRange: String {
-        let start = note.appointmentStartTime ?? ""
-        let end = note.appointmentEndTime ?? ""
-        let trimmedStart = formatClock(start)
-        let trimmedEnd = formatClock(end)
-        if !trimmedStart.isEmpty, !trimmedEnd.isEmpty { return "\(trimmedStart) – \(trimmedEnd)" }
-        return trimmedStart
+        let start = formatClock(note.appointmentStartTime)
+        let end = formatClock(note.appointmentEndTime)
+        if !start.isEmpty, !end.isEmpty { return "\(start) – \(end)" }
+        return start
     }
 
-    /// Pull the `HH:mm` portion out of an ISO-8601 string. Falls
-    /// back to the raw string if it doesn't look like ISO — better
-    /// to show something than crash on malformed payloads.
-    private func formatClock(_ raw: String) -> String {
-        guard !raw.isEmpty else { return "" }
-        // ISO format: `2026-05-03T10:00:00Z` → split on "T", take
-        // the time, drop seconds and any timezone suffix.
-        let parts = raw.split(separator: "T", maxSplits: 1).map(String.init)
-        guard parts.count == 2 else { return raw }
-        let timePart = parts[1]
-        let timeOnly = timePart
-            .split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
-            .prefix(2)
-            .joined(separator: ":")
-        return timeOnly.isEmpty ? raw : timeOnly
+    /// Parse a server-emitted ISO-8601 timestamp and format it as a
+    /// short locale-aware time. Falls back to the raw string if the
+    /// payload doesn't parse — better to show something than crash
+    /// on malformed input.
+    private func formatClock(_ raw: String?) -> String {
+        guard let raw, !raw.isEmpty else { return "" }
+        guard let date = AppointmentRow.iso8601.date(from: raw) else { return raw }
+        return AppointmentRow.timeFormatter.string(from: date)
     }
+
+    /// Shared parser for the server's ISO-8601 timestamps. `Z`
+    /// suffix is required, which the server always emits.
+    private static let iso8601: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    /// Shared short-time formatter. Picks up the user's current
+    /// locale and timezone automatically (e.g. "10:00 AM" in en_US,
+    /// "10:00" in en_GB).
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        formatter.dateStyle = .none
+        return formatter
+    }()
 
     private var subline: String {
         var pieces: [String] = []
@@ -65,7 +76,10 @@ struct AppointmentRow: View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: BrainSymbols.location)
                 .font(.title3)
-                .foregroundStyle(BrainColors.teal.color)
+                // Match the section header tint (web `--section-later`
+                // / slate) so the row icon doesn't disagree with the
+                // header it sits beneath.
+                .foregroundStyle(BrainColors.slate.color)
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 4) {

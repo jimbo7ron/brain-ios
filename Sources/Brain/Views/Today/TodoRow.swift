@@ -6,60 +6,30 @@
 // + due-date hint + tag pills in the middle. The checkbox is a
 // read-only stub here; toggling completion is M36.
 //
-// Project tint: we color-code the leading checkbox border with the
-// project's accent so the user can scan the list and tell which
-// project a todo belongs to without an extra column. Sourced from
-// `LocalProject.color` (a CSS HSL string) via `BrainColors.bySlug`
-// when we recognise it; otherwise the system tint. Resolution
-// happens here rather than in a separate model lookup so the row is
-// drop-in usable without extra wiring.
+// Project tint: the parent view (`TodayView`) resolves the accent
+// from a hoisted `[String: LocalProject]` dict and passes it in,
+// so this row does not run its own per-row `@Query`.
 
-import SwiftData
 import SwiftUI
 
 @MainActor
 struct TodoRow: View {
 
     let note: LocalNote
+    /// Pre-resolved accent color for the row's project. The parent
+    /// builds it once from a hoisted projects @Query and passes it
+    /// in to avoid per-row SwiftData lookups.
+    let accentColor: Color
 
-    /// Cached project lookup for the accent color. SwiftData will
-    /// re-fetch once per render; the project list is tiny so the
-    /// cost is negligible compared to the visual benefit.
-    @Query private var projects: [LocalProject]
-
-    init(note: LocalNote) {
+    init(note: LocalNote, accentColor: Color = .accentColor) {
         self.note = note
-        let projectId = note.projectId
-        // Predicate on `id` is fine because LocalProject.id is the
-        // server UUID and dedupes via @Attribute(.unique).
-        if let projectId {
-            _projects = Query(filter: #Predicate<LocalProject> { $0.id == projectId })
-        } else {
-            // No project — return an empty result. The view falls
-            // back to the system tint.
-            _projects = Query(filter: #Predicate<LocalProject> { _ in false })
-        }
+        self.accentColor = accentColor
     }
 
     private var displayTitle: String {
         let title = note.title?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let title, !title.isEmpty { return title }
         return note.content
-    }
-
-    private var accentColor: Color {
-        guard let css = projects.first?.color else { return .accentColor }
-        // Server stores CSS like `hsl(262 83% 58%)` — match against
-        // the palette's `cssValue`. Falls back to the slug match
-        // (server may eventually emit slugs directly), then to the
-        // system tint.
-        if let match = BrainColors.palette.first(where: { $0.cssValue == css }) {
-            return match.color
-        }
-        if let match = BrainColors.bySlug(css) {
-            return match.color
-        }
-        return .accentColor
     }
 
     private var tags: [String] {

@@ -51,8 +51,9 @@ struct TodayView: View {
 
     /// All non-archived appointments. We filter to "today" in Swift
     /// because the appointment start time is stored as a full ISO
-    /// timestamp string, so the prefix-matching logic is cleaner in
-    /// code than in a predicate.
+    /// UTC timestamp string and "today" depends on the user's local
+    /// timezone — a server-side date prefix won't be correct in
+    /// non-UTC zones, so we parse and compare via `Calendar`.
     @Query(
         filter: #Predicate<LocalNote> {
             $0.type == "appointment" && $0.archived == false && $0.appointmentStartTime != nil
@@ -60,6 +61,20 @@ struct TodayView: View {
         sort: [SortDescriptor(\.appointmentStartTime)]
     )
     private var appointments: [LocalNote]
+
+    /// All non-archived projects. We hoist this to the view level
+    /// so each `TodoRow` can look up its project's accent color from
+    /// a parent-built dict rather than running its own per-row
+    /// `@Query`. Project lists are personal-app scale (<50), so
+    /// fetching them all is cheaper than 100+ individual queries.
+    @Query(filter: #Predicate<LocalProject> { $0.archived == false })
+    private var projects: [LocalProject]
+
+    /// `projectId` → `LocalProject` lookup, rebuilt per render.
+    /// Constant-time access during the row builds.
+    private var projectsById: [String: LocalProject] {
+        Dictionary(uniqueKeysWithValues: projects.map { ($0.id, $0) })
+    }
 
     /// Local "today" recomputed each render. Cheap — a couple of
     /// `DateFormatter.string(from:)` calls — and lets the view
@@ -99,32 +114,36 @@ struct TodayView: View {
     }
 
     private var appointmentsToday: [LocalNote] {
-        appointments.filter {
-            guard let start = $0.appointmentStartTime else { return false }
-            // Server emits `2026-05-03T10:00:00Z` — ISO local-day
-            // prefix matching is enough to filter to "today".
-            return start.hasPrefix(todayISO)
+        let calendar = Calendar.current
+        return appointments.filter {
+            guard let raw = $0.appointmentStartTime,
+                  let date = TodayView.iso8601.date(from: raw)
+            else { return false }
+            // Compare in the user's local timezone — a UTC-suffixed
+            // ISO timestamp can land on a different calendar day in
+            // BST, PT, JST, etc. than its date prefix suggests.
+            return calendar.isDateInToday(date)
         }
     }
 
-    private var isEmpty: Bool {
-        overdue.isEmpty && dueToday.isEmpty && comingUp.isEmpty && appointmentsToday.isEmpty
-    }
+    /// Shared parser for the server's ISO-8601 UTC timestamps.
+    private static let iso8601: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
 
     var body: some View {
         NavigationStack {
             List {
-                if isEmpty {
-                    EmptyTodayView()
-                        .listRowSeparator(.hidden)
-                        .listRowBackground(Color.clear)
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 32)
-                }
-
+                // Overdue is the only section that hides when empty —
+                // matches the web (`overdue.length > 0 ? ... : null`)
+                // because an empty Overdue is the desired state and
+                // the destructive-tint header otherwise reads as a
+                // visual alarm with no content.
                 if !overdue.isEmpty {
                     Section {
-                        ForEach(overdue, id: \.id) { TodoRow(note: $0) }
+                        ForEach(overdue, id: \.id) { todo(for: $0) }
                     } header: {
                         TodaySectionHeader(
                             title: "Overdue",
@@ -135,20 +154,25 @@ struct TodayView: View {
                     }
                 }
 
-                if !dueToday.isEmpty {
-                    Section {
-                        ForEach(dueToday, id: \.id) { TodoRow(note: $0) }
-                    } header: {
-                        TodaySectionHeader(
-                            title: "Due today",
-                            symbol: BrainSymbols.dueToday,
-                            tint: BrainColors.amber.color
-                        )
+                Section {
+                    if dueToday.isEmpty {
+                        EmptySectionLine(text: "Nothing due today.")
+                    } else {
+                        ForEach(dueToday, id: \.id) { todo(for: $0) }
                     }
+                } header: {
+                    TodaySectionHeader(
+                        title: "Due today",
+                        symbol: BrainSymbols.dueToday,
+                        // Web maps Due Today → `--section-next` (sky).
+                        tint: BrainColors.sky.color
+                    )
                 }
 
-                if !comingUp.isEmpty {
-                    Section {
+                Section {
+                    if comingUp.isEmpty {
+                        EmptySectionLine(text: "Nothing scheduled in the next \(TodayDate.comingUpDays) days.")
+                    } else {
                         ForEach(comingUpDays, id: \.date) { day in
                             // Per-day subheader inside the section so
                             // the user sees "Tomorrow", "Mon May 5"
@@ -159,28 +183,34 @@ struct TodayView: View {
                                 .textCase(.uppercase)
                                 .listRowBackground(Color.clear)
                                 .listRowSeparator(.hidden)
-                            ForEach(day.todos, id: \.id) { TodoRow(note: $0) }
+                            ForEach(day.todos, id: \.id) { todo(for: $0) }
                         }
-                    } header: {
-                        TodaySectionHeader(
-                            title: "Coming up",
-                            symbol: BrainSymbols.now,
-                            tint: BrainColors.violet.color,
-                            trailingNote: "next \(TodayDate.comingUpDays) days"
-                        )
                     }
+                } header: {
+                    TodaySectionHeader(
+                        title: "Coming up",
+                        // Web uses Lucide `CalendarRange`; SF Symbols
+                        // closest is `calendar.badge.clock`.
+                        symbol: BrainSymbols.comingUp,
+                        // Web maps Coming Up → `--section-now` (violet).
+                        tint: BrainColors.violet.color,
+                        trailingNote: "next \(TodayDate.comingUpDays) days"
+                    )
                 }
 
-                if !appointmentsToday.isEmpty {
-                    Section {
+                Section {
+                    if appointmentsToday.isEmpty {
+                        EmptySectionLine(text: "No appointments today.")
+                    } else {
                         ForEach(appointmentsToday, id: \.id) { AppointmentRow(note: $0) }
-                    } header: {
-                        TodaySectionHeader(
-                            title: "Appointments today",
-                            symbol: BrainSymbols.location,
-                            tint: BrainColors.teal.color
-                        )
                     }
+                } header: {
+                    TodaySectionHeader(
+                        title: "Appointments today",
+                        symbol: BrainSymbols.location,
+                        // Web maps Appointments → `--section-later` (slate/zinc).
+                        tint: BrainColors.slate.color
+                    )
                 }
             }
             .listStyle(.insetGrouped)
@@ -189,9 +219,36 @@ struct TodayView: View {
                 // Pull-to-refresh: explicit user-initiated sync.
                 // SyncEngine debounces if a sync just ran, so this
                 // is safe to spam.
-                await syncEngine?.sync()
+                if let syncEngine {
+                    await syncEngine.sync()
+                } else {
+                    // Surfaces a wiring bug in development without
+                    // crashing release. PTR with no engine is a
+                    // silent no-op for users.
+                    assertionFailure("syncEngine should be injected")
+                }
             }
         }
+    }
+
+    /// Build a `TodoRow` for `note`, resolving its project's accent
+    /// color from the parent-built `projectsById` dict so the row
+    /// itself doesn't have to run a per-row `@Query`.
+    @ViewBuilder
+    private func todo(for note: LocalNote) -> some View {
+        let project = note.projectId.flatMap { projectsById[$0] }
+        TodoRow(note: note, accentColor: TodayView.accentColor(for: project))
+    }
+
+    /// Resolve a `LocalProject.color` (a CSS HSL string) to a
+    /// SwiftUI `Color`. Falls back to the system tint when the
+    /// project is `nil` or the CSS string is unrecognised.
+    static func accentColor(for project: LocalProject?) -> Color {
+        guard let css = project?.color else { return .accentColor }
+        if let match = BrainColors.palette.first(where: { $0.cssValue == css }) {
+            return match.color
+        }
+        return .accentColor
     }
 }
 
@@ -233,16 +290,18 @@ struct TodaySectionHeader: View {
     }
 }
 
-/// Empty state when every section is empty (fresh sign-in, or all
-/// caught up). Sized to match the section spacing so the layout
-/// doesn't lurch when the first todo arrives.
-struct EmptyTodayView: View {
+/// Inline empty-state line shown beneath a section header when the
+/// section has no rows. Mirrors the web's italic "Nothing due
+/// today." treatment so the user sees every section consistently
+/// rather than a layout that lurches as data arrives.
+struct EmptySectionLine: View {
+    let text: String
+
     var body: some View {
-        ContentUnavailableView {
-            Label("All clear", systemImage: BrainSymbols.checkmarkCircle)
-        } description: {
-            Text("Nothing overdue, due today, or on the next 6 days. Pull to sync.")
-        }
+        Text(text)
+            .font(.subheadline)
+            .italic()
+            .foregroundStyle(.secondary)
     }
 }
 
