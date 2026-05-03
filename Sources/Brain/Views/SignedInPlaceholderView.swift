@@ -10,14 +10,15 @@ import SwiftUI
 
 struct SignedInPlaceholderView: View {
 
+    @Environment(AuthSession.self) private var authSession
+
     /// Parent (ContentView) injects the sign-out flow because it owns
-    /// the auth-state binding and needs to flip its `apiKey` back to
-    /// `nil` once we're done.
+    /// the API client + Keychain wipe sequence; this view just calls
+    /// it. The post-condition (auth session flipped to `.signedOut`)
+    /// happens inside that closure so this view re-renders /
+    /// unmounts naturally.
     let onSignOut: () -> Void
 
-    /// Cached at first appear so the view doesn't re-touch the Keychain
-    /// every render.
-    @State private var email: String?
     @State private var isSigningOut: Bool = false
     @State private var showingSettings: Bool = false
 
@@ -34,7 +35,7 @@ struct SignedInPlaceholderView: View {
                 Text("Signed in")
                     .font(.title2.bold())
 
-                if let email {
+                if let email = authSession.email {
                     Text(email)
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -76,18 +77,11 @@ struct SignedInPlaceholderView: View {
             .sheet(isPresented: $showingSettings) {
                 SettingsView()
             }
-            .task {
-                // Prefer the live Keychain value over a captured one so
-                // we pick up post-login writes without an extra plumbing
-                // hop. `try?` collapses Keychain misses to nil — the
-                // user just won't see their email if the read fails,
-                // which is preferable to crashing.
-                email = (try? KeychainStore.load(.userEmail)) ?? nil
-            }
         }
     }
 }
 
 #Preview {
     SignedInPlaceholderView(onSignOut: {})
+        .environment(AuthSession(state: .signedIn(userId: "preview", email: "preview@example.com")))
 }

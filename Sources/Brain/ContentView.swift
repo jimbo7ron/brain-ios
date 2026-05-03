@@ -1,41 +1,38 @@
 // ContentView.swift
 // brain-ios
 //
-// Root view. Auth-state-driven routing: present `LoginView` when there's
-// no API key in Keychain, otherwise show `SignedInPlaceholderView`
-// (replaced by the real Today view in M34). The single source of truth
-// is the `apiKey` @State here — `LoginView` flips it on success via
-// `onSignedIn`, and sign-out from the placeholder flips it back after
-// the server-side revoke + Keychain wipe.
+// Root view. Auth-state-driven routing: present `LoginView` when the
+// session is signed out, otherwise show `SignedInPlaceholderView`
+// (replaced by the real Today view in M34). The single source of
+// truth is `AuthSession`, owned by `BrainApp` and injected via
+// `\.environment(AuthSession.self)`. ContentView observes the
+// session and re-renders when transitions fire — login flips the
+// session via `didSignIn(...)`, sign-out via `signedOut()`, and a
+// future M33 401-handler does the same. Keeping auth state out of
+// this view's `@State` means non-view callers can flip the UI
+// without owning a binding to it.
 
 import SwiftUI
 
 struct ContentView: View {
 
     @Environment(\.brainAPIClient) private var apiClient
+    @Environment(AuthSession.self) private var authSession
 
-    /// Initial value comes from Keychain at view-construction time so
-    /// the first render lands on the correct branch (no flicker through
-    /// the login screen on warm launches).
-    @State private var apiKey: String?
     @State private var showingSettings: Bool = false
-
-    init() {
-        let stored = (try? KeychainStore.load(.apiKey)) ?? nil
-        _apiKey = State(initialValue: stored)
-    }
 
     var body: some View {
         Group {
-            if apiKey == nil {
+            switch authSession.state {
+            case .signedOut:
                 NavigationStack {
-                    LoginView(onSignedIn: { refreshAuthState() })
+                    LoginView()
                         .toolbar { settingsToolbarItem }
                         .sheet(isPresented: $showingSettings) {
                             SettingsView()
                         }
                 }
-            } else {
+            case .signedIn:
                 SignedInPlaceholderView {
                     Task { @MainActor in await signOut() }
                 }
@@ -59,19 +56,18 @@ struct ContentView: View {
 
     // MARK: - Auth state
 
-    /// Re-reads Keychain after `LoginView` finishes its writes. Pulling
-    /// from Keychain (rather than threading the key through the
-    /// callback) keeps a single source of truth: whatever's persisted
-    /// is what we route on.
-    private func refreshAuthState() {
-        apiKey = (try? KeychainStore.load(.apiKey)) ?? nil
-    }
-
     /// Sign-out flow: best-effort revoke the device key server-side,
-    /// then wipe Keychain and clear the in-memory bearer token. The
-    /// revoke is best-effort because we always want logout to succeed
-    /// locally — if the device is offline or the key was already
-    /// revoked, the user is still effectively signed out.
+    /// then wipe Keychain, clear the in-memory API key on the
+    /// shared `BrainAPIClient`, and flip the session to
+    /// `.signedOut`. The revoke is best-effort because we always
+    /// want logout to succeed locally — if the device is offline or
+    /// the key was already revoked, the user is still effectively
+    /// signed out.
+    ///
+    /// Order matters: revoke (network) → wipe Keychain → clear API
+    /// client → flip session. The session flip lands last so any
+    /// view that re-renders on `.signedOut` (e.g. LoginView) reads a
+    /// consistent post-wipe state.
     @MainActor
     private func signOut() async {
         // Capture the id before wiping Keychain, otherwise we'd revoke
@@ -85,10 +81,11 @@ struct ContentView: View {
         // Local wipe always runs, even if the revoke threw.
         try? KeychainStore.wipe()
         await apiClient?.setApiKey(nil)
-        apiKey = nil
+        authSession.signedOut()
     }
 }
 
 #Preview {
     ContentView()
+        .environment(AuthSession(state: .signedOut))
 }

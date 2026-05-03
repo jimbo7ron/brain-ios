@@ -82,9 +82,25 @@ actor BrainAPIClient {
     private let session: URLSession
     private let decoder: JSONDecoder
     private let encoder: JSONEncoder
-    /// JWT or named API key. Sent as `Authorization: Bearer <key>`.
-    /// Either auth method is accepted by the server; iOS uses the named
-    /// API key minted at login (M30/M32).
+    /// The named API key minted at login (M30/M32) — the plaintext
+    /// `api_key.key` returned once on `/auth/login`. Sent as
+    /// `X-API-Key: <key>` on every authenticated request.
+    ///
+    /// Why API key (not JWT) for ongoing requests: after login we get
+    /// back both a JWT and a freshly-minted named API key. We persist
+    /// and use the API key because (a) it's what the user revokes when
+    /// they sign out, (b) it's longer-lived than the JWT (12 months
+    /// vs minutes), and (c) it produces clean per-device audit
+    /// attribution server-side — `get_api_key_user` sets
+    /// `request.state.api_key_id` and bumps `last_used_at` on the
+    /// device-key row, neither of which the JWT path does. The JWT is
+    /// discarded after the login response is consumed.
+    ///
+    /// Why `X-API-Key` (not `Authorization: Bearer`): the server's
+    /// bearer path runs `decode_jwt_token` first and 401s on a 32-byte
+    /// hex API key (it's not a JWT). Using `X-API-Key` routes through
+    /// `get_api_key_user`, which is the only path that emits audit
+    /// attribution and updates `last_used_at`.
     private var apiKey: String?
 
     // MARK: - Init
@@ -106,7 +122,8 @@ actor BrainAPIClient {
         self.encoder = encoder
     }
 
-    /// Update the bearer token after login (M32) or rotation.
+    /// Update the named API key after login (M32) or rotation. Sent as
+    /// `X-API-Key` on subsequent authenticated requests.
     func setApiKey(_ key: String?) {
         self.apiKey = key
     }
@@ -144,8 +161,9 @@ actor BrainAPIClient {
 
     /// `DELETE /api/v1/auth/api-keys/{id}` — revoke a named API key
     /// server-side. Used by sign-out to retire the device key before we
-    /// wipe Keychain. Sent with the current `apiKey` as a bearer token
-    /// so the server can authorise the deletion against the same user.
+    /// wipe Keychain. Authenticates with the current `apiKey` via
+    /// `X-API-Key` so the server can authorise the deletion against
+    /// the same user.
     func revokeApiKey(id: String) async throws {
         let request = try makeRequest(
             method: "DELETE",
@@ -225,7 +243,14 @@ actor BrainAPIClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if requiresAuth, let apiKey = apiKey {
-            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            // Use `X-API-Key` (not `Authorization: Bearer`) so the
+            // server routes through `get_api_key_user`, which sets
+            // `request.state.api_key_id` for audit logging and updates
+            // `last_used_at` on the device key row. The bearer path
+            // runs `decode_jwt_token` first and 401s on a non-JWT key.
+            // See the `apiKey` doc-comment above for the full
+            // rationale.
+            request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
         }
         if let idempotencyKey = idempotencyKey {
             request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key")

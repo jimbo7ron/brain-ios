@@ -1,10 +1,12 @@
 // BrainApp.swift
 // brain-ios
 //
-// App entry point. Wires up the SwiftData ModelContainer and the shared
-// BrainAPIClient, then presents ContentView. Login (M32) and sync (M33)
-// reach the API client through `\.brainAPIClient` in the environment so
-// they share the same `apiKey` state.
+// App entry point. Wires up the SwiftData ModelContainer, the shared
+// BrainAPIClient, and the shared AuthSession, then presents
+// ContentView. Login (M32) and sync (M33) reach the API client
+// through `\.brainAPIClient` in the environment so they share the
+// same `apiKey` state; views read auth state via
+// `@Environment(AuthSession.self)`.
 
 import SwiftData
 import SwiftUI
@@ -23,6 +25,21 @@ struct BrainApp: App {
     /// same instance via `@Environment(\.brainAPIClient)`.
     let apiClient: BrainAPIClient
 
+    /// Single shared auth-state observable. Hydrated from Keychain in
+    /// its initialiser, mutated by login (`didSignIn`) and sign-out /
+    /// 401 (`signedOut`). Views observe via
+    /// `@Environment(AuthSession.self)`. Owning it here (instead of
+    /// in ContentView's `@State`) means non-view callers — notably
+    /// M33's sync engine — can flip the UI back to LoginView on a
+    /// 401 without reaching into a parent view's local state.
+    let authSession: AuthSession
+
+    /// `@MainActor` because `AuthSession` is main-actor-isolated and
+    /// we construct one below. SwiftUI already runs `App.init` on
+    /// the main thread; this just makes the contract explicit so
+    /// strict concurrency stops complaining about cross-actor
+    /// initialisation.
+    @MainActor
     init() {
         do {
             let schema = Schema([
@@ -52,12 +69,24 @@ struct BrainApp: App {
         let serverURL = storedServer.flatMap(URL.init(string:)) ?? defaultBrainServerURL
         let storedApiKey = (try? KeychainStore.load(.apiKey)) ?? nil
         self.apiClient = BrainAPIClient(serverURL: serverURL, apiKey: storedApiKey)
+
+        // AuthSession reads Keychain itself in its initialiser. We
+        // build it here so the same instance is shared across the
+        // entire scene tree via `.environment(authSession)` below.
+        // Known limitation: pre-first-unlock background launches see
+        // `errSecInteractionNotAllowed` from Keychain reads, which we
+        // collapse to nil and treat as signed out. Becomes
+        // load-bearing once M33 wires up Background App Refresh; fix
+        // there is to defer the read until first unlock rather than
+        // bouncing the user to LoginView.
+        self.authSession = AuthSession()
     }
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environment(\.brainAPIClient, apiClient)
+                .environment(authSession)
         }
         .modelContainer(modelContainer)
     }

@@ -4,10 +4,18 @@
 // Real login screen — replaces the M31 `LoginPlaceholderView`. Posts to
 // `POST /api/v1/auth/login` with a `device_name` so the M30 server
 // auto-mints a named API key and inlines it on the response. We stash
-// the JWT-adjacent api_key plaintext (account `.apiKey`), the api_key
-// id (`.apiKeyId`), the user id (`.userId`) and the user's email
-// (`.userEmail`) in Keychain, then call back to the parent so it can
-// re-evaluate auth state and route to the signed-in UI.
+// the api_key plaintext (account `.apiKey`), the api_key id
+// (`.apiKeyId`), the user id (`.userId`) and the user's email
+// (`.userEmail`) in Keychain, push the API key into the shared
+// `BrainAPIClient` actor, and finally call
+// `authSession.didSignIn(...)` — ContentView observes the session
+// and re-renders into the signed-in UI.
+//
+// JWTs from the login response are intentionally discarded: the
+// named API key is what we use for ongoing requests (it's longer
+// lived, it's what gets revoked on sign-out, and it produces clean
+// per-device audit attribution server-side via `X-API-Key`). See
+// `BrainAPIClient.apiKey` for the full rationale.
 //
 // Design intentionally mirrors the web login screen
 // (`web/src/app/login/login-form.tsx`): brand mark + "brain" wordmark,
@@ -22,12 +30,7 @@ import UIKit
 struct LoginView: View {
 
     @Environment(\.brainAPIClient) private var apiClient
-
-    /// Parent (ContentView) hands us a callback so it can flip its
-    /// `apiKey` state and route to the signed-in placeholder once we've
-    /// finished writing to Keychain. Cleaner than NotificationCenter or
-    /// a shared observable for a flow this small.
-    let onSignedIn: () -> Void
+    @Environment(AuthSession.self) private var authSession
 
     @State private var email: String = ""
     @State private var password: String = ""
@@ -131,6 +134,14 @@ struct LoginView: View {
 
                 // Persist creds. Each `try` is wrapped so a single
                 // Keychain hiccup doesn't leave us partially signed-in.
+                //
+                // Order: write Keychain first, then update the API
+                // client's key, then flip the AuthSession last.
+                // ContentView observes `authSession.state` and will
+                // re-render synchronously on the flip — by that
+                // point Keychain and the API client are already
+                // consistent so any immediately-fired authenticated
+                // request reads the right key.
                 if let mintedKey = response.apiKey {
                     try KeychainStore.save(mintedKey.key, for: .apiKey)
                     try KeychainStore.save(mintedKey.id, for: .apiKeyId)
@@ -139,7 +150,7 @@ struct LoginView: View {
                 try KeychainStore.save(response.userId, for: .userId)
                 try KeychainStore.save(response.email, for: .userEmail)
 
-                onSignedIn()
+                authSession.didSignIn(userId: response.userId, email: response.email)
             } catch let error as BrainAPIClient.Error {
                 errorMessage = error.userFacingMessage
             } catch let error as KeychainError {
@@ -163,5 +174,6 @@ struct LoginView: View {
 }
 
 #Preview {
-    LoginView(onSignedIn: {})
+    LoginView()
+        .environment(AuthSession(state: .signedOut))
 }
