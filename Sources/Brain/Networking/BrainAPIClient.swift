@@ -174,10 +174,51 @@ actor BrainAPIClient {
         try await performIgnoringBody(request)
     }
 
-    /// `GET /api/v1/sync` — implemented in M33.
+    /// `GET /api/v1/sync` — incremental delta feed implemented in M33.
+    ///
+    /// `since` is the `server_time` cursor returned by the previous call
+    /// (URL-safe `Z`-suffixed ISO-8601 per the M28 server contract). Pass
+    /// `nil` on first launch to get the full data set. The string is sent
+    /// straight back to the server — we percent-encode it for transport
+    /// but never parse it, so timezone/precision quirks stay opaque to
+    /// the client.
     func sync(since: String?) async throws -> SyncResponse {
-        _ = since
-        throw Error.notImplemented("sync")
+        let request = try makeSyncRequest(since: since)
+        return try await perform(request, as: SyncResponse.self)
+    }
+
+    /// Build the `GET /api/v1/sync[?since=...]` request. Split out from
+    /// `makeRequest(method:path:...)` because the latter resolves a path
+    /// via `endpoint(_:)` and has no clean place to attach a query —
+    /// `appendingPathComponent` would encode the `?` as part of the path.
+    private func makeSyncRequest(since: String?) throws -> URLRequest {
+        let base = endpoint("/api/v1/sync")
+        let url: URL
+        if let since = since {
+            guard var components = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
+                throw Error.invalidURL
+            }
+            components.queryItems = [URLQueryItem(name: "since", value: since)]
+            guard let resolved = components.url else {
+                throw Error.invalidURL
+            }
+            url = resolved
+        } else {
+            url = base
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let apiKey = apiKey {
+            // `X-API-Key` (not `Authorization: Bearer`) — see the
+            // `apiKey` doc-comment for why. Using the same header here
+            // as `makeRequest` keeps audit attribution consistent
+            // across the sync path and every other authenticated call.
+            request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+        }
+        return request
     }
 
     /// `GET /api/v1/projects` — implemented in M33/M35.

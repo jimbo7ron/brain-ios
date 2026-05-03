@@ -37,9 +37,9 @@ final class LocalProject {
     @Attribute(.unique) var id: String
     var shortId: String
     var name: String
-    /// Raw CSS value from the server (e.g. `hsl(262 83% 58%)`). Render via
-    /// `BrainColors.bySlug(...)` if we recognise it; otherwise fall back to
-    /// a server-provided string.
+    /// Raw CSS value from the server (e.g. `hsl(262 83% 58%)`). Match
+    /// against `BrainColors.palette` by `cssValue` if recognised;
+    /// otherwise fall back to the system tint.
     var color: String?
     var sortOrder: Int
     var archived: Bool

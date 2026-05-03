@@ -40,12 +40,6 @@ enum BrainColors {
     ]
 
     static let `default`: BrainColor = violet
-
-    /// Look up a swatch by slug. Returns `nil` for unknown values so callers
-    /// can fall back to whatever the server stored verbatim.
-    static func bySlug(_ slug: String) -> BrainColor? {
-        palette.first { $0.id == slug }
-    }
 }
 
 // MARK: - HSL → display-P3 RGB

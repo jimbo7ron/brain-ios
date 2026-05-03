@@ -26,6 +26,11 @@ enum BrainSymbols {
     /// Lucide `CalendarClock` — Due Today.
     static let dueToday = "calendar"
 
+    /// Lucide `CalendarRange` — "Coming up" section. Distinct from
+    /// `dueToday` so the two adjacent sections read as visually
+    /// different at a glance.
+    static let comingUp = "calendar.badge.clock"
+
     /// Lucide `MapPin` — Appointments.
     static let location = "mappin.and.ellipse"
 

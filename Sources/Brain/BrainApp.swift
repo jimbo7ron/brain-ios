@@ -2,11 +2,12 @@
 // brain-ios
 //
 // App entry point. Wires up the SwiftData ModelContainer, the shared
-// BrainAPIClient, and the shared AuthSession, then presents
-// ContentView. Login (M32) and sync (M33) reach the API client
-// through `\.brainAPIClient` in the environment so they share the
-// same `apiKey` state; views read auth state via
-// `@Environment(AuthSession.self)`.
+// BrainAPIClient, the shared AuthSession, and (M33) the SyncEngine,
+// then presents ContentView. Login (M32) and sync (M33) reach the
+// API client through `\.brainAPIClient` in the environment so they
+// share the same `apiKey` state; views read auth state via
+// `@Environment(AuthSession.self)` and the sync engine via
+// `\.syncEngine`.
 
 import SwiftData
 import SwiftUI
@@ -34,13 +35,24 @@ struct BrainApp: App {
     /// 401 without reaching into a parent view's local state.
     let authSession: AuthSession
 
-    /// `@MainActor` because `AuthSession` is main-actor-isolated and
-    /// we construct one below. SwiftUI already runs `App.init` on
-    /// the main thread; this just makes the contract explicit so
-    /// strict concurrency stops complaining about cross-actor
-    /// initialisation.
+    /// Single shared sync engine. Holds the cursor and orchestrates
+    /// `GET /api/v1/sync` (M33). `@StateObject` keeps it alive across
+    /// SwiftUI re-renders and lets views observe `isSyncing` etc. via
+    /// `@EnvironmentObject` or `\.syncEngine`. We build it in `init`
+    /// rather than lazily so the M34 `SignedInRootView`'s `.task` can
+    /// trigger the first sync without an extra plumbing hop. The
+    /// engine owns the foreground 5-minute Timer internally so the
+    /// view layer doesn't have to manage that lifetime.
+    @StateObject private var syncEngine: SyncEngine
+
+    /// `@MainActor` because `AuthSession` and `SyncEngine` are both
+    /// main-actor-isolated and we construct them here. SwiftUI
+    /// already runs `App.init` on the main thread; this just makes
+    /// the contract explicit so strict concurrency stops complaining
+    /// about cross-actor initialisation.
     @MainActor
     init() {
+        let modelContainer: ModelContainer
         do {
             let schema = Schema([
                 LocalUser.self,
@@ -52,13 +64,14 @@ struct BrainApp: App {
                 LocalMutationQueueItem.self,
             ])
             let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
-            self.modelContainer = try ModelContainer(for: schema, configurations: [configuration])
+            modelContainer = try ModelContainer(for: schema, configurations: [configuration])
         } catch {
             // If the store is corrupt at launch we have no graceful fallback —
             // the app is unusable without local storage. Surface a fatal error
             // so it shows up in crash logs rather than silently breaking.
             fatalError("Failed to create SwiftData ModelContainer: \(error)")
         }
+        self.modelContainer = modelContainer
 
         // Pull the configured server URL out of Keychain (set in
         // SettingsView). `try?` collapses both "key missing" and
@@ -68,7 +81,8 @@ struct BrainApp: App {
         let storedServer = (try? KeychainStore.load(.serverURL)) ?? nil
         let serverURL = storedServer.flatMap(URL.init(string:)) ?? defaultBrainServerURL
         let storedApiKey = (try? KeychainStore.load(.apiKey)) ?? nil
-        self.apiClient = BrainAPIClient(serverURL: serverURL, apiKey: storedApiKey)
+        let apiClient = BrainAPIClient(serverURL: serverURL, apiKey: storedApiKey)
+        self.apiClient = apiClient
 
         // AuthSession reads Keychain itself in its initialiser. We
         // build it here so the same instance is shared across the
@@ -76,10 +90,29 @@ struct BrainApp: App {
         // Known limitation: pre-first-unlock background launches see
         // `errSecInteractionNotAllowed` from Keychain reads, which we
         // collapse to nil and treat as signed out. Becomes
-        // load-bearing once M33 wires up Background App Refresh; fix
+        // load-bearing once M41 wires up Background App Refresh; fix
         // there is to defer the read until first unlock rather than
         // bouncing the user to LoginView.
-        self.authSession = AuthSession()
+        let authSession = AuthSession()
+        self.authSession = authSession
+
+        // SyncEngine writes via its own `ModelContext`. We deliberately
+        // do NOT reuse the SwiftUI-injected context — that one is owned
+        // by the view hierarchy and can be torn down on scene churn. A
+        // dedicated context tied to the same container shares the
+        // SwiftData store while keeping the engine's lifetime aligned
+        // with the app, not the view tree.
+        //
+        // The engine takes the AuthSession so that on a 401 it can
+        // call `authSession.signedOut()` directly — flipping the UI
+        // back to LoginView without reaching through ContentView state.
+        let context = ModelContext(modelContainer)
+        let engine = SyncEngine(
+            client: apiClient,
+            modelContext: context,
+            authSession: authSession
+        )
+        _syncEngine = StateObject(wrappedValue: engine)
     }
 
     var body: some Scene {
@@ -87,6 +120,8 @@ struct BrainApp: App {
             ContentView()
                 .environment(\.brainAPIClient, apiClient)
                 .environment(authSession)
+                .environment(\.syncEngine, syncEngine)
+                .environmentObject(syncEngine)
         }
         .modelContainer(modelContainer)
     }
