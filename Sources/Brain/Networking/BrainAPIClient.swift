@@ -40,7 +40,19 @@ actor BrainAPIClient {
 
     enum Error: Swift.Error, CustomStringConvertible {
         case unauthorized
+        /// Server returned 404 for a specific RESOURCE the client asked
+        /// about (e.g. note that no longer exists). Mutation queue
+        /// poisons this — replaying will never succeed.
         case notFound
+        /// Server returned 404 for the PATH itself (route not registered
+        /// in the server's router, or a reverse-proxy 404). Distinct
+        /// from `.notFound` because:
+        ///   * resource-404 = "the thing is gone, give up"
+        ///   * route-404 = "iOS expects an endpoint the server doesn't
+        ///     have" — typically a misconfigured server URL or an iOS
+        ///     build that's newer than the deployed server. Should
+        ///     backoff + surface loudly, NOT poison.
+        case routeNotFound
         case rateLimited(retryAfter: TimeInterval?)
         case validationError(detail: String)
         case network(URLError)
@@ -54,7 +66,9 @@ actor BrainAPIClient {
             case .unauthorized:
                 return "Unauthorized — sign in again."
             case .notFound:
-                return "Not found."
+                return "Resource not found."
+            case .routeNotFound:
+                return "Server endpoint not found — check server URL or update the app."
             case .rateLimited(let retry):
                 if let retry = retry {
                     return "Rate limited — retry in \(Int(retry))s."
@@ -579,7 +593,7 @@ actor BrainAPIClient {
         case 401:
             throw Error.unauthorized
         case 404:
-            throw Error.notFound
+            throw Self.classify404(response: http, data: data, decoder: decoder)
         case 422:
             let detail = (try? decoder.decode(ErrorEnvelope.self, from: data))?.detail
                 ?? String(data: data, encoding: .utf8)
@@ -609,7 +623,7 @@ actor BrainAPIClient {
         case 401:
             throw Error.unauthorized
         case 404:
-            throw Error.notFound
+            throw Self.classify404(response: http, data: data, decoder: decoder)
         case 422:
             let detail = (try? decoder.decode(ErrorEnvelope.self, from: data))?.detail
                 ?? String(data: data, encoding: .utf8)
@@ -623,6 +637,94 @@ actor BrainAPIClient {
             throw Error.unknown(statusCode: http.statusCode, body: body)
         }
     }
+
+    /// Decide whether a 404 means "the resource you asked about doesn't
+    /// exist" (poison-worthy) or "the path you asked for isn't routed
+    /// on this server" (transient — likely a deploy / config issue).
+    ///
+    /// Heuristic — necessarily fuzzy because HTTP doesn't distinguish
+    /// these cases at the status-code layer. Discrimination order:
+    ///
+    ///   1. **Non-JSON body / `Content-Type: text/html`** → routeNotFound.
+    ///      This is what reverse proxies (nginx, Cloudflare) emit when
+    ///      the request never reaches the brain server, e.g. because
+    ///      the configured base URL is wrong.
+    ///
+    ///   2. **JSON body with `detail` of `"Not Found"`** → routeNotFound.
+    ///      This is FastAPI's default for an unrouted path.
+    ///
+    ///   3. **JSON body with `detail` starting with a known resource
+    ///      label (`"Note "`, `"Project "`, `"Section "`, etc.)** →
+    ///      notFound. brain's server uniformly emits `"<Type> not
+    ///      found: <id>"` for resource-404s; matching the prefix lets
+    ///      us distinguish from a future endpoint we haven't routed
+    ///      yet whose 404 happens to be JSON.
+    ///
+    ///   4. **Anything else** (JSON body that doesn't match either
+    ///      shape, missing/empty body, etc.) → routeNotFound. This is
+    ///      the conservative choice: false-positive routeNotFound
+    ///      means "backoff + log loudly" (recoverable on next replay
+    ///      once config is fixed), whereas a false-positive notFound
+    ///      poisons a queue item permanently. Better to over-retry
+    ///      than to silently drop a user's mutation.
+    ///
+    /// Caveat: the `detail`-prefix list is hand-maintained against the
+    /// brain server. Adding a new resource type that emits
+    /// `"<NewType> not found: ..."` requires adding a prefix here, or
+    /// every legitimate not-found will be classified as routeNotFound
+    /// and the queue will retry forever (until the maxAttempts cap).
+    /// That's a recoverable failure mode, not data loss.
+    static func classify404(
+        response: HTTPURLResponse,
+        data: Data,
+        decoder: JSONDecoder
+    ) -> Error {
+        let contentType = (response.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+        // If the response body isn't JSON at all, we're almost
+        // certainly looking at a reverse-proxy or load-balancer 404.
+        if !contentType.contains("application/json") {
+            return .routeNotFound
+        }
+        guard let envelope = try? decoder.decode(ErrorEnvelope.self, from: data) else {
+            // JSON Content-Type but body didn't parse as
+            // `{"detail": "..."}`. Could be a stub server / mock
+            // returning weird JSON. Treat as route-not-found rather
+            // than poisoning a real mutation.
+            return .routeNotFound
+        }
+        let detail = envelope.detail
+        // FastAPI's default 404 for an unrouted path.
+        if detail == "Not Found" {
+            return .routeNotFound
+        }
+        // brain server's resource-404 envelopes start with a known
+        // resource type label. Match case-insensitively so a server
+        // tweak ("note not found:") doesn't break classification.
+        let lower = detail.lowercased()
+        for label in Self.resourceNotFoundPrefixes {
+            if lower.hasPrefix(label) {
+                return .notFound
+            }
+        }
+        // JSON envelope but `detail` doesn't match any known shape.
+        // Conservatively classify as routeNotFound so we don't poison
+        // a queue item on a 404 we don't recognise.
+        return .routeNotFound
+    }
+
+    /// Lowercase prefixes of `detail` strings the brain server emits
+    /// when a specific resource is missing. Maintained alongside
+    /// `server.py` raise sites — keep in sync when a new resource
+    /// type lands. Lower-cased so the match in `classify404` is
+    /// case-insensitive (server actually uses Title Case today).
+    private static let resourceNotFoundPrefixes: [String] = [
+        "note not found",
+        "project not found",
+        "section not found",
+        "api key not found",
+        "device token not found",
+        "appointment not found",
+    ]
 
     /// Validate that `raw` is a UUID before it gets spliced into a URL
     /// path. Returns the canonical (lowercased, hyphenated) string on
@@ -657,7 +759,9 @@ extension BrainAPIClient.Error {
         case .unauthorized:
             return "That email and password didn't match. Try again."
         case .notFound:
-            return "Server endpoint not found. Check the server URL in Settings."
+            return "That item was deleted on the server."
+        case .routeNotFound:
+            return "Server doesn't recognise that endpoint. Update the app or check the server URL."
         case .rateLimited(let retry):
             if let retry = retry {
                 return "Too many attempts — try again in \(Int(retry))s."

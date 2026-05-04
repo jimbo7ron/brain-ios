@@ -228,12 +228,52 @@ final class MutationQueue {
                     // unknown). Poison the row and drain the rest of
                     // the queue — otherwise a single bad item blocks
                     // every later mutation.
+                    //
+                    // `.notFound` here specifically means a
+                    // RESOURCE-not-found (a note/project the server
+                    // confirms doesn't exist). Route-not-found is a
+                    // separate case below — it should NOT poison.
                     item.attempts += 1
                     item.nextRetryAt = .distantFuture
                     item.lastError = "Permanent failure: \(error)"
                     try? modelContext.save()
                     lastError = error.userFacingMessage
                     continue
+
+                case .routeNotFound:
+                    // Server returned 404 for the PATH itself, not the
+                    // resource. This signals iOS and the server are
+                    // out of sync: misconfigured server URL, missing
+                    // endpoint, or an iOS build newer than the
+                    // deployed server. Poisoning would be wrong — a
+                    // user with a bad URL would have every queued
+                    // mutation permanently dropped. Backoff with the
+                    // same retry-cap as other transient failures, but
+                    // log LOUDLY (NSLog so it shows up outside the
+                    // SwiftUI debug pane) so an operator can spot it.
+                    let attemptsAfter = item.attempts + 1
+                    item.attempts = attemptsAfter
+                    if attemptsAfter >= Self.maxAttempts {
+                        item.nextRetryAt = .distantFuture
+                        item.lastError = "Retry cap exceeded after \(attemptsAfter) attempts: \(error)"
+                    } else {
+                        let delay = backoff(attempts: attemptsAfter)
+                        item.nextRetryAt = Date().addingTimeInterval(delay)
+                        item.lastError = String(describing: error)
+                    }
+                    try? modelContext.save()
+                    // Surface the route-not-found case via lastError
+                    // so the UI (M44 territory) can hint at the
+                    // out-of-sync server. The message wording is
+                    // chosen to point at the operator action, not the
+                    // user's data.
+                    lastError = error.userFacingMessage
+                    NSLog(
+                        "MutationQueue: route-not-found on \(item.op) for resource " +
+                        "\(item.resourceId). Server URL may be misconfigured or the iOS " +
+                        "client is newer than the deployed server. Backing off; will retry."
+                    )
+                    return
 
                 default:
                     // Transient failure (5xx, network, rate-limit,
