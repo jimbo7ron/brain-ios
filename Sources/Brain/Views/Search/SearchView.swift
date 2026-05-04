@@ -5,9 +5,11 @@
 // tab in `SignedInRootView`. Mirrors the web's search-box: the user
 // types a substring, the app debounces 300 ms, then hits
 // `GET /api/v1/notes?q=<query>` and renders the matches as a tappable
-// list. Tapping a row opens the row's edit dialog (todos) or jumps
-// to the parent project (notes / appointments — M43 ships with the
-// minimal "edit if possible" routing; deeper drill-down is M44+).
+// list. Tapping a row presents the M40 `EditTodoView` for the row's
+// `LocalNote` if the SwiftData cache has it; otherwise the tap is a
+// no-op (cache hasn't synced this row yet — same graceful degradation
+// we use elsewhere). Appointments and plain notes share the same
+// edit surface; a dedicated read-only detail view is M44+.
 //
 // Why server-side search rather than scanning the SwiftData store:
 //   * The server's `q` parameter is full-text against `title` +
@@ -77,6 +79,32 @@ struct SearchView: View {
         Dictionary(uniqueKeysWithValues: projects.map { ($0.id, $0) })
     }
 
+    /// All non-archived local notes, used to resolve a tapped wire
+    /// `Note` (DTO) back into the `LocalNote` SwiftData model that
+    /// `EditTodoView` expects. Cheap at personal-app scale — the same
+    /// pattern TodayView uses to bucket todos for its sections.
+    @Query(filter: #Predicate<LocalNote> { $0.archived == false })
+    private var localNotes: [LocalNote]
+
+    private var localNotesById: [String: LocalNote] {
+        Dictionary(uniqueKeysWithValues: localNotes.map { ($0.id, $0) })
+    }
+
+    /// The note currently being edited, or `nil` when no sheet is
+    /// presented. Mirrors `ProjectListView.projectToEdit` — using
+    /// `sheet(item:)` lets a single sheet host serialise across all
+    /// rows without per-row state. M43 routing decision (tap → edit
+    /// dialog vs project navigation): we open `EditTodoView` for any
+    /// row whose `Note.id` resolves to a cached `LocalNote`, regardless
+    /// of `type`. Appointments are rare in search results today and a
+    /// dedicated read-only detail view is M44+; until then, the edit
+    /// dialog is the only existing surface that can show a note's
+    /// fields, so reusing it keeps the tap target meaningful instead
+    /// of dead. Rows whose id isn't in the local cache (cache hasn't
+    /// synced yet) are no-ops — same graceful degradation we use
+    /// elsewhere when the cache lags the server.
+    @State private var noteToEdit: LocalNote?
+
     /// UserDefaults key for recent searches. Scoped under the bundle
     /// so a future "shared container with widget extension" wouldn't
     /// collide on the bare key.
@@ -109,6 +137,23 @@ struct SearchView: View {
                 }
                 .task {
                     loadRecentSearches()
+                }
+                .onDisappear {
+                    // M43 polish: cancel any in-flight debounced fetch
+                    // when the user leaves the Search tab. Without this
+                    // a slow request would keep running in the
+                    // background, mutate `results` after we're off
+                    // screen, and (worse) push a stale entry into the
+                    // recents list once it resolved.
+                    searchTask?.cancel()
+                    searchTask = nil
+                }
+                .sheet(item: $noteToEdit) { note in
+                    // Reuse the M40 edit dialog for any tapped result.
+                    // See `noteToEdit` doc-comment for why we don't
+                    // branch on `note.type` — appointments and plain
+                    // notes get the same surface today.
+                    EditTodoView(note: note)
                 }
         }
     }
@@ -149,6 +194,13 @@ struct SearchView: View {
                 Section {
                     ForEach(recentSearches, id: \.self) { recent in
                         Button {
+                            // M43 polish: light haptic on a recents
+                            // tap — the field about to repopulate is
+                            // a meaningful state change worth
+                            // confirming by feel. Matches the
+                            // TodoRow.toggle() / QuickAdd.submit()
+                            // treatment.
+                            BrainHaptics.light()
                             query = recent
                         } label: {
                             HStack {
@@ -195,13 +247,35 @@ struct SearchView: View {
             }
             Section {
                 ForEach(results, id: \.id) { note in
-                    SearchResultRow(
-                        note: note,
-                        accentColor: SearchView.accentColor(
-                            for: note,
-                            projectsById: projectsById
+                    // Wrap each row in a Button so the entire row is
+                    // tappable. We picked the `Button { selectedNote }`
+                    // + `.sheet(item:)` pattern over `NavigationLink`
+                    // here because (a) it matches what M35's
+                    // ProjectListView already uses for "long-press →
+                    // edit" so iOS feels uniform, and (b) the search
+                    // result list shouldn't push onto the stack — the
+                    // user wants to edit and bounce back to refine
+                    // their query.
+                    Button {
+                        if let local = localNotesById[note.id] {
+                            noteToEdit = local
+                        }
+                        // Cache miss: silently no-op. The most
+                        // common cause is "user just signed in on a
+                        // new device and the row hasn't synced yet"
+                        // — surfacing an error here would be more
+                        // confusing than just letting the next tap
+                        // succeed once sync catches up.
+                    } label: {
+                        SearchResultRow(
+                            note: note,
+                            accentColor: SearchView.accentColor(
+                                for: note,
+                                projectsById: projectsById
+                            )
                         )
-                    )
+                    }
+                    .buttonStyle(.plain)
                 }
             } footer: {
                 if isSearching {

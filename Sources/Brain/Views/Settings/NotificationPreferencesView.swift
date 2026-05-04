@@ -152,10 +152,19 @@ struct NotificationPreferencesView: View {
     /// nil-coalescing default) means a regression — a binding leaking
     /// outside the gated branch — would crash loudly in DEBUG instead
     /// of silently writing to a sentinel struct.
+    ///
+    /// M43 polish — haptic on toggle changes: a `Bool` field flipping
+    /// is a discrete commit the user actively chose, so we fire a
+    /// light haptic before the debounced save. We deliberately skip
+    /// non-Bool fields (e.g. the time picker) because a wheel-drag
+    /// would otherwise fire dozens of haptics per gesture.
     private func binding<T>(_ keyPath: WritableKeyPath<NotificationPreferences, T>) -> Binding<T> {
         Binding(
             get: { self.prefs![keyPath: keyPath] },
             set: { newValue in
+                if T.self == Bool.self {
+                    BrainHaptics.light()
+                }
                 self.prefs?[keyPath: keyPath] = newValue
                 self.scheduleDebouncedSave()
             }
