@@ -378,6 +378,84 @@ struct DeviceRegisterPayload: Encodable, Hashable {
     }
 }
 
+// MARK: - Notification preferences (M42)
+
+/// Mirrors the M42 server response from
+/// `GET /api/v1/preferences/notifications`. The server returns a full
+/// snapshot with the four toggle / time fields plus the user's stored
+/// timezone. Defaults (`defaults`) match what the server returns the
+/// very first time a user reads the endpoint — useful as a fallback so
+/// the form doesn't crash on a transient decode error during the
+/// rollout window when the server hasn't redeployed yet.
+///
+/// We use explicit `CodingKeys` (rather than
+/// `keyEncodingStrategy = .convertToSnakeCase`) so the wire shape stays
+/// obvious in source and is greppable against the Python schema. Match
+/// the existing pattern used for every other DTO in this file.
+struct NotificationPreferences: Codable, Equatable {
+    /// Master switch for the daily summary push. When false the M42
+    /// scheduler skips this user entirely; the time field is ignored.
+    var morningBriefingEnabled: Bool
+    /// `"HH:MM"` 24-hour string. Server interprets it in the user's
+    /// stored `timezone`. We round-trip it as a string rather than a
+    /// `Date` so DST edges don't drift the value silently.
+    var morningBriefingTime: String
+    /// Per-todo reminder at the row's `due_time`. Off by default to
+    /// avoid spamming users on first sign-in before they've opted in.
+    var dueRemindersEnabled: Bool
+    /// Once-a-day 9 AM digest of items due today with no specific
+    /// `due_time`. Complements `dueRemindersEnabled` rather than
+    /// duplicating it — they fire on disjoint sets of todos.
+    var dueTodayEnabled: Bool
+    /// IANA tz identifier (e.g. `"Europe/London"`). Read-only in the
+    /// M42 UI; M43 polish will add a picker. The view auto-syncs the
+    /// device's identifier to the server on first load if the server
+    /// has the placeholder `"UTC"` default.
+    var timezone: String
+
+    enum CodingKeys: String, CodingKey {
+        case morningBriefingEnabled = "morning_briefing_enabled"
+        case morningBriefingTime = "morning_briefing_time"
+        case dueRemindersEnabled = "due_reminders_enabled"
+        case dueTodayEnabled = "due_today_enabled"
+        case timezone
+    }
+
+    static let defaults = NotificationPreferences(
+        morningBriefingEnabled: false,
+        morningBriefingTime: "08:00",
+        dueRemindersEnabled: false,
+        dueTodayEnabled: false,
+        timezone: TimeZone.current.identifier
+    )
+}
+
+/// Patch body for `PUT /api/v1/preferences/notifications`. Mirrors the
+/// agreed M42 contract: any subset of fields, partial-update semantics
+/// (the server treats unspecified fields as "leave alone"). All-nil is
+/// a legal request body — it encodes to `{}` and is a no-op server-side.
+///
+/// Why a separate struct from `NotificationPreferences`: the GET
+/// response is required-fields-only, but PATCH bodies need optionals so
+/// we don't accidentally clobber unset fields with their zero values
+/// (e.g. sending `morning_briefing_enabled: false` on a save that only
+/// touched the time picker would silently disable the briefing).
+struct NotificationPreferencesUpdate: Encodable, Hashable {
+    var morningBriefingEnabled: Bool?
+    var morningBriefingTime: String?
+    var dueRemindersEnabled: Bool?
+    var dueTodayEnabled: Bool?
+    var timezone: String?
+
+    enum CodingKeys: String, CodingKey {
+        case morningBriefingEnabled = "morning_briefing_enabled"
+        case morningBriefingTime = "morning_briefing_time"
+        case dueRemindersEnabled = "due_reminders_enabled"
+        case dueTodayEnabled = "due_today_enabled"
+        case timezone
+    }
+}
+
 // MARK: - Health
 
 struct HealthResponse: Codable {
