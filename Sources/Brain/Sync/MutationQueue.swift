@@ -110,6 +110,15 @@ final class MutationQueue {
     /// the SyncEngine treatment.
     private(set) var lastError: String?
 
+    /// Running count of queue items dropped by LWW conflict resolution
+    /// (M38). Bumped from `dropPendingMutation(_:)` when the SyncEngine
+    /// decides an incoming server row is newer than a pending local
+    /// mutation. Surfaced as observability — a future Settings panel /
+    /// transient toast (M43) can render "N changes overwritten by web
+    /// edits". Reset on `clear()` so the count is meaningful per
+    /// signed-in session rather than across sign-out/sign-in cycles.
+    private(set) var conflictsResolved: Int = 0
+
     // MARK: - Init
 
     init(modelContext: ModelContext, client: BrainAPIClient, authSession: AuthSession) {
@@ -125,18 +134,35 @@ final class MutationQueue {
     /// optimistic local UI mutation *before* this call so the user sees
     /// instant feedback regardless of network state.
     ///
+    /// `baseUpdatedAt` is the server-side `updated_at` of the target
+    /// resource at the moment the user kicked off this edit (M38). It's
+    /// captured so LWW conflict resolution in `SyncEngine.applyRow` can
+    /// detect the case where a newer server-side write (e.g. from the
+    /// web client) lands while this mutation is still queued. Pass
+    /// `nil` for ops that don't have a pre-existing resource (creates)
+    /// or for callers that don't yet have the base — `nil` falls
+    /// through to client-wins on replay, which matches pre-M38
+    /// behaviour.
+    ///
     /// After the row is persisted we kick a fire-and-forget `replay()`
     /// Task. The `isReplaying` guard prevents a stampede if the user is
     /// rapidly enqueueing several mutations — the second `replay()` call
     /// short-circuits and the in-flight pass picks up the new row when
     /// it loops back to `nextReadyItem()`.
     @discardableResult
-    func enqueue(op: MutationOp, resourceType: String, resourceId: String, payload: Data) throws -> MutationQueueItem {
+    func enqueue(
+        op: MutationOp,
+        resourceType: String,
+        resourceId: String,
+        payload: Data,
+        baseUpdatedAt: Date? = nil
+    ) throws -> MutationQueueItem {
         let item = MutationQueueItem(
             op: op.rawValue,
             resourceType: resourceType,
             resourceId: resourceId,
-            payload: payload
+            payload: payload,
+            baseUpdatedAt: baseUpdatedAt
         )
         modelContext.insert(item)
         try modelContext.save()
@@ -270,6 +296,54 @@ final class MutationQueue {
         }
         refreshPendingCount()
         lastError = nil
+        // Reset the LWW conflict counter so it's meaningful per
+        // signed-in session. A `clear()` always implies the queue is
+        // gone (sign-out, 401, manual wipe), so the previous session's
+        // accumulated conflict count would only confuse the UI on
+        // re-sign-in.
+        conflictsResolved = 0
+    }
+
+    /// Look up the oldest pending queue item for a given resource id.
+    /// Used by `SyncEngine.applyRow` (M38) to find a queued mutation
+    /// that may conflict with an incoming server row. FIFO matches the
+    /// replay order, so picking the oldest gives us the same item the
+    /// replayer would dispatch next for that resource.
+    ///
+    /// Why fetch with a predicate here rather than scanning the whole
+    /// queue: a single resource typically has 0–1 pending mutations,
+    /// and pulling them by `resourceId` keeps the SyncEngine call site
+    /// O(1) even if the queue grows large during a long offline window.
+    func pendingMutation(forResourceId id: String) -> MutationQueueItem? {
+        var descriptor = FetchDescriptor<MutationQueueItem>(
+            predicate: #Predicate { $0.resourceId == id },
+            sortBy: [SortDescriptor(\.createdAt, order: .forward)]
+        )
+        descriptor.fetchLimit = 1
+        return (try? modelContext.fetch(descriptor))?.first
+    }
+
+    /// Drop a pending queue item because LWW concluded the server's
+    /// version is newer (M38). Increments `conflictsResolved` so the
+    /// UI can surface "N changes overwritten by web edits". Called by
+    /// `SyncEngine.applyRow` when an inbound row's `updated_at` is
+    /// strictly greater than both the queue item's `baseUpdatedAt`
+    /// and `createdAt`.
+    ///
+    /// Best-effort save: a SwiftData failure here is logged via
+    /// `lastError` rather than thrown — the SyncEngine can't usefully
+    /// recover from a save failure mid-apply, and on next launch the
+    /// queue will simply still contain the row (which then replays and
+    /// — at worst — is rejected by the server with the newer state).
+    func dropPendingMutation(_ item: MutationQueueItem) {
+        modelContext.delete(item)
+        do {
+            try modelContext.save()
+            conflictsResolved += 1
+            refreshPendingCount()
+        } catch {
+            lastError = "Failed to drop conflicting mutation: \(error.localizedDescription)"
+        }
     }
 
     // MARK: - Internal helpers
@@ -460,6 +534,74 @@ enum BrainDebugMutationQueue {
         assert(queue.isReplaying == false)
     }
 
+    /// M38: LWW server-wins drop. Enqueue with a `baseUpdatedAt`,
+    /// then drop via `dropPendingMutation` and assert the queue
+    /// shrinks and `conflictsResolved` ticks up. Mirrors what
+    /// `SyncEngine.resolveConflictIfNeeded` does on a real conflict.
+    @MainActor
+    static func assertLWWDropIncrementsCounter() throws {
+        let schema = Schema([MutationQueueItem.self])
+        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+        let container = try ModelContainer(for: schema, configurations: [config])
+        let context = ModelContext(container)
+        let session = AuthSession(state: .signedOut)
+        let client = BrainAPIClient()
+        let queue = MutationQueue(modelContext: context, client: client, authSession: session)
+        let resourceId = "11111111-1111-1111-1111-111111111111"
+        let base = Date().addingTimeInterval(-60) // user's edit was based on something a minute old
+        let item = try queue.enqueue(
+            op: .completeTodo,
+            resourceType: "todo",
+            resourceId: resourceId,
+            payload: Data(),
+            baseUpdatedAt: base
+        )
+        assert(item.baseUpdatedAt == base, "baseUpdatedAt should round-trip through enqueue")
+        let initialConflicts = queue.conflictsResolved
+        let initialPending = queue.pendingCount
+        // Look up the same item by resource id to exercise the helper.
+        let fetched = queue.pendingMutation(forResourceId: resourceId)
+        assert(fetched?.id == item.id, "pendingMutation(forResourceId:) should return the enqueued row")
+        guard let fetched else {
+            assertionFailure("pendingMutation lookup returned nil")
+            return
+        }
+        queue.dropPendingMutation(fetched)
+        assert(queue.conflictsResolved == initialConflicts + 1,
+               "dropPendingMutation should bump conflictsResolved")
+        assert(queue.pendingCount == initialPending - 1,
+               "dropPendingMutation should shrink pendingCount")
+        assert(queue.pendingMutation(forResourceId: resourceId) == nil,
+               "dropped mutation should no longer be findable")
+    }
+
+    /// M38: clear() resets `conflictsResolved` along with the queue
+    /// rows. The counter is per-session; a sign-out wipe should not
+    /// carry yesterday's conflict tally into a new session.
+    @MainActor
+    static func assertClearResetsConflictCounter() throws {
+        let schema = Schema([MutationQueueItem.self])
+        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+        let container = try ModelContainer(for: schema, configurations: [config])
+        let context = ModelContext(container)
+        let session = AuthSession(state: .signedOut)
+        let client = BrainAPIClient()
+        let queue = MutationQueue(modelContext: context, client: client, authSession: session)
+        let item = try queue.enqueue(
+            op: .completeTodo,
+            resourceType: "todo",
+            resourceId: "22222222-2222-2222-2222-222222222222",
+            payload: Data(),
+            baseUpdatedAt: Date()
+        )
+        queue.dropPendingMutation(item)
+        assert(queue.conflictsResolved >= 1)
+        queue.clear()
+        assert(queue.conflictsResolved == 0,
+               "clear() should reset conflictsResolved")
+        assert(queue.pendingCount == 0)
+    }
+
     /// Run every check. Convenience entrypoint for a future debug menu /
     /// CI smoke step.
     @MainActor
@@ -468,6 +610,8 @@ enum BrainDebugMutationQueue {
         do {
             try assertEnqueueBumpsCount()
             try await assertEmptyReplayIsNoOp()
+            try assertLWWDropIncrementsCounter()
+            try assertClearResetsConflictCounter()
         } catch {
             assertionFailure("BrainDebugMutationQueue: setup failed: \(error)")
         }

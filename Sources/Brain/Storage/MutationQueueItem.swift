@@ -95,7 +95,34 @@ final class MutationQueueItem {
     /// user-facing copy. Optional because the happy path never sets it.
     var lastError: String?
 
-    init(op: String, resourceType: String, resourceId: String, payload: Data) {
+    /// The server's `updated_at` for the target resource at the moment
+    /// this mutation was enqueued (M38). Captured so the LWW conflict
+    /// detector in `SyncEngine.applyRow` can compare incoming server
+    /// rows against the base the user actually edited from.
+    ///
+    /// Optional for two reasons:
+    ///   * Existing queue rows from M37 builds have no base — they get
+    ///     `nil` after auto-migration. A `nil` base is treated as
+    ///     "unknown" and falls through to the client-wins branch (i.e.
+    ///     replay normally), which preserves the user's pre-M38 intent.
+    ///   * Some create-flows (e.g. `.createTodo`) have no pre-existing
+    ///     resource row, so there's no `updated_at` to capture. Those
+    ///     stay `nil`; the conflict check finds nothing pending under
+    ///     a not-yet-server-side id anyway.
+    ///
+    /// Schema note: this is an additive nullable field, which SwiftData
+    /// auto-migrates without ceremony. The destructive-fallback in
+    /// `BrainApp.init` is the safety net if a dev / TestFlight device's
+    /// store somehow can't migrate cleanly.
+    var baseUpdatedAt: Date?
+
+    init(
+        op: String,
+        resourceType: String,
+        resourceId: String,
+        payload: Data,
+        baseUpdatedAt: Date? = nil
+    ) {
         self.id = UUID()
         self.op = op
         self.resourceType = resourceType
@@ -106,5 +133,6 @@ final class MutationQueueItem {
         self.attempts = 0
         self.nextRetryAt = nil
         self.lastError = nil
+        self.baseUpdatedAt = baseUpdatedAt
     }
 }

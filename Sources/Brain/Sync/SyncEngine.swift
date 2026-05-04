@@ -300,9 +300,17 @@ final class SyncEngine: ObservableObject {
     /// idempotent (upsert by id, delete-if-exists).
     private func applyAndAdvanceCursor(_ response: SyncResponse) throws {
         for project in response.projects {
+            resolveConflictIfNeeded(
+                resourceId: project.id,
+                serverUpdatedAt: parseDate(project.updatedAt)
+            )
             upsert(project)
         }
         for note in response.notes {
+            resolveConflictIfNeeded(
+                resourceId: note.id,
+                serverUpdatedAt: parseDate(note.updatedAt)
+            )
             upsert(note)
         }
         for projectID in response.tombstones.projects {
@@ -315,6 +323,54 @@ final class SyncEngine: ObservableObject {
         // SwiftData's save() commits everything together.
         stageCursor(response.serverTime)
         try modelContext.save()
+    }
+
+    // MARK: - Conflict resolution (M38)
+
+    /// LWW (last-write-wins) conflict check. Called for every inbound
+    /// resource row before its local state is overwritten. If the
+    /// queue holds a pending mutation against the same resource AND
+    /// the server's row is strictly newer than the base the user
+    /// edited from AND newer than when the user made the edit, the
+    /// queue item is dropped — replaying it would clobber the newer
+    /// server state.
+    ///
+    /// Conditions in detail:
+    ///   * `serverUpdatedAt` must be present. Without it we can't
+    ///     compare timestamps; fall through to client-wins.
+    ///   * `baseUpdatedAt` must be present on the queue item. A nil
+    ///     base is "unknown" (M37 row, or a create op) — we can't
+    ///     prove the server moved past it, so fall through to
+    ///     client-wins.
+    ///   * `serverUpdatedAt > baseUpdatedAt`: the server has changed
+    ///     since the user started their edit. Without this, the
+    ///     incoming row could just be the echo of the user's own
+    ///     queued mutation having already been applied (race between
+    ///     sync and replay). Echoes carry `updated_at == baseUpdatedAt`
+    ///     in the absence of a server-side modification.
+    ///   * `serverUpdatedAt > createdAt`: belt-and-braces. If the
+    ///     server's row is older than the queue entry, the user's
+    ///     edit happened *after* whatever produced this server row —
+    ///     client wins.
+    ///
+    /// All four must hold to drop. Any one failing leaves the queue
+    /// item in place and lets the replayer run normally — at worst
+    /// the server rejects or no-ops the request, which is the M37
+    /// failure path we already handle.
+    ///
+    /// Always-after-apply: the server row is applied to local state
+    /// regardless. The user's optimistic UI update gets overwritten
+    /// by the server's truth in the same transaction. That's the
+    /// "lose one side of a simultaneous edit" trade-off documented in
+    /// the M38 spec — single-user app, acceptable.
+    private func resolveConflictIfNeeded(resourceId: String, serverUpdatedAt: Date?) {
+        guard let queue = mutationQueue else { return }
+        guard let serverUpdatedAt else { return }
+        guard let pending = queue.pendingMutation(forResourceId: resourceId) else { return }
+        guard let baseUpdatedAt = pending.baseUpdatedAt else { return }
+        guard serverUpdatedAt > baseUpdatedAt,
+              serverUpdatedAt > pending.createdAt else { return }
+        queue.dropPendingMutation(pending)
     }
 
     // MARK: - Project upsert
