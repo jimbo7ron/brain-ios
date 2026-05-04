@@ -45,6 +45,13 @@ struct TodoRow: View {
     /// flip with no rollback — fine for previews, never hit in
     /// production.
     @Environment(\.brainAPIClient) private var client
+    /// Optional for the same reason as `client` — the env key
+    /// default is `nil`. In production `BrainApp` always injects a
+    /// real engine; we use it on a 401 from `completeTodo` to hand
+    /// off to `signOutDueToUnauthorized()` immediately rather than
+    /// waiting up to 5 minutes for the next sync tick to detect the
+    /// revoked key. See `toggle()` for the catch-block branching.
+    @Environment(\.syncEngine) private var syncEngine
 
     /// Tracks whether a toggle is currently in flight. Prevents a
     /// rapid double-tap from firing two POSTs against the server
@@ -206,6 +213,21 @@ struct TodoRow: View {
             // item ("`prepare()` on haptic generator") is addressed
             // there.
             BrainHaptics.light()
+        } catch BrainAPIClient.Error.unauthorized {
+            // 401: the device's API key was revoked (server-side
+            // sign-out, key rotation, etc.). Roll back the optimistic
+            // flip first — we don't want a stale "completed"
+            // checkmark lingering as the LoginView animates in — then
+            // hand off to the SyncEngine's centralised 401 handler.
+            // Without this branch the user would sit on a revoked
+            // key until the next 5-minute sync tick caught the same
+            // 401 and triggered the sign-out then; the polish here
+            // is that recovery latency drops from "up to 5 minutes"
+            // to "immediate".
+            note.completed = wasCompleted
+            note.completedAt = originalCompletedAt
+            try? modelContext.save()
+            await syncEngine?.signOutDueToUnauthorized()
         } catch {
             // Revert. Visual revert is the success signal. M43 adds
             // an error-pattern haptic so the failure is also felt —
