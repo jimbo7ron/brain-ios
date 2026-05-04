@@ -43,6 +43,12 @@ struct ProjectDetailView: View {
     /// `useState(false)` per section).
     @State private var expandedDoneSlugs: Set<String> = []
 
+    /// Drives the M40 edit-project sheet. Toolbar Edit button toggles
+    /// this; the sheet hosts `EditProjectView` bound to the same
+    /// `@Bindable` project so optimistic edits flow through SwiftUI
+    /// without a re-fetch.
+    @State private var isEditPresented: Bool = false
+
     init(project: LocalProject) {
         self.project = project
         let projectID = project.id
@@ -151,6 +157,24 @@ struct ProjectDetailView: View {
         .listStyle(.insetGrouped)
         .navigationTitle(project.name)
         .navigationBarTitleDisplayMode(.large)
+        .toolbar {
+            // M40 — top-right Edit button mirrors the web project
+            // header's pencil affordance. We could also have wired this
+            // through the long-press menu in `ProjectListView`, but
+            // that's a separate surface; users on the detail view
+            // shouldn't have to back out to edit.
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    isEditPresented = true
+                } label: {
+                    Image(systemName: BrainSymbols.edit)
+                }
+                .accessibilityLabel("Edit project")
+            }
+        }
+        .sheet(isPresented: $isEditPresented) {
+            EditProjectView(project: project)
+        }
     }
 
     // MARK: - Header
