@@ -36,6 +36,11 @@ struct TodayView: View {
 
     @Environment(\.syncEngine) private var syncEngine
 
+    /// Drives the M39 quick-add sheet. `@State` (not `@SceneStorage`)
+    /// because the sheet is a transient capture surface; we don't want
+    /// it to re-open on a fresh launch.
+    @State private var isQuickAddPresented: Bool = false
+
     /// Open todos with a `due_date`. Filtered server-side via the
     /// predicate so we don't drag completed / undated todos into the
     /// view's working set. Sort by `dueDate` (string sort matches
@@ -136,7 +141,23 @@ struct TodayView: View {
 
     var body: some View {
         NavigationStack {
-            List {
+            ZStack(alignment: .bottomTrailing) {
+                listContent
+                quickAddButton
+            }
+            .navigationTitle("Today")
+            .sheet(isPresented: $isQuickAddPresented) {
+                QuickAddView()
+            }
+        }
+    }
+
+    /// The Today section list. Lifted out of `body` so the FAB can sit
+    /// on top of it inside a `ZStack` without losing the
+    /// `NavigationStack` chrome.
+    @ViewBuilder
+    private var listContent: some View {
+        List {
                 // Overdue is the only section that hides when empty —
                 // matches the web (`overdue.length > 0 ? ... : null`)
                 // because an empty Overdue is the desired state and
@@ -213,23 +234,47 @@ struct TodayView: View {
                         tint: BrainColors.slate.color
                     )
                 }
-            }
-            .listStyle(.insetGrouped)
-            .navigationTitle("Today")
-            .refreshable {
-                // Pull-to-refresh: explicit user-initiated sync.
-                // SyncEngine debounces if a sync just ran, so this
-                // is safe to spam.
-                if let syncEngine {
-                    await syncEngine.sync()
-                } else {
-                    // Surfaces a wiring bug in development without
-                    // crashing release. PTR with no engine is a
-                    // silent no-op for users.
-                    assertionFailure("syncEngine should be injected")
-                }
+        }
+        .listStyle(.insetGrouped)
+        .refreshable {
+            // Pull-to-refresh: explicit user-initiated sync.
+            // SyncEngine debounces if a sync just ran, so this
+            // is safe to spam.
+            if let syncEngine {
+                await syncEngine.sync()
+            } else {
+                // Surfaces a wiring bug in development without
+                // crashing release. PTR with no engine is a
+                // silent no-op for users.
+                assertionFailure("syncEngine should be injected")
             }
         }
+    }
+
+    /// Floating-action button — bottom-right, brand-violet circle.
+    /// Mirrors the web's mobile quick-capture affordance. Sits inside
+    /// the body's `ZStack` so it stays pinned regardless of the list's
+    /// scroll position; the bottom padding lifts it clear of the tab
+    /// bar and any bottom-edge home-indicator inset.
+    @ViewBuilder
+    private var quickAddButton: some View {
+        Button {
+            isQuickAddPresented = true
+        } label: {
+            Image(systemName: BrainSymbols.add)
+                .font(.title2.weight(.semibold))
+                .foregroundStyle(.white)
+                .frame(width: 56, height: 56)
+                .background(
+                    Circle()
+                        .fill(BrainColors.violet.color)
+                )
+                .shadow(color: .black.opacity(0.18), radius: 8, x: 0, y: 4)
+        }
+        .padding(.trailing, 16)
+        .padding(.bottom, 16)
+        .accessibilityLabel("Quick add")
+        .accessibilityHint("Opens a quick-add sheet to capture a new todo.")
     }
 
     /// Build a `TodoRow` for `note`, resolving its project's accent

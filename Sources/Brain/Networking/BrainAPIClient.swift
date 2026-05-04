@@ -321,6 +321,29 @@ actor BrainAPIClient {
     /// re-opening a completed todo from the iOS client is deferred to
     /// M40. `TodoRow`'s tap handler treats a completed-row tap as a
     /// no-op until then.
+    /// `POST /api/v1/notes` — create a new note / todo / appointment.
+    /// Implemented in M39 for the quick-add path. Direct call (NOT via
+    /// the M37 mutation queue) — the user's intent is "save this thing
+    /// I just typed and tell me if it failed", which is far better
+    /// served by an immediate round-trip than by an enqueue + replay.
+    /// M40 will revisit this once the full edit dialog lands and the
+    /// queue understands `createTodo` payloads end-to-end.
+    func createNote(_ payload: CreateNotePayload) async throws -> Note {
+        let body: Data
+        do {
+            body = try encoder.encode(payload)
+        } catch {
+            throw Error.unknown(statusCode: -1, body: "failed to encode create-note body: \(error)")
+        }
+        let request = try makeRequest(
+            method: "POST",
+            path: "/api/v1/notes",
+            body: body,
+            requiresAuth: true
+        )
+        return try await perform(request, as: Note.self)
+    }
+
     func completeTodo(noteId: String) async throws -> Note {
         let request = try makeRequest(
             method: "POST",

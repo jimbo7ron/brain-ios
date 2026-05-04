@@ -249,6 +249,55 @@ struct UpdateNotePayload: Encodable, Hashable {
     }
 }
 
+/// Body for `POST /api/v1/notes` — mirrors `NoteCreate` in
+/// `brain/src/brain/schemas.py`. Used by M39's quick-add flow to mint a
+/// todo (or, in future, an appointment) directly through the API. Every
+/// type-specific field is optional; the server applies sane defaults
+/// when the key is absent. We use explicit `CodingKeys` (rather than
+/// `keyEncodingStrategy = .convertToSnakeCase`) so the wire shape stays
+/// obvious in source and is greppable against the Python schema.
+struct CreateNotePayload: Encodable, Hashable {
+    /// Required by the server — minimum 1, maximum 100k characters.
+    var content: String
+    /// Optional — extracted from `content` server-side when omitted.
+    var title: String?
+    /// `"note"` | `"todo"` | `"appointment"`. Defaults to `"note"` on
+    /// the server, but the M39 path always sends `"todo"`.
+    var type: String
+    // Todo fields
+    var dueDate: String?
+    var dueTime: String?
+    /// `"low"` | `"medium"` | `"high"`. Server defaults to `"medium"`.
+    var priority: String?
+    /// `"daily"` | `"weekly"` | `"monthly"` | `"weekdays"`.
+    var recurrence: String?
+    /// Project name or short id.
+    var project: String?
+    /// Section slug.
+    var section: String?
+    var url: String?
+    // Appointment fields
+    var startTime: String?
+    var endTime: String?
+    var location: String?
+
+    enum CodingKeys: String, CodingKey {
+        case content
+        case title
+        case type
+        case dueDate = "due_date"
+        case dueTime = "due_time"
+        case priority
+        case recurrence
+        case project
+        case section
+        case url
+        case startTime = "start_time"
+        case endTime = "end_time"
+        case location
+    }
+}
+
 // MARK: - Sync feed (M28)
 
 struct SyncTombstones: Codable, Hashable {
