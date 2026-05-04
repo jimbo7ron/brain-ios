@@ -127,12 +127,18 @@ struct BrainApp: App {
             //
             // Even on the schema-mismatch branch we BACK UP the store
             // to `<original>.backup-<timestamp>.store` (and -shm/-wal
-            // siblings) before wiping. The user's data is quarantined,
+            // siblings) by RENAMING. The user's data is quarantined,
             // not destroyed; a developer can recover it manually if
             // anyone reports loss. The next sync from the server
             // re-populates the read models; queued mutations on the
             // old schema do not survive (acceptable — see queue clear
             // semantics in `MutationQueue.handleUnauthorized`).
+            //
+            // If the backup move itself fails (permissions, disk
+            // full, etc.) the helper LEAVES THE ORIGINAL STORE IN
+            // PLACE and re-throws. We then crash with `fatalError`
+            // rather than silently deleting user data. No data is
+            // deleted in any failure path.
             //
             // The proper fix is a real `SchemaMigrationPlan`, tracked
             // separately. This is the conservative pre-TestFlight
@@ -143,11 +149,24 @@ struct BrainApp: App {
                     "BrainApp: ModelContainer init failed with schema-incompatibility error " +
                     "(\(error)). Backing up store and retrying with a fresh store."
                 )
-                let backedUpTo = Self.backUpOnDiskStore()
+                let backedUpTo: URL?
+                do {
+                    backedUpTo = try Self.backUpOnDiskStore()
+                } catch {
+                    // Backup move failed — original store is preserved
+                    // (the helper does NOT delete on failure). Crash
+                    // with a clear message so the TestFlight crash
+                    // report surfaces the underlying I/O error; the
+                    // user's data is intact on disk and recoverable.
+                    fatalError(
+                        "ModelContainer schema-fallback backup failed; original store " +
+                        "preserved on disk: \(error)"
+                    )
+                }
                 if let backedUpTo {
                     NSLog("BrainApp: existing store quarantined to \(backedUpTo.path).")
                 } else {
-                    NSLog("BrainApp: no existing store to back up (or backup failed).")
+                    NSLog("BrainApp: no existing store to back up.")
                 }
                 do {
                     modelContainer = try ModelContainer(for: schema, configurations: [configuration])
@@ -283,8 +302,8 @@ struct BrainApp: App {
         return (134000...134999).contains(nsError.code)
     }
 
-    /// Best-effort backup-then-wipe of the on-disk SwiftData store.
-    /// Used by the schema-incompatibility branch in `init` when the
+    /// Backup-then-quarantine of the on-disk SwiftData store. Used by
+    /// the schema-incompatibility branch in `init` when the
     /// `ModelContainer` fails to open in a way we recognise as
     /// recoverable.
     ///
@@ -296,13 +315,20 @@ struct BrainApp: App {
     ///
     /// Returns the URL of the primary backed-up store file (the
     /// `.store` itself, not the `-shm`/`-wal`) for logging, or `nil`
-    /// if there was no store to back up or all moves failed. We don't
-    /// throw — the retry will surface any remaining issue, and a
-    /// failed move just means the new container will fail to open
-    /// against the still-incompatible old store, which the caller
-    /// handles with `fatalError`.
-    @discardableResult
-    private static func backUpOnDiskStore() -> URL? {
+    /// if there was no store to back up.
+    ///
+    /// **Failure semantics:** if a `moveItem` call fails (permissions,
+    /// disk full, etc.) we leave the original store untouched and
+    /// re-throw. The previous version silently `removeItem`'d the
+    /// original on move failure as a "best-effort cleanup", which
+    /// contradicted the quarantine guarantee — a transient permissions
+    /// error would have wiped a TestFlight user's data with no
+    /// recovery path. The retry in `init` will likely also fail
+    /// against the still-incompatible store, which surfaces as a
+    /// `fatalError` and a TestFlight crash report — strictly better
+    /// than silent data destruction. **No data is deleted in any
+    /// failure path.**
+    private static func backUpOnDiskStore() throws -> URL? {
         let fileManager = FileManager.default
         guard let appSupport = try? fileManager.url(
             for: .applicationSupportDirectory,
@@ -327,13 +353,17 @@ struct BrainApp: App {
                     primaryBackup = backup
                 }
             } catch {
-                // Move failed (permissions, disk full, etc.). Fall back
-                // to deletion so the retry can at least succeed —
-                // matches pre-polish behaviour for this file. We
-                // already attempted to preserve the data; a delete
-                // here is best-effort cleanup.
-                NSLog("BrainApp: failed to back up \(original.lastPathComponent) (\(error)); deleting instead.")
-                try? fileManager.removeItem(at: original)
+                // Move failed. Leave the original in place and
+                // propagate — we'd rather surface a launch failure
+                // than silently delete user data. The retry in `init`
+                // will likely also fail against the still-incompatible
+                // store, which crashes with `fatalError` and shows up
+                // in the TestFlight crash log so the user can recover.
+                NSLog(
+                    "[BrainApp] schema-fallback backup failed; leaving original store at " +
+                    "\(original.path): \(error)"
+                )
+                throw error
             }
         }
         return primaryBackup
