@@ -31,6 +31,7 @@ struct LoginView: View {
 
     @Environment(\.brainAPIClient) private var apiClient
     @Environment(AuthSession.self) private var authSession
+    @Environment(\.notificationManager) private var notificationManager
 
     @State private var email: String = ""
     @State private var password: String = ""
@@ -151,6 +152,20 @@ struct LoginView: View {
                 try KeychainStore.save(response.email, for: .userEmail)
 
                 authSession.didSignIn(userId: response.userId, email: response.email)
+
+                // M41: kick APNs registration once the session is
+                // established. Fire-and-forget — registration is
+                // intentionally non-load-bearing; we don't block the
+                // UI on the permission prompt or the device-register
+                // round-trip, and a denial / failure leaves the user
+                // signed in normally. NotificationManager owns the
+                // permission state so subsequent calls are idempotent
+                // (no second prompt if the user already responded).
+                if let notificationManager {
+                    Task { @MainActor in
+                        await notificationManager.requestAuthorizationAndRegister()
+                    }
+                }
             } catch let error as BrainAPIClient.Error {
                 errorMessage = error.userFacingMessage
             } catch let error as KeychainError {

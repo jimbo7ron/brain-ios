@@ -2,18 +2,37 @@
 // brain-ios
 //
 // App entry point. Wires up the SwiftData ModelContainer, the shared
-// BrainAPIClient, the shared AuthSession, and (M33) the SyncEngine,
-// then presents ContentView. Login (M32) and sync (M33) reach the
+// BrainAPIClient, the shared AuthSession, the SyncEngine (M33), the
+// MutationQueue (M37), and the NotificationManager (M41), then
+// presents ContentView. Login (M32) and sync (M33) reach the
 // API client through `\.brainAPIClient` in the environment so they
 // share the same `apiKey` state; views read auth state via
-// `@Environment(AuthSession.self)` and the sync engine via
-// `\.syncEngine`.
+// `@Environment(AuthSession.self)`, the sync engine via
+// `\.syncEngine`, the mutation queue via `\.mutationQueue`, and the
+// notification manager via `\.notificationManager`.
+//
+// M41 also registers a `BrainAppDelegate` via `@UIApplicationDelegateAdaptor`
+// so the UIKit-only APNs callbacks (token registration + silent-push
+// wake) have a place to land. `init` stashes static refs to the
+// NotificationManager / SyncEngine / MutationQueue on the AppDelegate
+// because UIKit invokes its methods outside the SwiftUI environment.
 
 import SwiftData
 import SwiftUI
 
 @main
 struct BrainApp: App {
+
+    /// SwiftUI's bridge to the legacy UIKit AppDelegate world. We need
+    /// it for M41: the three APNs callbacks
+    /// (`didRegisterForRemoteNotificationsWithDeviceToken`,
+    /// `didFailToRegisterForRemoteNotificationsWithError`, and
+    /// `didReceiveRemoteNotification:fetchCompletionHandler:`) live on
+    /// `UIApplicationDelegate` and SwiftUI has no native equivalent.
+    /// `BrainAppDelegate` forwards the token / failure / silent-push
+    /// payloads to the NotificationManager and the SyncEngine via
+    /// static refs set in `init` below.
+    @UIApplicationDelegateAdaptor(BrainAppDelegate.self) private var appDelegate
 
     /// Single shared ModelContainer for the app. SwiftData expects one
     /// container per app process; views grab a `ModelContext` from the
@@ -53,6 +72,16 @@ struct BrainApp: App {
     /// Same lifetime as `syncEngine`: built once in `init`, shared
     /// across the scene tree via `\.mutationQueue`.
     @State private var mutationQueue: MutationQueue
+
+    /// Single shared notification manager (M41). Owns the APNs
+    /// permission + registration flow and the `POST /api/v1/devices`
+    /// round-trip. Held as `@State` (matches `mutationQueue`) because
+    /// `NotificationManager` is `@Observable`. Lifetime tied to the
+    /// app: built once in `init`, shared via `\.notificationManager`,
+    /// and stashed on `BrainAppDelegate.notificationManager` so the
+    /// AppDelegate APNs callbacks can reach it without the SwiftUI
+    /// environment.
+    @State private var notificationManager: NotificationManager
 
     /// `@MainActor` because `AuthSession` and `SyncEngine` are both
     /// main-actor-isolated and we construct them here. SwiftUI
@@ -169,6 +198,23 @@ struct BrainApp: App {
         // wipe the queue (cross-tenant safety). Held weakly inside
         // SyncEngine so the two engines don't retain each other.
         engine.attach(mutationQueue: queue)
+
+        // M41: build the notification manager and stash refs on the
+        // AppDelegate adapter so its APNs callbacks (which run
+        // outside the SwiftUI environment) can reach the singletons.
+        // `BrainAppDelegate` is constructed by SwiftUI before `init`
+        // runs, but the static refs are nil until we set them here —
+        // any APNs callback fired before this point would no-op
+        // gracefully, and in practice the system can't deliver a
+        // callback before the app has even finished launching.
+        let manager = NotificationManager(
+            client: apiClient,
+            authSession: authSession
+        )
+        _notificationManager = State(initialValue: manager)
+        BrainAppDelegate.notificationManager = manager
+        BrainAppDelegate.syncEngine = engine
+        BrainAppDelegate.mutationQueue = queue
     }
 
     /// Best-effort wipe of the on-disk SwiftData store. Used by the
@@ -209,6 +255,10 @@ struct BrainApp: App {
                 // and so `SignedInRootView` can call `replay()` after a
                 // successful sync / on scenePhase resume.
                 .environment(\.mutationQueue, mutationQueue)
+                // M41: expose the notification manager so LoginView /
+                // SettingsView can trigger registration and surface
+                // current authorization status.
+                .environment(\.notificationManager, notificationManager)
         }
         .modelContainer(modelContainer)
     }

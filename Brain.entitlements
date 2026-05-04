@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+		M41 — Apple Push Notification service entitlement.
+
+		`development` is correct for Simulator builds and for
+		dev-signed device builds. Xcode automatically rewrites this
+		key to `production` when creating an archive for TestFlight
+		or App Store distribution (the "Generate APN Production"
+		option in the archive workflow), so we ship a single
+		entitlement file rather than maintaining dev/prod variants.
+
+		Server-side, the brain push module (M29) selects the
+		matching APNs gateway via `BRAIN_APNS_USE_SANDBOX`:
+		Simulator + dev builds hit `api.sandbox.push.apple.com`,
+		archived builds hit `api.push.apple.com`.
+
+		If push registration silently fails on a real device, the
+		first thing to check is whether this entitlement was
+		actually embedded — `codesign -d --entitlements - <path>`
+		on the .app bundle should show this key.
+	-->
+	<key>aps-environment</key>
+	<string>development</string>
+</dict>
+</plist>

@@ -16,6 +16,9 @@
 // presentations without redesign — that's M43's job.
 
 import SwiftUI
+#if canImport(UserNotifications)
+import UserNotifications
+#endif
 
 struct SettingsView: View {
 
@@ -23,6 +26,7 @@ struct SettingsView: View {
     @Environment(\.brainAPIClient) private var apiClient
     @Environment(AuthSession.self) private var authSession
     @Environment(\.mutationQueue) private var mutationQueue
+    @Environment(\.notificationManager) private var notificationManager
 
     @State private var serverURL: String = ""
     @State private var savedServerURL: String = ""
@@ -80,6 +84,8 @@ struct SettingsView: View {
                 }
 
                 if authSession.isSignedIn {
+                    notificationsSection
+
                     Section {
                         Button(role: .destructive) {
                             isSigningOut = true
@@ -96,7 +102,7 @@ struct SettingsView: View {
 
                 Section {
                     LabeledContent("Bundle id", value: "io.mindkeeper.brain")
-                    LabeledContent("Roadmap milestone", value: "M34")
+                    LabeledContent("Roadmap milestone", value: "M41")
                 }
             }
             .navigationTitle("Settings")
@@ -110,7 +116,98 @@ struct SettingsView: View {
             }
             .task {
                 loadServerURL()
+                // Refresh permission state every time the screen
+                // appears — the user can flip the system toggle in
+                // Settings.app while the app is backgrounded, and
+                // the only way to notice is to re-read on next mount.
+                await notificationManager?.refreshAuthorizationStatus()
             }
+        }
+    }
+
+    // MARK: - Notifications section (M41)
+
+    /// Renders the current APNs authorization status and offers an
+    /// action button matching the state. The view is intentionally
+    /// minimal — full preferences UI (per-category toggles, quiet
+    /// hours) is M42's territory.
+    @ViewBuilder
+    private var notificationsSection: some View {
+        Section {
+            LabeledContent("Permission", value: notificationStatusLabel)
+            notificationActionButton
+            if let lastError = notificationManager?.lastError {
+                Text(lastError)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("Notifications")
+        } footer: {
+            Text("Used for due-date reminders and the morning briefing. " +
+                 "Push delivery requires the brain server to be configured " +
+                 "with an APNs key — registration here just stores the " +
+                 "device token.")
+                .font(.caption)
+        }
+    }
+
+    /// Action button whose label and behaviour depend on the current
+    /// permission status. We branch on the raw enum (rather than
+    /// rendering both buttons unconditionally) so the row stays
+    /// uncluttered and the affordance is unambiguous.
+    @ViewBuilder
+    private var notificationActionButton: some View {
+        let status = notificationManager?.authorizationStatus ?? .notDetermined
+        switch status {
+        case .denied:
+            // The only path back to granted is the system Settings
+            // app — `requestAuthorization` is one-shot, so a denial
+            // is sticky from the SDK's point of view.
+            Button {
+                notificationManager?.openSystemSettings()
+            } label: {
+                Label("Open System Settings", systemImage: BrainSymbols.settings)
+            }
+        case .notDetermined:
+            // Prompt hasn't been shown yet (or was somehow reset).
+            // Same code path as the sign-in trigger — idempotent.
+            Button {
+                Task { @MainActor in
+                    await notificationManager?.requestAuthorizationAndRegister()
+                }
+            } label: {
+                Label("Enable notifications", systemImage: "bell.badge")
+            }
+        case .authorized, .provisional, .ephemeral:
+            // No action — the user has granted permission. Settings
+            // app remains the only place to revoke, but we don't
+            // need a button for that (Apple's HIG prefers users go
+            // through Settings.app for permission revocation).
+            EmptyView()
+        @unknown default:
+            EmptyView()
+        }
+    }
+
+    /// Human-readable rendering of `UNAuthorizationStatus`. The system
+    /// API doesn't ship with a `description`, so we map the four cases
+    /// we actually surface.
+    private var notificationStatusLabel: String {
+        let status = notificationManager?.authorizationStatus ?? .notDetermined
+        switch status {
+        case .notDetermined:
+            return "Not requested"
+        case .denied:
+            return "Denied"
+        case .authorized:
+            return "Allowed"
+        case .provisional:
+            return "Provisional"
+        case .ephemeral:
+            return "Ephemeral"
+        @unknown default:
+            return "Unknown"
         }
     }
 
