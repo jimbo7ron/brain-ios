@@ -320,6 +320,37 @@ struct SyncResponse: Codable {
     }
 }
 
+// MARK: - Devices (M29 / M41)
+
+/// Body for `POST /api/v1/devices` — mirrors the M29 server's
+/// device-registration shape. Sent on the iOS side once APNs hands us
+/// a device token (M41). The server upserts on `apns_token`, so
+/// duplicate calls (re-sign-in, app reinstall with the same token)
+/// are no-ops — `last_seen_at` is bumped but no new row is inserted.
+///
+/// We use explicit `CodingKeys` (rather than
+/// `keyEncodingStrategy = .convertToSnakeCase`) so the wire shape stays
+/// obvious in source and is greppable against the Python schema. The
+/// keys must match `device_tokens` columns in `brain/src/brain/db.py`.
+struct DeviceRegisterPayload: Encodable, Hashable {
+    let apnsToken: String
+    /// Always `"ios"` from this client. Server enum also accepts
+    /// future platforms (e.g. macOS Catalyst) but we only register
+    /// iPhone today.
+    let platform: String
+    /// Human-readable label for the user's device list. Mirrors the
+    /// format used by the M30 login flow (`iPhone — <name>`) so the
+    /// device shows the same name in the API key list and the APNs
+    /// device list.
+    let deviceName: String
+
+    enum CodingKeys: String, CodingKey {
+        case apnsToken = "apns_token"
+        case platform
+        case deviceName = "device_name"
+    }
+}
+
 // MARK: - Health
 
 struct HealthResponse: Codable {

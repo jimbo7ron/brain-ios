@@ -6,9 +6,13 @@ knowledge / todo / appointment system at [mindkeeper.io](https://mindkeeper.io).
 This repo is mirrored from the brain server's data model and uses the public
 HTTP API at `https://api.mindkeeper.io`. SwiftUI + SwiftData, iOS 17+.
 
-> **Status:** M32 (login flow). Email/password sign-in mints a named device
-> API key against the brain server (M30) and stashes it in Keychain. Sync
-> engine lands in M33. See the [iOS roadmap](https://github.com/jimbo7ron/brain/blob/main/docs/ios-roadmap.md)
+> **Status:** M41 (APNs device registration + silent-push wake).
+> Email/password sign-in mints a named device API key (M30), the read
+> path syncs incrementally (M33), the write path queues and replays
+> mutations with idempotency keys (M37), Today / Projects / Quick add
+> are wired (M34/M35/M39), and APNs registration kicks on first
+> sign-in (M41). See the
+> [iOS roadmap](https://github.com/jimbo7ron/brain/blob/main/docs/ios-roadmap.md)
 > for the full milestone plan.
 
 ## Prerequisites
@@ -54,14 +58,18 @@ survives app restarts.
 ```
 brain-ios/
 ├── project.yml                   # XcodeGen spec — single source of truth
+├── Brain.entitlements            # APNs (`aps-environment`) entitlement (M41)
 ├── .swiftlint.yml                # lint config
 ├── Sources/Brain/
 │   ├── BrainApp.swift            # @main, sets up SwiftData ModelContainer
 │   ├── ContentView.swift         # auth-state-driven root router
 │   ├── Networking/               # BrainAPIClient (actor), DTOs
+│   ├── Notifications/            # NotificationManager + AppDelegate adapter (M41)
+│   ├── Parsing/                  # quick-add NLP (M39)
 │   ├── Storage/                  # KeychainStore, SwiftData models
+│   ├── Sync/                     # SyncEngine + MutationQueue
 │   ├── Theme/                    # color palette, SF Symbol map
-│   └── Views/                    # LoginView, SignedInPlaceholderView, SettingsView
+│   └── Views/                    # LoginView, Today, Projects, SettingsView, QuickAdd
 └── .github/workflows/ci.yml      # SwiftLint on PRs
 ```
 

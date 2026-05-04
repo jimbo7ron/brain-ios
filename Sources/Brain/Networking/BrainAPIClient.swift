@@ -357,6 +357,43 @@ actor BrainAPIClient {
         return try await perform(request, as: Note.self)
     }
 
+    /// `POST /api/v1/devices` — register an APNs device token (M41).
+    /// Wraps the M29 server endpoint that upserts on `apns_token`, so
+    /// calling this every sign-in is safe: a duplicate token just
+    /// bumps `last_seen_at` server-side rather than minting a new row.
+    /// Caller is `NotificationManager.handleAPNsToken(_:)`; the body
+    /// carries the lowercase-hex token plus a human-readable
+    /// `device_name` for the user's device list.
+    ///
+    /// We discard the response body — the server returns the inserted
+    /// row but the iOS client doesn't need any of it (the token is
+    /// what we already sent). M42 will revisit if a "list devices"
+    /// surface lands on the iOS side.
+    func registerDevice(
+        apnsToken: String,
+        platform: String = "ios",
+        deviceName: String
+    ) async throws {
+        let payload = DeviceRegisterPayload(
+            apnsToken: apnsToken,
+            platform: platform,
+            deviceName: deviceName
+        )
+        let body: Data
+        do {
+            body = try encoder.encode(payload)
+        } catch {
+            throw Error.unknown(statusCode: -1, body: "failed to encode device-register body: \(error)")
+        }
+        let request = try makeRequest(
+            method: "POST",
+            path: "/api/v1/devices",
+            body: body,
+            requiresAuth: true
+        )
+        try await performIgnoringBody(request)
+    }
+
     // MARK: - Internal HTTP
 
     /// Generic GET helper. `path` should start with `/`.

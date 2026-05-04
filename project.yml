@@ -35,4 +35,19 @@ targets:
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         INFOPLIST_KEY_CFBundleDisplayName: brain
+        # M41: enable silent-push wake. APNs payloads with
+        # `content-available: 1` deliver to
+        # `application(_:didReceiveRemoteNotification:fetchCompletionHandler:)`
+        # while the app is backgrounded. The system grants ~30s per
+        # wake; we use it to drain SyncEngine and the mutation queue.
+        # Space-separated values are recognised by `INFOPLIST_KEY_*` as
+        # an array, matching how `UISupportedInterfaceOrientations` is
+        # already declared above.
+        INFOPLIST_KEY_UIBackgroundModes: "remote-notification"
         GENERATE_INFOPLIST_FILE: YES
+        # M41: APNs entitlement file. `Brain.entitlements` lives at
+        # the repo root and contains `aps-environment: development`,
+        # which is correct for Simulator + dev-signed device builds.
+        # Xcode rewrites it to `production` automatically when
+        # archiving for TestFlight / App Store distribution.
+        CODE_SIGN_ENTITLEMENTS: Brain.entitlements
