@@ -6,12 +6,16 @@ knowledge / todo / appointment system at [mindkeeper.io](https://mindkeeper.io).
 This repo is mirrored from the brain server's data model and uses the public
 HTTP API at `https://api.mindkeeper.io`. SwiftUI + SwiftData, iOS 17+.
 
-> **Status:** M41 (APNs device registration + silent-push wake).
-> Email/password sign-in mints a named device API key (M30), the read
-> path syncs incrementally (M33), the write path queues and replays
-> mutations with idempotency keys (M37), Today / Projects / Quick add
-> are wired (M34/M35/M39), and APNs registration kicks on first
-> sign-in (M41). See the
+> **Status:** M43 (polish — dark mode, haptics, in-app search, App
+> Intents / Siri Shortcuts, placeholder app icon). Email/password
+> sign-in mints a named device API key (M30), the read path syncs
+> incrementally (M33), the write path queues and replays mutations
+> with idempotency keys (M37), Today / Projects / Quick add / edit
+> dialogs are wired (M34/M35/M39/M40), APNs registration kicks on
+> first sign-in (M41), and notification preferences round-trip
+> (M42). M43 adds the polish pass: tactile feedback at every commit
+> point, a dedicated Search tab, and "What's due in Brain?" / "Add
+> to Brain: …" Siri triggers. See the
 > [iOS roadmap](https://github.com/jimbo7ron/brain/blob/main/docs/ios-roadmap.md)
 > for the full milestone plan.
 
@@ -63,13 +67,15 @@ brain-ios/
 ├── Sources/Brain/
 │   ├── BrainApp.swift            # @main, sets up SwiftData ModelContainer
 │   ├── ContentView.swift         # auth-state-driven root router
+│   ├── Assets.xcassets/          # AppIcon (M43), AccentColor (M43)
+│   ├── Intents/                  # App Intents — Siri "What's due", "Add a todo" (M43)
 │   ├── Networking/               # BrainAPIClient (actor), DTOs
 │   ├── Notifications/            # NotificationManager + AppDelegate adapter (M41)
 │   ├── Parsing/                  # quick-add NLP (M39)
 │   ├── Storage/                  # KeychainStore, SwiftData models
 │   ├── Sync/                     # SyncEngine + MutationQueue
-│   ├── Theme/                    # color palette, SF Symbol map
-│   └── Views/                    # LoginView, Today, Projects, SettingsView, QuickAdd
+│   ├── Theme/                    # color palette, SF Symbol map, BrainHaptics (M43)
+│   └── Views/                    # LoginView, Today, Projects, Search (M43), SettingsView, QuickAdd
 └── .github/workflows/ci.yml      # SwiftLint on PRs
 ```
 

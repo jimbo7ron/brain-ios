@@ -102,7 +102,7 @@ struct SettingsView: View {
 
                 Section {
                     LabeledContent("Bundle id", value: "io.mindkeeper.brain")
-                    LabeledContent("Roadmap milestone", value: "M42")
+                    LabeledContent("Roadmap milestone", value: "M43")
                 }
             }
             .navigationTitle("Settings")
@@ -284,6 +284,12 @@ struct SettingsView: View {
         try? KeychainStore.wipe()
         await apiClient?.setApiKey(nil)
         authSession.signedOut()
+        // M43 polish: medium haptic on the success path only. The
+        // revoke-failure branch above returns early without flipping
+        // the session, so a stronger "you've actually signed out"
+        // confirmation here is meaningful — matches the EditTodoView
+        // Save treatment for committed mutations.
+        BrainHaptics.medium()
     }
 }
 

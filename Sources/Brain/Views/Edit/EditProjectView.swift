@@ -378,9 +378,14 @@ struct EditProjectView: View {
                 payload: encoded,
                 baseUpdatedAt: project.updatedAt
             )
+            // M43: medium haptic mirrors EditTodoView — the dialog
+            // committed a multi-field save and the user benefits
+            // from a stronger tactile confirmation.
+            BrainHaptics.medium()
             dismiss()
         } catch {
             errorMessage = "Couldn't queue the change: \(error.localizedDescription)"
+            BrainHaptics.error()
         }
     }
 

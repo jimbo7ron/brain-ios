@@ -168,11 +168,17 @@ struct QuickAddView: View {
             // 5-minute Timer. Fire-and-forget — we've already saved
             // server-side, so the user can dismiss even if sync lags.
             Task { await syncEngine?.sync() }
+            // M43: light haptic on dismiss. Matches the M36 toggle-
+            // complete pattern — a brief confirmation that the capture
+            // landed before the sheet animates away.
+            BrainHaptics.light()
             dismiss()
         } catch let error as BrainAPIClient.Error {
             errorMessage = error.userFacingMessage
+            BrainHaptics.error()
         } catch {
             errorMessage = "Couldn't save: \(error.localizedDescription)"
+            BrainHaptics.error()
         }
     }
 }
