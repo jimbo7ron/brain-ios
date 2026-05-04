@@ -102,7 +102,7 @@ struct SettingsView: View {
 
                 Section {
                     LabeledContent("Bundle id", value: "io.mindkeeper.brain")
-                    LabeledContent("Roadmap milestone", value: "M41")
+                    LabeledContent("Roadmap milestone", value: "M42")
                 }
             }
             .navigationTitle("Settings")
@@ -136,6 +136,19 @@ struct SettingsView: View {
         Section {
             LabeledContent("Permission", value: notificationStatusLabel)
             notificationActionButton
+            // M42: only expose the per-category preferences once the
+            // user has actually granted notification permission. If
+            // permission is denied or not yet determined, there's
+            // nothing the prefs page can do for them — the OS-level
+            // toggle dominates, and every category would be silently
+            // suppressed regardless of what they tweak here.
+            if notificationManager?.authorizationStatus == .authorized {
+                NavigationLink {
+                    NotificationPreferencesView()
+                } label: {
+                    Label("Preferences", systemImage: "bell.badge")
+                }
+            }
             if let lastError = notificationManager?.lastError {
                 Text(lastError)
                     .font(.caption)

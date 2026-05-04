@@ -468,6 +468,45 @@ actor BrainAPIClient {
         try await performIgnoringBody(request)
     }
 
+    /// `GET /api/v1/preferences/notifications` — fetch the per-user
+    /// notification preferences (M42). The server returns a full
+    /// snapshot every time, so callers don't need to merge — assign
+    /// the response straight onto state.
+    ///
+    /// Returns the typed `NotificationPreferences` or throws a
+    /// `BrainAPIClient.Error`. A 404 here means the server doesn't yet
+    /// have the M42 endpoints deployed (iOS may ship before the
+    /// server-side PR lands); the view treats that as a graceful
+    /// "couldn't load" rather than a hard failure.
+    func getNotificationPreferences() async throws -> NotificationPreferences {
+        try await get("/api/v1/preferences/notifications", as: NotificationPreferences.self)
+    }
+
+    /// `PUT /api/v1/preferences/notifications` — partial update of the
+    /// notification preferences (M42). Send only the fields you want to
+    /// change; the server merges and returns the full updated snapshot.
+    /// Direct call (NOT via the M37 mutation queue) because the user is
+    /// in an interactive form and benefits from immediate feedback —
+    /// failures surface as an inline error banner, and the local toggle
+    /// state is preserved so the user can retry by re-toggling.
+    func updateNotificationPreferences(
+        _ payload: NotificationPreferencesUpdate
+    ) async throws -> NotificationPreferences {
+        let body: Data
+        do {
+            body = try encoder.encode(payload)
+        } catch {
+            throw Error.unknown(statusCode: -1, body: "failed to encode notification-prefs body: \(error)")
+        }
+        let request = try makeRequest(
+            method: "PUT",
+            path: "/api/v1/preferences/notifications",
+            body: body,
+            requiresAuth: true
+        )
+        return try await perform(request, as: NotificationPreferences.self)
+    }
+
     // MARK: - Internal HTTP
 
     /// Generic GET helper. `path` should start with `/`.
