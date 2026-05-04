@@ -249,6 +249,33 @@ struct UpdateNotePayload: Encodable, Hashable {
     }
 }
 
+/// Patch body for `PUT /api/v1/projects/{id}` — mirrors `ProjectUpdate`
+/// in `brain/src/brain/schemas.py`. Every field is optional; the server
+/// applies whatever is present and ignores keys that aren't sent. Used
+/// by M40's edit-project dialog.
+///
+/// Note: this struct intentionally does NOT carry `sections`. Section
+/// editing rides separate endpoints (`POST /projects/{id}/sections`,
+/// `PUT /projects/{id}/sections`, `PATCH /projects/{id}/sections/{slug}`,
+/// `DELETE /projects/{id}/sections/{slug}`) — see `server.py`. Mirroring
+/// the wire shape exactly here means the M37 queue's PUT body matches
+/// what `update_project_endpoint` expects field-for-field.
+struct UpdateProjectPayload: Encodable, Hashable {
+    var name: String?
+    /// Raw CSS colour string (e.g. `hsl(262 83% 58%)`). Pick from
+    /// `BrainColors.palette` so iOS and web render identically.
+    var color: String?
+    var sortOrder: Int?
+    var archived: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case color
+        case sortOrder = "sort_order"
+        case archived
+    }
+}
+
 /// Body for `POST /api/v1/notes` — mirrors `NoteCreate` in
 /// `brain/src/brain/schemas.py`. Used by M39's quick-add flow to mint a
 /// todo (or, in future, an appointment) directly through the API. Every

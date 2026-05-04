@@ -77,6 +77,14 @@ struct ProjectListView: View {
     /// the detail pane don't drop the selection.
     @State private var selectedProjectID: String?
 
+    /// The project being edited via the M40 long-press → Edit flow,
+    /// or nil when the sheet is dismissed. We use the
+    /// `sheet(item:)` form (not `isPresented`) so SwiftUI rebuilds the
+    /// sheet body whenever a different row is targeted — that's the
+    /// shape that lets a single sheet host serialise across all rows
+    /// without per-row state.
+    @State private var projectToEdit: LocalProject?
+
     var body: some View {
         NavigationSplitView {
             sidebar
@@ -111,29 +119,30 @@ struct ProjectListView: View {
                         )
                     }
                     .contextMenu {
-                        // Long-press placeholders. Spec: "archive/edit
-                        // (placeholder; edit lands in M40)". We render
-                        // the menu items disabled so the affordance is
-                        // discoverable now without committing to a
-                        // partial implementation.
+                        // M40 — long-press → Edit lands the
+                        // edit-project dialog. Archive remains a
+                        // placeholder (M41 wires `MutationOp.archive
+                        // Project` end-to-end).
                         Button {
-                            // M40: archive flow
+                            // M41: archive flow
                         } label: {
                             Label("Archive", systemImage: BrainSymbols.archive)
                         }
                         .disabled(true)
 
                         Button {
-                            // M40: edit flow
+                            projectToEdit = project
                         } label: {
                             Label("Edit", systemImage: BrainSymbols.edit)
                         }
-                        .disabled(true)
                     }
                 }
             }
         }
         .navigationTitle("Projects")
+        .sheet(item: $projectToEdit) { project in
+            EditProjectView(project: project)
+        }
         .navigationDestination(for: String.self) { projectID in
             // Resolve the id back into the live `LocalProject` so the
             // detail view can subscribe to changes via `@Bindable` /
@@ -186,15 +195,16 @@ struct ProjectListView: View {
 }
 
 /// Empty-state copy for the project list. Mirrors the web sidebar:
-/// "No projects yet — hit + to create one." iOS doesn't have a "+"
-/// affordance until M40, so we point the user at the web instead.
+/// "No projects yet — hit + to create one." iOS doesn't yet have a
+/// project-create affordance (M40 ships *edit* only — create lands in
+/// a follow-up), so we point the user at the web in the meantime.
 struct EmptyProjectListView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("No projects yet.")
                 .font(.body)
                 .foregroundStyle(.secondary)
-            Text("Create one on the web — project creation lands on iOS in M40.")
+            Text("Create one on the web — project creation on iOS is coming soon.")
                 .font(.footnote)
                 .foregroundStyle(.tertiary)
         }

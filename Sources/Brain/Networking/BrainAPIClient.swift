@@ -219,20 +219,48 @@ actor BrainAPIClient {
                 idempotencyKey: key
             )
             try await performIgnoringBody(request)
+        case .updateTodo:
+            // M40: PUT /api/v1/notes/{id} with the queue item's pre-
+            // encoded JSON body. The server treats unspecified fields as
+            // "leave alone", so the payload is naturally PATCH-style
+            // (only changed fields ride). The dispatch site doesn't
+            // re-decode the body — it's already exactly what the server
+            // expects, captured at enqueue time when the user hit Save.
+            let request = try makeRequest(
+                method: "PUT",
+                path: "/api/v1/notes/\(resourceId)",
+                body: item.payload,
+                requiresAuth: true,
+                idempotencyKey: key
+            )
+            try await performIgnoringBody(request)
+        case .updateProject:
+            // M40: PUT /api/v1/projects/{id}. Same shape as updateTodo;
+            // the body is `UpdateProjectPayload` JSON encoded at
+            // enqueue. Note: this endpoint covers name/colour/sort_order
+            // /archived only — section editing rides separate endpoints
+            // and (for M40) is handled by direct API calls in
+            // `EditProjectView`, not the queue.
+            let request = try makeRequest(
+                method: "PUT",
+                path: "/api/v1/projects/\(resourceId)",
+                body: item.payload,
+                requiresAuth: true,
+                idempotencyKey: key
+            )
+            try await performIgnoringBody(request)
         case .uncompleteTodo,
              .createTodo,
-             .updateTodo,
              .archiveNote,
              .createProject,
-             .updateProject,
              .addSection:
-            // TODO(M38+): Wire each of these to its server endpoint.
-            // The shape is the same as `.completeTodo`: build a request
+            // TODO(M41+): Wire each of these to its server endpoint.
+            // The shape is the same as `.updateTodo`: build a request
             // via `makeRequest(...)` with `idempotencyKey: key`, then
-            // perform/perfomIgnoringBody depending on whether the caller
-            // cares about the response body. Keep `body` typed via the
-            // structs in `DTOs.swift` (e.g. `UpdateNotePayload`) and
-            // decode `item.payload` into them at the dispatch site.
+            // perform/performIgnoringBody depending on whether the
+            // caller cares about the response body. Keep `body` typed
+            // via the structs in `DTOs.swift` (e.g. `UpdateNotePayload`)
+            // and encode the payload at the call site before enqueue.
             throw Error.notImplemented("executeMutation(\(op.rawValue))")
         }
     }
@@ -342,6 +370,52 @@ actor BrainAPIClient {
             requiresAuth: true
         )
         return try await perform(request, as: Note.self)
+    }
+
+    /// `POST /api/v1/projects/{id}/sections` — append a new section
+    /// to a project. Implemented in M40 for the edit-project dialog.
+    /// Direct call (NOT via the M37 mutation queue) because the
+    /// queue's `MutationOp.addSection` isn't fully wired yet (M41
+    /// territory) and the user is in the middle of an interactive
+    /// edit flow that benefits from immediate per-row feedback.
+    /// Returns the full project so the caller can re-render the
+    /// section list with the server's authoritative slug + position.
+    func addProjectSection(projectId: String, name: String) async throws -> Project {
+        struct Body: Encodable { let name: String }
+        let body: Data
+        do {
+            body = try encoder.encode(Body(name: name))
+        } catch {
+            throw Error.unknown(statusCode: -1, body: "failed to encode add-section body: \(error)")
+        }
+        let request = try makeRequest(
+            method: "POST",
+            path: "/api/v1/projects/\(projectId)/sections",
+            body: body,
+            requiresAuth: true
+        )
+        return try await perform(request, as: Project.self)
+    }
+
+    /// `PATCH /api/v1/projects/{id}/sections/{slug}` — rename an
+    /// existing section. The slug is preserved server-side so any
+    /// todos pointing at it stay attached. Used by M40's edit-project
+    /// dialog. Same direct-call rationale as `addProjectSection`.
+    func renameProjectSection(projectId: String, slug: String, name: String) async throws -> Project {
+        struct Body: Encodable { let name: String }
+        let body: Data
+        do {
+            body = try encoder.encode(Body(name: name))
+        } catch {
+            throw Error.unknown(statusCode: -1, body: "failed to encode rename-section body: \(error)")
+        }
+        let request = try makeRequest(
+            method: "PATCH",
+            path: "/api/v1/projects/\(projectId)/sections/\(slug)",
+            body: body,
+            requiresAuth: true
+        )
+        return try await perform(request, as: Project.self)
     }
 
     func completeTodo(noteId: String) async throws -> Note {
