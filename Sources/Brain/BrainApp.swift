@@ -215,6 +215,19 @@ struct BrainApp: App {
         BrainAppDelegate.notificationManager = manager
         BrainAppDelegate.syncEngine = engine
         BrainAppDelegate.mutationQueue = queue
+
+        // M43: stash the same singletons on `BrainIntentsBridge` so
+        // App Intents (`WhatsDueIntent`, `AddTodoIntent`) can reach
+        // them. App Intents run outside the SwiftUI environment and
+        // would otherwise have no path to `\.brainAPIClient` /
+        // `\.mutationQueue` / the SwiftData container. Same pattern
+        // as `BrainAppDelegate.notificationManager` above — set once
+        // here, never reset, never cleared on sign-out (the bridge's
+        // intents check `authSession.isSignedIn` themselves).
+        BrainIntentsBridge.apiClient = apiClient
+        BrainIntentsBridge.authSession = authSession
+        BrainIntentsBridge.mutationQueue = queue
+        BrainIntentsBridge.modelContainer = modelContainer
     }
 
     /// Best-effort wipe of the on-disk SwiftData store. Used by the

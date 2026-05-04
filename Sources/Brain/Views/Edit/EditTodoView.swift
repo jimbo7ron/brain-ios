@@ -483,6 +483,11 @@ struct EditTodoView: View {
                 payload: encoded,
                 baseUpdatedAt: note.updatedAt
             )
+            // M43: medium haptic on a committed multi-field save.
+            // Stronger than the M36 toggle haptic (which is `.light`)
+            // because the user just typed and chose; the heavier
+            // tap reinforces the "yes, this stuck" signal.
+            BrainHaptics.medium()
             dismiss()
         } catch {
             // Enqueue failure (SwiftData fault). Roll the local update
@@ -492,6 +497,7 @@ struct EditTodoView: View {
             // is to surface the error and let the next sync re-apply
             // the server's version.
             errorMessage = "Couldn't queue the change: \(error.localizedDescription)"
+            BrainHaptics.error()
         }
     }
 

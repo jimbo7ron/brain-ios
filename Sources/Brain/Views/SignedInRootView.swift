@@ -3,11 +3,14 @@
 //
 // Tabbed root for the signed-in user. Replaces the M32/M33
 // `SignedInPlaceholderView` once we have a real Today surface to
-// land on. Three tabs:
+// land on. Four tabs (M43 added Search):
 //
 //   * Today — the M34 surface, mirroring the web `/` page.
 //   * Projects — the M35 surface. `ProjectListView` is a
 //     `NavigationSplitView` (sidebar on iPad, push-stack on iPhone).
+//   * Search — M43 in-app search across notes / todos via
+//     `GET /api/v1/notes?q=`. Debounced 300 ms, with recent-search
+//     history persisted in UserDefaults.
 //   * Settings — hosts the server URL editor and the sign-out
 //     button. In M32 those lived in a sheet behind a toolbar gear;
 //     promoting Settings to a tab here means the user always has a
@@ -37,6 +40,7 @@ struct SignedInRootView: View {
     enum Tab: Hashable {
         case today
         case projects
+        case search
         case settings
     }
 
@@ -49,6 +53,13 @@ struct SignedInRootView: View {
             ProjectListView()
                 .tabItem { Label("Projects", systemImage: "folder") }
                 .tag(Tab.projects)
+
+            // M43: in-app search across notes / todos. Hits
+            // `GET /api/v1/notes?q=` with a 300 ms debounce; recent
+            // searches persist in UserDefaults.
+            SearchView()
+                .tabItem { Label("Search", systemImage: "magnifyingglass") }
+                .tag(Tab.search)
 
             // Settings hosted as a tab — pass `showsDismissButton:
             // false` so it doesn't render a "Done" button (there's no

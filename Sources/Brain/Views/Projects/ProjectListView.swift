@@ -168,6 +168,10 @@ struct ProjectListView: View {
             // a tap-spammer can't pile up overlapping requests.
             if let syncEngine {
                 await syncEngine.sync()
+                // M43: light haptic on PTR completion. Mirrors the
+                // TodayView treatment so the two pull-to-refresh
+                // surfaces feel identical to the user.
+                BrainHaptics.light()
             } else {
                 assertionFailure("syncEngine should be injected")
             }

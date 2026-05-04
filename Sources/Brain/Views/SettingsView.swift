@@ -102,7 +102,7 @@ struct SettingsView: View {
 
                 Section {
                     LabeledContent("Bundle id", value: "io.mindkeeper.brain")
-                    LabeledContent("Roadmap milestone", value: "M42")
+                    LabeledContent("Roadmap milestone", value: "M43")
                 }
             }
             .navigationTitle("Settings")

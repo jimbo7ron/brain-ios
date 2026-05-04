@@ -323,6 +323,62 @@ actor BrainAPIClient {
         throw Error.notImplemented("listNotes")
     }
 
+    /// `GET /api/v1/notes?q=<query>&limit=<limit>` — free-text search
+    /// across `title` and `content`. Implemented in M43 for the in-app
+    /// SearchView.
+    ///
+    /// Why this endpoint rather than `POST /api/v1/search`:
+    ///   * `/api/v1/search` is the semantic-similarity endpoint backed
+    ///     by embeddings; it requires the server to have run
+    ///     `_ensure_embeddings()` and is the right hammer for "find
+    ///     things related to X".
+    ///   * `/api/v1/notes?q=...` is a substring/full-text match against
+    ///     title + content. For the iOS user typing into a search box
+    ///     ("milk", "PR review"), this is what they want — instant
+    ///     literal matches, not "things semantically near milk".
+    ///   * It also avoids the embeddings warm-up cost on cold cache,
+    ///     which can be 200–500 ms on the server's first request.
+    ///
+    /// We pass `include_completed: true` so the user can find a todo
+    /// they completed last week and re-open it (M44 territory). The
+    /// list is sorted server-side by `updated_at` desc which matches
+    /// the "most recent first" expectation users have for search.
+    func searchNotes(query: String, limit: Int = 50) async throws -> NoteListResponse {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            // Empty query is a programmer error — the caller should
+            // have suppressed the request when the field cleared.
+            // Returning an empty list is the friendliest default; we
+            // don't want to round-trip `?q=` and have the server
+            // return everything.
+            return NoteListResponse(notes: [], total: 0)
+        }
+        let base = endpoint("/api/v1/notes")
+        guard var components = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
+            throw Error.invalidURL
+        }
+        components.queryItems = [
+            URLQueryItem(name: "q", value: trimmed),
+            URLQueryItem(name: "limit", value: String(limit)),
+            // Pull completed todos into the result set — search is the
+            // canonical path for finding old work, and excluding them
+            // would surprise users who explicitly typed a substring of
+            // a completed todo's title.
+            URLQueryItem(name: "include_completed", value: "true"),
+        ]
+        guard let url = components.url else {
+            throw Error.invalidURL
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let apiKey = apiKey {
+            request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+        }
+        return try await perform(request, as: NoteListResponse.self)
+    }
+
     /// `PATCH /api/v1/notes/{id}` — implemented in M36 (edit/move).
     /// Takes a typed `UpdateNotePayload` so callers can't accidentally
     /// hand-roll JSON that drifts from `NoteUpdate` on the server.

@@ -27,9 +27,6 @@
 
 import SwiftData
 import SwiftUI
-#if canImport(UIKit)
-import UIKit
-#endif
 
 @MainActor
 struct TodoRow: View {
@@ -203,17 +200,21 @@ struct TodoRow: View {
             // Light tactile confirmation on success. Matches the iOS
             // system idiom for a "thing happened" affordance — the
             // web equivalent is the brief Lucide `Check` flash on
-            // todo-item.tsx. Skipped on platforms without UIKit
-            // (e.g. previews on macOS hosts).
-            #if canImport(UIKit)
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            #endif
+            // todo-item.tsx. M43 routes through `BrainHaptics` so the
+            // generator is `prepare()`-warmed and the latency drops
+            // below the perceptual threshold; the M36 polish-backlog
+            // item ("`prepare()` on haptic generator") is addressed
+            // there.
+            BrainHaptics.light()
         } catch {
-            // Revert. Don't surface a toast — UX polish is M43, and
-            // the visual revert is itself the failure signal.
+            // Revert. Visual revert is the success signal. M43 adds
+            // an error-pattern haptic so the failure is also felt —
+            // the rollback is silent visually (we don't surface a
+            // toast), so the haptic carries the entire signal weight.
             note.completed = wasCompleted
             note.completedAt = originalCompletedAt
             try? modelContext.save()
+            BrainHaptics.error()
         }
     }
 

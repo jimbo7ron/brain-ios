@@ -242,6 +242,14 @@ struct TodayView: View {
             // is safe to spam.
             if let syncEngine {
                 await syncEngine.sync()
+                // M43: light haptic when the sync settles. The
+                // refreshable spinner already gives a visual signal,
+                // but the haptic confirms the user's pull actually
+                // did something — particularly important when the
+                // engine debounced (no visible row movement) and the
+                // user might otherwise wonder if the gesture
+                // registered.
+                BrainHaptics.light()
             } else {
                 // Surfaces a wiring bug in development without
                 // crashing release. PTR with no engine is a
