@@ -89,7 +89,7 @@ struct User: Codable, Hashable {
 
 // MARK: - Project / Section
 
-struct Section: Codable, Hashable {
+struct SectionDTO: Codable, Hashable {
     let slug: String
     let name: String
     let position: Int
@@ -102,7 +102,7 @@ struct Project: Codable, Hashable {
     let color: String?
     let sortOrder: Int
     let archived: Bool
-    let sections: [Section]
+    let sections: [SectionDTO]
     let createdAt: String?
     let updatedAt: String?
 

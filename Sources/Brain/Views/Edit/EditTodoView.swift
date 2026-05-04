@@ -161,7 +161,7 @@ struct EditTodoView: View {
     /// here (rather than in the row dropdown) so a fresh edit-dialog
     /// open always sees the latest project list.
     @Query(
-        filter: #Predicate<LocalProject> { $0.archived == false },
+        filter: #Predicate<LocalProject> { !$0.archived },
         sort: [SortDescriptor(\LocalProject.sortOrder), SortDescriptor(\LocalProject.name)]
     )
     private var projects: [LocalProject]

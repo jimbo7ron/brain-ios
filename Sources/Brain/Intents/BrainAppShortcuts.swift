@@ -55,9 +55,9 @@ struct BrainAppShortcuts: AppShortcutsProvider {
         AppShortcut(
             intent: AddTodoIntent(),
             phrases: [
-                "Add to \(.applicationName) \(\.$content)",
-                "Add \(\.$content) to \(.applicationName)",
-                "Remind me to \(\.$content) in \(.applicationName)",
+                "Add to \(.applicationName)",
+                "Add a todo to \(.applicationName)",
+                "Remind me in \(.applicationName)",
             ],
             shortTitle: "Add a todo",
             systemImageName: "plus.circle.fill"
