@@ -262,7 +262,7 @@ struct EditTodoView: View {
                 axis: .vertical
             )
             .lineLimit(4...12)
-            .font(.body.monospaced())
+            .font(.callout.monospaced())
         }
     }
 

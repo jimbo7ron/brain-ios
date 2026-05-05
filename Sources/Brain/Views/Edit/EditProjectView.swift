@@ -276,7 +276,7 @@ struct EditProjectView: View {
                 Text(spec.name)
                 Spacer()
                 Text(spec.slug)
-                    .font(.caption.monospaced())
+                    .font(.caption2.monospaced())
                     .foregroundStyle(.tertiary)
                 Button {
                     renamingSlug = spec.slug
