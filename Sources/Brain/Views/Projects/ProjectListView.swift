@@ -6,6 +6,16 @@
 // for the list shape and feeds into `ProjectDetailView`, which
 // mirrors `web/src/app/projects/[id]/page.tsx`.
 //
+// "Unassigned" virtual project (mirror web): adds an "Unassigned" row
+// at the top of the sidebar, backed not by a `LocalProject` but by a
+// fan-out filter on `LocalNote.projectId == nil`. The literal string
+// `"unassigned"` in the navigation path resolves to
+// `UnassignedDetailView` rather than a real project lookup. The brain
+// server treats `project_id=unassigned` as a sentinel for
+// `WHERE project_id IS NULL` (`src/brain/server.py:1722-1723, 1751`),
+// so the iOS surface stays in sync with the same data the web sidebar
+// reveals at `/projects/unassigned`.
+//
 // Adaptive chrome: this view is built around `NavigationSplitView`
 // rather than `NavigationStack`, so on iPad we get a sidebar +
 // detail pane out of the box and on iPhone the same view collapses
@@ -29,6 +39,15 @@ import SwiftUI
 
 @MainActor
 struct ProjectListView: View {
+
+    /// Sentinel string the navigation path uses for the "Unassigned"
+    /// virtual project. Mirrors the URL slug the web uses
+    /// (`/projects/unassigned`) and the server's filter sentinel
+    /// (`?project_id=unassigned`). Kept as a `static let` so call
+    /// sites — including the navigation destination branch and
+    /// `UnassignedDetailView`'s wire payload — share a single source
+    /// of truth.
+    static let unassignedProjectID: String = "unassigned"
 
     @Environment(\.syncEngine) private var syncEngine
 
@@ -55,6 +74,50 @@ struct ProjectListView: View {
         }
     )
     private var openProjectTodos: [LocalNote]
+
+    /// Raw todo working set (just `type == "todo"`) — narrowed to
+    /// "open, non-archived, no project" in `openUnassignedTodos`
+    /// below. Predicate is kept minimal because the SwiftData
+    /// `#Predicate` macro under Xcode 26 times out on 4-condition AND
+    /// forms with an optional comparison (`projectId == nil`); the
+    /// remaining filters are cheap to apply in Swift over the small
+    /// per-user dataset SwiftData publishes.
+    @Query(filter: ProjectListView.unassignedTodoPredicate)
+    private var openUnassignedTodosRaw: [LocalNote]
+
+    private static let unassignedTodoPredicate: Predicate<LocalNote> = #Predicate { note in
+        note.type == "todo"
+    }
+
+    /// Swift-narrowed Unassigned working set: open, non-archived,
+    /// no-project todos. Drives both the open-count chip and the
+    /// "show or hide the row" decision (we render Unassigned only
+    /// when the user has at least one such todo OR they have no real
+    /// projects, mirroring the web's hardcoded
+    /// `/projects/unassigned` link).
+    private var openUnassignedTodos: [LocalNote] {
+        openUnassignedTodosRaw.filter {
+            !$0.completed && !$0.archived && $0.projectId == nil
+        }
+    }
+
+    /// Open-todo count surfaced on the synthetic "Unassigned" row.
+    private var unassignedOpenCount: Int { openUnassignedTodos.count }
+
+    /// Whether the user has any open unassigned todos. When `false`
+    /// AND the user has at least one real project, we suppress the
+    /// Unassigned row to avoid a permanent zero-count entry above the
+    /// real list. When the user has *no* real projects we show it
+    /// regardless so they always have a surface to land on (matches
+    /// the web's hardcoded sidebar link).
+    private var hasUnassignedTodos: Bool { !openUnassignedTodos.isEmpty }
+
+    /// Combine the two visibility checks into one expression so the
+    /// sidebar body and the empty-state branch read off a single
+    /// source of truth.
+    private var shouldShowUnassignedRow: Bool {
+        hasUnassignedTodos || projects.isEmpty
+    }
 
     /// `projectId` → open-todo count. Rebuilt per render — cheap
     /// (linear scan over a small list) and SwiftUI's diffing means
@@ -102,11 +165,26 @@ struct ProjectListView: View {
     @ViewBuilder
     private var sidebar: some View {
         List(selection: $selectedProjectID) {
+            // "Unassigned" virtual project — always shown when the
+            // user has no real projects yet (so they have *some*
+            // surface to land on), or when they have at least one
+            // open unassigned todo. Kept deliberately *outside* the
+            // `ForEach(projects)` so it has no context menu (Edit /
+            // Archive don't apply to a synthetic row), and so it sits
+            // above real projects regardless of their `sortOrder`.
+            if shouldShowUnassignedRow {
+                NavigationLink(value: ProjectListView.unassignedProjectID) {
+                    UnassignedRow(openTodoCount: unassignedOpenCount)
+                }
+            }
+
             if projects.isEmpty {
+                // Empty-state copy still renders below the Unassigned
+                // row when the user has no real projects — points
+                // them at the web for project creation (iOS create is
+                // a follow-up). Suppressed once the user has at least
+                // one real project so the sidebar stays focused.
                 EmptyProjectListView()
-                    // Hide the row separator + selection chrome so the
-                    // empty-state copy reads as a static message rather
-                    // than a (selectable) list row.
                     .listRowSeparator(.hidden)
                     .listRowBackground(Color.clear)
                     .selectionDisabled()
@@ -144,13 +222,20 @@ struct ProjectListView: View {
             EditProjectView(project: project)
         }
         .navigationDestination(for: String.self) { projectID in
-            // Resolve the id back into the live `LocalProject` so the
-            // detail view can subscribe to changes via `@Bindable` /
-            // `@Query`. We look up by id rather than threading the
-            // model object through `NavigationLink(value:)` because
-            // `@Query` results can churn under us — the id is the
-            // stable handle.
-            if let project = projects.first(where: { $0.id == projectID }) {
+            // Branch on the literal `"unassigned"` sentinel before
+            // attempting a real project lookup — mirrors the web's
+            // `/projects/[id]` route handler (see
+            // `web/src/app/projects/[id]/page.tsx` lines 30-33) which
+            // special-cases the same value.
+            if projectID == ProjectListView.unassignedProjectID {
+                UnassignedDetailView()
+            } else if let project = projects.first(where: { $0.id == projectID }) {
+                // Resolve the id back into the live `LocalProject` so
+                // the detail view can subscribe to changes via
+                // `@Bindable` / `@Query`. We look up by id rather than
+                // threading the model object through
+                // `NavigationLink(value:)` because `@Query` results
+                // can churn under us — the id is the stable handle.
                 ProjectDetailView(project: project)
             } else {
                 // Project disappeared (archived elsewhere, deleted,
@@ -185,8 +270,10 @@ struct ProjectListView: View {
     /// branch is only reachable on regular-width layouts.
     @ViewBuilder
     private var detailPane: some View {
-        if let id = selectedProjectID,
-           let project = projects.first(where: { $0.id == id }) {
+        if selectedProjectID == ProjectListView.unassignedProjectID {
+            UnassignedDetailView()
+        } else if let id = selectedProjectID,
+                  let project = projects.first(where: { $0.id == id }) {
             ProjectDetailView(project: project)
         } else {
             ContentUnavailableView {
@@ -195,6 +282,44 @@ struct ProjectListView: View {
                 Text("Select a project from the sidebar to see its sections.")
             }
         }
+    }
+}
+
+// MARK: - Unassigned row
+
+/// Sidebar row for the synthetic "Unassigned" virtual project.
+/// Visually distinct from `ProjectRow` (no color dot — there's no
+/// `LocalProject.color` to sample — and a tray icon instead) so the
+/// user reads it as a system-provided bucket rather than something
+/// they created. Open-todo count chip mirrors the real-project
+/// rendering for consistency.
+struct UnassignedRow: View {
+
+    let openTodoCount: Int
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: BrainSymbols.inbox)
+                .frame(width: 12, height: 12)
+                .foregroundStyle(.secondary)
+
+            Text("Unassigned")
+                .font(.body)
+                .lineLimit(1)
+                .truncationMode(.tail)
+
+            Spacer(minLength: 0)
+
+            if openTodoCount > 0 {
+                Text("\(openTodoCount)")
+                    .font(.caption.weight(.medium))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("\(openTodoCount) open todos")
+            }
+        }
+        .contentShape(Rectangle())
+        .accessibilityIdentifier("project-list.unassigned-row")
     }
 }
 
