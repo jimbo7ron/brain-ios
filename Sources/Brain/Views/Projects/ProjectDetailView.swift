@@ -27,8 +27,13 @@ import SwiftUI
 @MainActor
 struct ProjectDetailView: View {
 
-    @Environment(\.brainAPIClient) private var client
-    @Environment(\.syncEngine) private var syncEngine
+    /// SwiftData context for the optimistic local insert. Same context
+    /// the rest of the app uses, so the @Query on this view picks up the
+    /// new row in the next render pass.
+    @Environment(\.modelContext) private var modelContext
+    /// Mutation queue (M37) — owns the create round-trip after the
+    /// optimistic insert. Mirrors the `QuickAddView` wiring.
+    @Environment(\.mutationQueue) private var mutationQueue
 
     /// The project this view describes. Bindable so SwiftData
     /// updates from the sync engine flow through without us having
@@ -165,12 +170,10 @@ struct ProjectDetailView: View {
                         }
                     ),
                     onInlineAdd: { rawText in
-                        Task {
-                            await createTodoInline(
-                                content: rawText,
-                                sectionSlug: spec.slug
-                            )
-                        }
+                        createTodoInline(
+                            content: rawText,
+                            sectionSlug: spec.slug
+                        )
                     }
                 )
             }
@@ -225,21 +228,25 @@ struct ProjectDetailView: View {
     /// Create a todo from inline-add text, scoped to `sectionSlug`. The
     /// text rides through `QuickAddParser` so trailing keywords
     /// ("tomorrow", "!high", "#tag") behave the same way they do in
-    /// `QuickAddView.submit()` — same payload shape, same server
-    /// resolution path, same post-create sync kick. Errors are
-    /// surfaced via the `inlineAddError` banner above the list; the
-    /// `InlineAddRow` keeps the user's text in place on failure (it
-    /// only clears on a successful `onCommit` callback — see
-    /// `InlineAddRow.body`).
-    private func createTodoInline(content: String, sectionSlug: String) async {
+    /// `QuickAddView.submit()`.
+    ///
+    /// M44.x optimistic-add: this used to await `client.createNote(...)`
+    /// before the new row appeared, which meant rapid taps "piled up"
+    /// on a slow network — the user would type three todos and only see
+    /// them all once the round-trip + sync completed. The fix mirrors
+    /// `QuickAddView.submit()` exactly: mint a client UUID, insert a
+    /// `LocalNote` stub immediately, save so SwiftUI's @Query picks it
+    /// up in the next render pass, then enqueue a `.createTodo`
+    /// mutation. The `MutationQueue` replays it in the background and
+    /// `reconcileCreateResponse` patches the stub's id / shortId /
+    /// timestamps in place once the server confirms.
+    ///
+    /// Synchronous now: the `InlineAddRow` clears its text on every
+    /// commit; with this shape the user can type-return-type-return
+    /// without the keyboard jitter or the "where's my todo" confusion.
+    private func createTodoInline(content: String, sectionSlug: String) {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-
-        guard let client else {
-            inlineAddError = "Couldn't reach the server. Try again."
-            BrainHaptics.error()
-            return
-        }
 
         let parsed = QuickAddParser.parse(trimmed)
         let bodyContent = parsed.title.isEmpty ? trimmed : parsed.bodyForServer()
@@ -260,22 +267,108 @@ struct ProjectDetailView: View {
             location: nil
         )
 
+        // Mint a client UUID — used as the LocalNote primary key AND
+        // as the queue row's `resourceId` so the replayer can find the
+        // stub to patch when the server confirms the create.
+        let clientID = UUID().uuidString.lowercased()
+        let now = Date()
+        // Title preview already strips wiki-link brackets and tags;
+        // mirror it here so the optimistic row reads the same as the
+        // user's input. The server runs its own extraction on `content`
+        // — once the create echo lands, the title may be patched
+        // (typically to nil because the server derives it lazily).
+        let optimisticTitle: String? = {
+            let preview = parsed.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            return preview.isEmpty ? nil : preview
+        }()
+        let stub = LocalNote(
+            id: clientID,
+            // shortId is server-assigned; leave empty until the create
+            // echo backfills it. No view filters on shortId so an
+            // empty string here is invisible.
+            shortId: "",
+            title: optimisticTitle,
+            content: bodyContent,
+            type: "todo",
+            archived: false,
+            createdAt: now,
+            updatedAt: now,
+            tagsCSV: parsed.tags.joined(separator: ","),
+            dueDate: parsed.dueDateISO(),
+            dueTime: parsed.dueTimeHHMM(),
+            completed: false,
+            priority: parsed.priority?.rawValue ?? "medium",
+            recurrence: parsed.recurrence?.rawValue,
+            // Project context flows directly from this view's bound
+            // project — unlike QuickAddView there's no "unassigned"
+            // sentinel to worry about here; this surface is always
+            // scoped to a real project UUID.
+            projectId: project.id,
+            section: sectionSlug,
+            sortOrder: 0
+        )
+        modelContext.insert(stub)
         do {
-            _ = try await client.createNote(payload)
+            try modelContext.save()
             inlineAddError = nil
-            // Pull the newly-created row through the read-path sync so
-            // it appears in the section without waiting for the
-            // 5-minute foreground Timer. Same shape `QuickAddView.submit()`
-            // uses — fire-and-forget; the server already saved.
-            Task { await syncEngine?.sync() }
-            BrainHaptics.light()
-        } catch let error as BrainAPIClient.Error {
-            inlineAddError = error.userFacingMessage
-            BrainHaptics.error()
         } catch {
+            // SwiftData fault — extremely rare. Surface inline and
+            // bail; nothing was enqueued, nothing leaked to the queue.
             inlineAddError = "Couldn't save: \(error.localizedDescription)"
             BrainHaptics.error()
+            return
         }
+
+        // Encode the wire payload for the queue.
+        let encoder = JSONEncoder()
+        let body: Data
+        do {
+            body = try encoder.encode(payload)
+        } catch {
+            // Encoding a fixed Codable struct can't realistically fail,
+            // but the throws-style API forces us to handle it. Roll
+            // back the optimistic insert in this (essentially
+            // unreachable) path so the user isn't left with a phantom
+            // todo.
+            modelContext.delete(stub)
+            try? modelContext.save()
+            inlineAddError = "Couldn't encode the request. Try again."
+            BrainHaptics.error()
+            return
+        }
+
+        // Enqueue the create. The queue's post-enqueue Task fires a
+        // replay automatically.
+        if let queue = mutationQueue {
+            do {
+                _ = try queue.enqueue(
+                    op: .createTodo,
+                    resourceType: "todo",
+                    resourceId: clientID,
+                    payload: body,
+                    baseUpdatedAt: nil
+                )
+            } catch {
+                // Enqueue failure (SwiftData fault on the queue row).
+                // Same trade-off as `QuickAddView.submit()` — leave the
+                // optimistic stub visible rather than ripping it back
+                // out on a transient SwiftData hiccup. The next sync
+                // delta won't bring back a server row (we never
+                // replayed), so the row sits locally until the user
+                // re-edits or restarts.
+                BrainHaptics.error()
+                NSLog(
+                    "ProjectDetailView: failed to enqueue createTodo for \(clientID): \(error). " +
+                    "Local stub remains visible; no server replay."
+                )
+            }
+        } else {
+            // Preview / non-production host: local insert is the
+            // entire effect. Production never hits this branch.
+            NSLog("ProjectDetailView: no mutation queue in environment — local-only insert.")
+        }
+
+        BrainHaptics.light()
     }
 
     // MARK: - Header

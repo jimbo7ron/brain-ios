@@ -36,8 +36,14 @@ import SwiftUI
 @MainActor
 struct UnassignedDetailView: View {
 
-    @Environment(\.brainAPIClient) private var client
     @Environment(\.syncEngine) private var syncEngine
+    /// SwiftData context for the optimistic local insert. Same context
+    /// the rest of the app uses, so the @Query on this view picks up
+    /// the new row in the next render pass.
+    @Environment(\.modelContext) private var modelContext
+    /// Mutation queue (M37) — owns the create round-trip after the
+    /// optimistic insert. Mirrors the `QuickAddView` wiring.
+    @Environment(\.mutationQueue) private var mutationQueue
 
     /// All todos in the working set, narrowed to type `"todo"` only at
     /// the SwiftData layer. We then filter for `!archived` and
@@ -141,7 +147,7 @@ struct UnassignedDetailView: View {
                     placeholder: "Add to Unassigned",
                     accessibilityIdentifier: "unassigned.inline-add",
                     onCommit: { rawText in
-                        Task { await createTodoInline(content: rawText) }
+                        createTodoInline(content: rawText)
                     }
                 )
             } header: {
@@ -216,19 +222,23 @@ struct UnassignedDetailView: View {
 
     /// Create a todo from inline-add text in the Unassigned bucket.
     /// Threads the `"unassigned"` sentinel through as the `project`
-    /// field — the server resolves this to `project_id = NULL` on
-    /// insert (`src/brain/server.py:1858, 2032-2044`). Same payload
-    /// shape as `ProjectDetailView.createTodoInline` so trailing
-    /// keywords behave identically.
-    private func createTodoInline(content: String) async {
+    /// field on the wire payload — the server resolves this to
+    /// `project_id = NULL` on insert (`src/brain/server.py:1858,
+    /// 2032-2044`). Same payload shape and parser as
+    /// `ProjectDetailView.createTodoInline` so trailing keywords behave
+    /// identically.
+    ///
+    /// M44.x optimistic-add: this used to await `client.createNote(...)`
+    /// before the new row appeared. The fix mirrors
+    /// `QuickAddView.submit()` and `ProjectDetailView.createTodoInline`
+    /// — mint a client UUID, insert a `LocalNote` stub immediately,
+    /// save, enqueue `.createTodo`. The local stub's `projectId` is set
+    /// to nil (matching the @Query predicate `projectId == nil` that
+    /// gates this view's list), so the row appears in the Unassigned
+    /// section the moment we save.
+    private func createTodoInline(content: String) {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-
-        guard let client else {
-            inlineAddError = "Couldn't reach the server. Try again."
-            BrainHaptics.error()
-            return
-        }
 
         let parsed = QuickAddParser.parse(trimmed)
         let bodyContent = parsed.title.isEmpty ? trimmed : parsed.bodyForServer()
@@ -249,18 +259,79 @@ struct UnassignedDetailView: View {
             location: nil
         )
 
+        let clientID = UUID().uuidString.lowercased()
+        let now = Date()
+        let optimisticTitle: String? = {
+            let preview = parsed.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            return preview.isEmpty ? nil : preview
+        }()
+        let stub = LocalNote(
+            id: clientID,
+            shortId: "",
+            title: optimisticTitle,
+            content: bodyContent,
+            type: "todo",
+            archived: false,
+            createdAt: now,
+            updatedAt: now,
+            tagsCSV: parsed.tags.joined(separator: ","),
+            dueDate: parsed.dueDateISO(),
+            dueTime: parsed.dueTimeHHMM(),
+            completed: false,
+            priority: parsed.priority?.rawValue ?? "medium",
+            recurrence: parsed.recurrence?.rawValue,
+            // projectId nil mirrors the @Query predicate `projectId ==
+            // nil` that scopes this view's list. The wire payload
+            // sends "unassigned" so the server resolves to NULL —
+            // that round-trips back to a nil `project_id` in the next
+            // sync delta, matching what we set here.
+            projectId: nil,
+            section: nil,
+            sortOrder: 0
+        )
+        modelContext.insert(stub)
         do {
-            _ = try await client.createNote(payload)
+            try modelContext.save()
             inlineAddError = nil
-            Task { await syncEngine?.sync() }
-            BrainHaptics.light()
-        } catch let error as BrainAPIClient.Error {
-            inlineAddError = error.userFacingMessage
-            BrainHaptics.error()
         } catch {
             inlineAddError = "Couldn't save: \(error.localizedDescription)"
             BrainHaptics.error()
+            return
         }
+
+        let encoder = JSONEncoder()
+        let body: Data
+        do {
+            body = try encoder.encode(payload)
+        } catch {
+            modelContext.delete(stub)
+            try? modelContext.save()
+            inlineAddError = "Couldn't encode the request. Try again."
+            BrainHaptics.error()
+            return
+        }
+
+        if let queue = mutationQueue {
+            do {
+                _ = try queue.enqueue(
+                    op: .createTodo,
+                    resourceType: "todo",
+                    resourceId: clientID,
+                    payload: body,
+                    baseUpdatedAt: nil
+                )
+            } catch {
+                BrainHaptics.error()
+                NSLog(
+                    "UnassignedDetailView: failed to enqueue createTodo for \(clientID): \(error). " +
+                    "Local stub remains visible; no server replay."
+                )
+            }
+        } else {
+            NSLog("UnassignedDetailView: no mutation queue in environment — local-only insert.")
+        }
+
+        BrainHaptics.light()
     }
 
     /// Open-section header. Matches the visual cadence of

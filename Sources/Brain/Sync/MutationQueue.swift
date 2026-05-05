@@ -206,21 +206,31 @@ final class MutationQueue {
 
         while let item = nextReadyItem() {
             do {
-                let serverNote = try await client.executeMutation(item)
-                // M44.x optimistic-add reconciliation: when a `.createTodo`
-                // replay succeeds the server returns the canonical Note
-                // (with a server-assigned UUID + short_id + timestamps).
-                // The local stub was inserted at enqueue time keyed off
-                // the client UUID we put in `item.resourceId`; patch it
-                // in place so it picks up the server's id without a
-                // visible flicker. Doing this *before* deleting the
-                // queue row keeps the row's id the source of truth for
-                // matching. Other ops (complete / update / archive)
-                // return nil and skip the reconcile branch.
-                if let serverNote {
+                let result = try await client.executeMutation(item)
+                // M44.x optimistic-add reconciliation: create-class ops
+                // return a typed result so we can patch the right kind
+                // of local stub. Other ops (complete / update / archive)
+                // return `.none` and skip the reconcile branch — those
+                // target an existing server row that the next sync
+                // delta will reconcile.
+                //
+                // Doing the reconcile *before* deleting the queue row
+                // keeps `item.resourceId` (the client UUID) the source
+                // of truth for matching the stub. The B1 sync-race
+                // dedupe + B2 pending-mutation rewrite live inside
+                // `reconcileCreateResponse` / `reconcileCreateProjectResponse`.
+                switch result {
+                case .none:
+                    break
+                case .note(let serverNote):
                     reconcileCreateResponse(
                         clientId: item.resourceId,
                         serverNote: serverNote
+                    )
+                case .project(let serverProject):
+                    reconcileCreateProjectResponse(
+                        clientId: item.resourceId,
+                        serverProject: serverProject
                     )
                 }
                 modelContext.delete(item)
@@ -596,67 +606,235 @@ final class MutationQueue {
         stub.appointmentRecurrence = appointment?.recurrence
     }
 
-    /// S1 rollback for the createTodo poison case. `.createTodo` is
-    /// the one mutation where the optimistic local state must be
-    /// rolled back on permanent failure: the user saw a row appear in
-    /// QuickAddView's optimistic insert and (without this) it would
-    /// stay on screen forever, never reflected on the server. Other
-    /// ops (toggle / archive / update) target an existing server row
-    /// — the next sync will overwrite any optimistic divergence with
-    /// the server's truth.
+    /// Project-flavoured sibling of `reconcileCreateResponse`. Patches
+    /// the optimistic `LocalProject` stub (keyed by the client UUID we
+    /// used as `resourceId`) with the server's canonical `Project` so
+    /// the row picks up the server's id, short id, sortOrder, the M26
+    /// default sections, and timestamps in a single SwiftData update —
+    /// no flicker, no duplicate.
     ///
-    /// Looks up the orphan `LocalNote` by `item.resourceId` (the
-    /// client UUID minted in `QuickAddView.submit()`) and deletes it.
-    /// Cross-context propagation: the stub was inserted on the
-    /// SwiftUI `ModelContext` and we're deleting it from the queue's
-    /// context — both share the SwiftData container, the delete
-    /// hits the SQLite store on save, and `@Query` on the SwiftUI
-    /// side picks up the disappearance via SwiftData's change-
-    /// coalescing. Same pattern as the rename path in
-    /// `reconcileCreateResponse`.
+    /// Mirrors the same defences as the note flavour:
+    ///   * **B1 (sync race)** — if a sync delta inserted a separate
+    ///     `LocalProject` keyed on the server id while we were in
+    ///     flight, delete that row before the rename so the
+    ///     `@Attribute(.unique)` constraint on `LocalProject.id` doesn't
+    ///     collide.
+    ///   * **B2 (pending-mutation rewrite)** — if the user immediately
+    ///     edited the freshly-created project (e.g. `EditProjectView`
+    ///     queued an `updateProject` keyed on the client UUID), rewrite
+    ///     those queue rows to point at the server id *before* we rename
+    ///     the stub. Otherwise the next replay would 404 on the stale
+    ///     client UUID and get poisoned.
     ///
-    /// No-ops for non-create ops, and silent (the only signal is the
-    /// existing `lastError` / NSLog path the caller has already
-    /// stamped). UI banners / toasts on this failure are a separate
-    /// UX decision; this just prevents the phantom-row data state.
+    /// Sections handling: `Project.sections` is the canonical list the
+    /// server emits (M26 defaults — Now/Next/Later — when none were
+    /// supplied at create). After the rename we mirror those onto the
+    /// stub's `LocalSection` children using composite ids built from
+    /// the server's project id, so subsequent project-detail reads see
+    /// the same shape `SyncEngine.reconcileSections` would have produced.
     ///
-    /// Known limitation (M44+): if the user typed the stub, then
-    /// long-pressed and edited it locally before the create cap was
-    /// hit, this rollback nukes their edit silently. See the TODO at
-    /// the delete site below.
-    private func rollbackOptimisticStateIfNeeded(
-        for item: MutationQueueItem,
-        reason: some Error
-    ) {
-        guard MutationOp(rawValue: item.op) == .createTodo else { return }
-        let stubId = item.resourceId
-        let descriptor: FetchDescriptor<LocalNote> = {
-            var d = FetchDescriptor<LocalNote>(
-                predicate: #Predicate { $0.id == stubId }
+    /// Idempotency: if the local stub is already gone (sync delivered
+    /// the server row first AND the user wiped local data, or kill-9
+    /// across the create echo) the lookup-by-clientId returns nil and
+    /// we no-op — the existing sync-inserted row already represents the
+    /// truth. The B2 queue rewrite still runs *before* the early bail
+    /// so any pending edit lands on the server id regardless.
+    private func reconcileCreateProjectResponse(clientId: String, serverProject: Project) {
+        // B2: rewrite any queued mutations that still target the client
+        // UUID. Has to happen before the rename / field copy below.
+        let pendingDescriptor = FetchDescriptor<MutationQueueItem>(
+            predicate: #Predicate { $0.resourceId == clientId }
+        )
+        if let stalePending = try? modelContext.fetch(pendingDescriptor) {
+            for row in stalePending {
+                row.resourceId = serverProject.id
+            }
+        }
+
+        let stubDescriptor: FetchDescriptor<LocalProject> = {
+            var d = FetchDescriptor<LocalProject>(
+                predicate: #Predicate { $0.id == clientId }
             )
             d.fetchLimit = 1
             return d
         }()
-        guard let stub = (try? modelContext.fetch(descriptor))?.first else {
+        guard let stub = (try? modelContext.fetch(stubDescriptor))?.first else {
+            // Local stub already gone — see the sibling note flavour for
+            // the cases this branch covers. Save the B2 queue rewrite
+            // and bail.
+            try? modelContext.save()
             return
         }
-        // TODO(M44+): If the user edited the stub locally before the create
-        // hit the cap (typed → long-press edit → create fails permanently),
-        // this rollback nukes their edit silently. The rewritten updateTodo
-        // will then 404 and poison. Consider preserving local-only edits or
-        // surfacing the failure in UI before deleting.
-        modelContext.delete(stub)
-        do {
-            try modelContext.save()
-            NSLog(
-                "MutationQueue: rolled back optimistic createTodo stub " +
-                "\(stubId) after permanent failure: \(reason)"
+
+        // B1: drop any LocalProject that sync already inserted under
+        // the server id. Same logic as the note flavour: the about-to-
+        // be-renamed stub will be repopulated with the canonical
+        // payload, so the sync-inserted row is redundant — and leaving
+        // it would collide with the rename on `@Attribute(.unique)`.
+        let serverId = serverProject.id
+        let dupeDescriptor: FetchDescriptor<LocalProject> = {
+            var d = FetchDescriptor<LocalProject>(
+                predicate: #Predicate { $0.id == serverId }
             )
-        } catch {
-            NSLog(
-                "MutationQueue: failed to roll back optimistic createTodo " +
-                "stub \(stubId): \(error)"
+            d.fetchLimit = 1
+            return d
+        }()
+        if let dupe = (try? modelContext.fetch(dupeDescriptor))?.first,
+           dupe !== stub {
+            modelContext.delete(dupe)
+            do {
+                try modelContext.save()
+            } catch {
+                NSLog(
+                    "MutationQueue: project reconcile dupe-delete save failed " +
+                    "for clientId \(clientId) -> serverId \(serverId): " +
+                    "\(error). Falling through; the rename's save will " +
+                    "surface the constraint collision."
+                )
+            }
+        }
+
+        // Mirror the field copy that `SyncEngine.upsert(_:Project)` does
+        // on an existing row. Keep this list in sync with the sync-side
+        // upsert so both produce the same final state.
+        stub.id = serverProject.id
+        stub.shortId = serverProject.shortId
+        stub.name = serverProject.name
+        stub.color = serverProject.color
+        stub.sortOrder = serverProject.sortOrder
+        stub.archived = serverProject.archived
+        stub.createdAt = parseServerDate(serverProject.createdAt)
+        stub.updatedAt = parseServerDate(serverProject.updatedAt)
+
+        // Replace the stub's section children with the server's
+        // canonical list (the M26 defaults when none were supplied at
+        // create). Mirrors `SyncEngine.reconcileSections` but scoped to
+        // a brand-new project — there are no in-flight section edits
+        // to preserve, so a wipe-and-replace is safe and simpler than
+        // diffing.
+        for existing in stub.sections {
+            modelContext.delete(existing)
+        }
+        for wire in serverProject.sections {
+            let composite = LocalSection.makeID(projectID: stub.id, slug: wire.slug)
+            let local = LocalSection(
+                id: composite,
+                slug: wire.slug,
+                name: wire.name,
+                position: wire.position,
+                project: stub
             )
+            modelContext.insert(local)
+        }
+    }
+
+    /// S1 rollback for the create-poison case. Create ops are the one
+    /// class of mutation where the optimistic local state must be rolled
+    /// back on permanent failure: the user saw a row appear after typing
+    /// (QuickAdd / inline section add / new-project sheet) and (without
+    /// this) it would stay on screen forever, never reflected on the
+    /// server. Other ops (toggle / archive / update) target an existing
+    /// server row — the next sync will overwrite any optimistic
+    /// divergence with the server's truth.
+    ///
+    /// Routes by `MutationOp`:
+    ///   * `.createTodo` → delete the orphan `LocalNote` keyed on the
+    ///     client UUID we put in `item.resourceId`.
+    ///   * `.createProject` → delete the orphan `LocalProject` keyed on
+    ///     the client UUID. Cascade-deletes any locally-staged
+    ///     `LocalSection` rows (the schema's `.cascade` rule on the
+    ///     `sections` relationship), which is the right behaviour: those
+    ///     sections only existed on the doomed stub.
+    ///   * Anything else → no-op.
+    ///
+    /// Cross-context propagation: the stub was inserted on the SwiftUI
+    /// `ModelContext` and we're deleting it from the queue's context —
+    /// both share the SwiftData container, the delete hits the SQLite
+    /// store on save, and `@Query` on the SwiftUI side picks up the
+    /// disappearance via SwiftData's change-coalescing. Same pattern as
+    /// the rename path in `reconcileCreateResponse` /
+    /// `reconcileCreateProjectResponse`.
+    ///
+    /// Silent (the only signal is the existing `lastError` / NSLog path
+    /// the caller has already stamped). UI banners / toasts on this
+    /// failure are a separate UX decision; this just prevents the
+    /// phantom-row data state.
+    ///
+    /// Known limitation (M44+): if the user typed the stub, then
+    /// long-pressed and edited it locally before the create cap was hit,
+    /// this rollback nukes their edit silently. See the TODO at each
+    /// delete site below.
+    private func rollbackOptimisticStateIfNeeded(
+        for item: MutationQueueItem,
+        reason: some Error
+    ) {
+        guard let op = MutationOp(rawValue: item.op) else { return }
+        let stubId = item.resourceId
+        switch op {
+        case .createTodo:
+            let descriptor: FetchDescriptor<LocalNote> = {
+                var d = FetchDescriptor<LocalNote>(
+                    predicate: #Predicate { $0.id == stubId }
+                )
+                d.fetchLimit = 1
+                return d
+            }()
+            guard let stub = (try? modelContext.fetch(descriptor))?.first else {
+                return
+            }
+            // TODO(M44+): If the user edited the stub locally before the
+            // create hit the cap (typed → long-press edit → create fails
+            // permanently), this rollback nukes their edit silently. The
+            // rewritten updateTodo will then 404 and poison. Consider
+            // preserving local-only edits or surfacing the failure in UI
+            // before deleting.
+            modelContext.delete(stub)
+            do {
+                try modelContext.save()
+                NSLog(
+                    "MutationQueue: rolled back optimistic createTodo stub " +
+                    "\(stubId) after permanent failure: \(reason)"
+                )
+            } catch {
+                NSLog(
+                    "MutationQueue: failed to roll back optimistic createTodo " +
+                    "stub \(stubId): \(error)"
+                )
+            }
+        case .createProject:
+            let descriptor: FetchDescriptor<LocalProject> = {
+                var d = FetchDescriptor<LocalProject>(
+                    predicate: #Predicate { $0.id == stubId }
+                )
+                d.fetchLimit = 1
+                return d
+            }()
+            guard let stub = (try? modelContext.fetch(descriptor))?.first else {
+                return
+            }
+            // TODO(M44+): cascade-deletes any locally-inserted
+            // `LocalSection` rows. If the user created a project and
+            // then started editing it (renaming sections via the M40
+            // dialog) before the create echo returned, those edits ride
+            // the queue as separate rows that will hit 404 once this
+            // rollback removes the project. Mitigation is the same shape
+            // as the createTodo case — preserve the local edits or
+            // surface the failure in UI before deleting.
+            modelContext.delete(stub)
+            do {
+                try modelContext.save()
+                NSLog(
+                    "MutationQueue: rolled back optimistic createProject stub " +
+                    "\(stubId) after permanent failure: \(reason)"
+                )
+            } catch {
+                NSLog(
+                    "MutationQueue: failed to roll back optimistic createProject " +
+                    "stub \(stubId): \(error)"
+                )
+            }
+        default:
+            return
         }
     }
 
@@ -798,6 +976,11 @@ extension MutationQueue {
     /// the private helper to `BrainDebugMutationQueue`.
     func debugReconcileCreateResponse(clientId: String, serverNote: Note) {
         reconcileCreateResponse(clientId: clientId, serverNote: serverNote)
+    }
+
+    /// Test-only entry point for `reconcileCreateProjectResponse`.
+    func debugReconcileCreateProjectResponse(clientId: String, serverProject: Project) {
+        reconcileCreateProjectResponse(clientId: clientId, serverProject: serverProject)
     }
 
     /// Test-only entry point for `rollbackOptimisticStateIfNeeded`.
@@ -1270,6 +1453,139 @@ enum BrainDebugMutationQueue {
                "queue row should remain parked after rollback")
     }
 
+    /// M44.x optimistic-add for projects: `reconcileCreateProjectResponse`
+    /// must rename the stub onto the server id, mirror the canonical
+    /// sections, and rewrite any pending mutations targeting the client
+    /// UUID. Mirrors the structure of `assertReconcileDedupesSyncRace` /
+    /// `assertReconcileRewritesPendingResourceIds` but for projects.
+    @MainActor
+    static func assertReconcileProjectRenamesStubAndSections() throws {
+        let schema = Schema([
+            MutationQueueItem.self,
+            LocalProject.self,
+            LocalSection.self,
+            LocalNote.self,
+        ])
+        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+        let container = try ModelContainer(for: schema, configurations: [config])
+        let context = ModelContext(container)
+        let session = AuthSession(state: .signedOut)
+        let client = BrainAPIClient()
+        let queue = MutationQueue(modelContext: context, client: client, authSession: session)
+
+        let clientId = "11111111-2222-3333-4444-555555555555"
+        let serverId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+        let stub = LocalProject(
+            id: clientId,
+            shortId: "",
+            name: "Tax 2026",
+            color: "hsl(262 83% 58%)"
+        )
+        queue.debugModelContext.insert(stub)
+
+        // Pending edit on the just-created project (B2 coverage).
+        let pendingEdit = try queue.enqueue(
+            op: .updateProject,
+            resourceType: "project",
+            resourceId: clientId,
+            payload: Data(),
+            baseUpdatedAt: nil
+        )
+        assert(pendingEdit.resourceId == clientId)
+
+        let serverProject = Project(
+            id: serverId,
+            shortId: "p7q",
+            name: "Tax 2026",
+            color: "hsl(262 83% 58%)",
+            sortOrder: 0,
+            archived: false,
+            sections: [
+                SectionDTO(slug: "now", name: "Now", position: 0),
+                SectionDTO(slug: "next", name: "Next", position: 1),
+                SectionDTO(slug: "later", name: "Later", position: 2),
+            ],
+            createdAt: nil,
+            updatedAt: nil
+        )
+
+        queue.debugReconcileCreateProjectResponse(
+            clientId: clientId,
+            serverProject: serverProject
+        )
+        try queue.debugModelContext.save()
+
+        // Stub renamed.
+        let allProjects = try queue.debugModelContext.fetch(FetchDescriptor<LocalProject>())
+        assert(allProjects.contains(where: { $0.id == serverId }),
+               "stub should have been renamed to serverId")
+        assert(!allProjects.contains(where: { $0.id == clientId }),
+               "no LocalProject should remain under the client UUID")
+
+        // Default sections mirrored.
+        let renamed = allProjects.first(where: { $0.id == serverId })
+        assert(renamed?.sections.count == 3,
+               "project should carry the M26 default sections after reconcile")
+        let slugs = Set(renamed?.sections.map { $0.slug } ?? [])
+        assert(slugs == ["now", "next", "later"],
+               "section slugs should match the canonical default set")
+
+        // Section ids rebuilt against the server project id.
+        for sect in renamed?.sections ?? [] {
+            assert(sect.id == LocalSection.makeID(projectID: serverId, slug: sect.slug),
+                   "section composite id should be rebuilt against serverId, got \(sect.id)")
+        }
+
+        // B2: pending updateProject row rewritten to serverId.
+        let pendingAfter = queue.pendingMutation(forResourceId: serverId)
+        assert(pendingAfter?.id == pendingEdit.id,
+               "queued updateProject should be rewritten to serverId")
+        assert(queue.pendingMutation(forResourceId: clientId) == nil,
+               "no queue row should still target the now-phantom client UUID")
+    }
+
+    /// S1 rollback must also fire for `.createProject` poison. Mirrors
+    /// `assertCreateTodoPoisonRollsBackStub` for the project case.
+    @MainActor
+    static func assertCreateProjectPoisonRollsBackStub() throws {
+        let schema = Schema([
+            MutationQueueItem.self,
+            LocalProject.self,
+            LocalSection.self,
+        ])
+        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+        let container = try ModelContainer(for: schema, configurations: [config])
+        let context = ModelContext(container)
+        let session = AuthSession(state: .signedOut)
+        let client = BrainAPIClient()
+        let queue = MutationQueue(modelContext: context, client: client, authSession: session)
+
+        let clientId = "deadbeef-dead-beef-dead-beefdeadbeef"
+
+        let stub = LocalProject(id: clientId, shortId: "", name: "Doomed")
+        queue.debugModelContext.insert(stub)
+        let item = try queue.enqueue(
+            op: .createProject,
+            resourceType: "project",
+            resourceId: clientId,
+            payload: Data()
+        )
+
+        item.attempts += 1
+        item.nextRetryAt = .distantFuture
+        item.lastError = "simulated 422"
+        try queue.debugModelContext.save()
+        queue.debugRollbackOptimisticState(
+            for: item,
+            reason: BrainAPIClient.Error.validationError(detail: "simulated")
+        )
+
+        let allProjects = try queue.debugModelContext.fetch(FetchDescriptor<LocalProject>())
+        assert(!allProjects.contains(where: { $0.id == clientId }),
+               "createProject poison rollback should delete the orphan stub")
+    }
+
     /// Run every check. Convenience entrypoint for a future debug menu /
     /// CI smoke step.
     @MainActor
@@ -1284,6 +1600,8 @@ enum BrainDebugMutationQueue {
             try assertReconcileRewritesPendingResourceIds()
             try assertReconcileRewritesPendingResourceIdsWhenStubMissing()
             try assertCreateTodoPoisonRollsBackStub()
+            try assertReconcileProjectRenamesStubAndSections()
+            try assertCreateProjectPoisonRollsBackStub()
         } catch {
             assertionFailure("BrainDebugMutationQueue: setup failed: \(error)")
         }

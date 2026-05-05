@@ -321,18 +321,33 @@ actor BrainAPIClient {
         }
     }
 
+    /// Result returned by `executeMutation(_:)` for create-class ops
+    /// where the caller needs to reconcile the local stub against the
+    /// server's canonical row. Update / complete / archive ops still
+    /// return `.none` — the next sync delta is the canonical update path
+    /// for those.
+    ///
+    /// `.note` is emitted for `.createTodo`. `.project` is emitted for
+    /// `.createProject`. Adding a new create op (e.g. `.createSection`)
+    /// adds a new case here and a new `reconcileCreate*` arm in
+    /// `MutationQueue.replay`.
+    enum MutationResult {
+        case none
+        case note(Note)
+        case project(Project)
+    }
+
     /// Replay one queued mutation (M37). The replayer hands us the queue
     /// row; we route by `MutationOp` to the matching endpoint and thread
     /// the row's `idempotencyKey` UUID into the `Idempotency-Key` header
     /// so retries are server-deduped.
     ///
-    /// Returns the server's freshly-decoded `Note` for ops where the
-    /// caller needs to reconcile against the response (currently only
-    /// `.createTodo` — see the optimistic-add flow in `MutationQueue.replay`
-    /// where the local UUID stub gets its id / shortId / timestamps
-    /// patched to the server's canonical values once the POST succeeds).
-    /// All other ops return `nil`.
-    func executeMutation(_ item: MutationQueueItem) async throws -> Note? {
+    /// Returns a typed `MutationResult` so the queue's reconcile step
+    /// can patch the right local stub (`LocalNote` for `.createTodo`,
+    /// `LocalProject` for `.createProject`). Update / complete / archive
+    /// ops return `.none` — those target an existing server row which
+    /// the next sync delta will reconcile.
+    func executeMutation(_ item: MutationQueueItem) async throws -> MutationResult {
         let key = item.idempotencyKey.uuidString
         // Validate `resourceId` shape before splicing into a URL path.
         // The queue is local-only and SwiftData rows can't be tampered
@@ -365,7 +380,7 @@ actor BrainAPIClient {
                 idempotencyKey: key
             )
             try await performIgnoringBody(request)
-            return nil
+            return .none
         case .createTodo:
             // M44.x optimistic-add: POST /api/v1/notes with the queue
             // item's pre-encoded `CreateNotePayload` body. The server
@@ -389,7 +404,8 @@ actor BrainAPIClient {
                 requiresAuth: true,
                 idempotencyKey: key
             )
-            return try await perform(request, as: Note.self)
+            let note = try await perform(request, as: Note.self)
+            return .note(note)
         case .updateTodo:
             // M40: PUT /api/v1/notes/{id} with the queue item's pre-
             // encoded JSON body. The server treats unspecified fields as
@@ -405,7 +421,7 @@ actor BrainAPIClient {
                 idempotencyKey: key
             )
             try await performIgnoringBody(request)
-            return nil
+            return .none
         case .updateProject:
             // M40: PUT /api/v1/projects/{id}. Same shape as updateTodo;
             // the body is `UpdateProjectPayload` JSON encoded at
@@ -421,7 +437,7 @@ actor BrainAPIClient {
                 idempotencyKey: key
             )
             try await performIgnoringBody(request)
-            return nil
+            return .none
         case .archiveNote:
             // M44.x: DELETE /api/v1/notes/{id} — the brain server treats
             // DELETE as soft-delete / archive (see `delete_note_endpoint`
@@ -437,9 +453,33 @@ actor BrainAPIClient {
                 idempotencyKey: key
             )
             try await performIgnoringBody(request)
-            return nil
+            return .none
+        case .createProject:
+            // POST /api/v1/projects with the queue item's pre-encoded
+            // `CreateProjectPayload` body. Mirrors the `.createTodo`
+            // shape: the server doesn't accept a client-supplied `id`,
+            // so the response carries a server-assigned UUID + short_id
+            // + canonical timestamps + the M26 default sections list.
+            // The replayer in `MutationQueue` uses those to patch the
+            // optimistic `LocalProject` stub (whose `id` is the client
+            // UUID we put in `resourceId`) so the row picks up the
+            // server's id without a flicker.
+            //
+            // Idempotency-Key threads through unchanged: the brain
+            // server's middleware caches the response under
+            // `(key, user, POST, /api/v1/projects)` for 24h, so a
+            // network blip that triggers a retry returns the same
+            // Project (same server id) rather than minting a duplicate.
+            let request = try makeRequest(
+                method: "POST",
+                path: "/api/v1/projects",
+                body: item.payload,
+                requiresAuth: true,
+                idempotencyKey: key
+            )
+            let project = try await perform(request, as: Project.self)
+            return .project(project)
         case .uncompleteTodo,
-             .createProject,
              .addSection:
             // TODO(M41+): Wire each of these to its server endpoint.
             // The shape is the same as `.updateTodo`: build a request
@@ -615,18 +655,20 @@ actor BrainAPIClient {
         return try await perform(request, as: Note.self)
     }
 
-    /// `POST /api/v1/projects` — create a new project. Direct call (NOT
-    /// via the M37 mutation queue) because the user is in an interactive
-    /// "New project" sheet and benefits from immediate feedback, and
-    /// because the M37 queue's `MutationOp.createProject` isn't fully
-    /// wired yet (M41+ territory). Same direct-call rationale as
-    /// `createNote(...)` for the M39 quick-add path.
+    /// `POST /api/v1/projects` — create a new project.
+    ///
+    /// Historical note: this used to be the only path used by
+    /// `NewProjectView` (direct round-trip + dismiss). M44.x moved the
+    /// new-project flow onto the optimistic-add pattern: the view inserts
+    /// a `LocalProject` stub, enqueues `MutationOp.createProject`, and
+    /// the queue replays through `executeMutation(.createProject)` →
+    /// which uses *this* method's path + body shape but threads an
+    /// `Idempotency-Key`. The function stays as a thin convenience for
+    /// any non-queue caller that still wants a synchronous round-trip.
     ///
     /// Returns the freshly-created project (with server-assigned id,
     /// sort_order, and the canonical M26 default sections — Now/Next/
-    /// Later). The caller (`NewProjectView`) discards the response and
-    /// instead fires a sync; the next sync delta writes the new row into
-    /// SwiftData and the Projects list re-renders via `@Query`.
+    /// Later).
     func createProject(_ payload: CreateProjectPayload) async throws -> Project {
         let body: Data
         do {
