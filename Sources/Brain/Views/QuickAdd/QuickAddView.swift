@@ -18,7 +18,10 @@ import SwiftData
 import SwiftUI
 
 /// Modal sheet that converts free-form text into a todo. Presented
-/// from the FAB on `TodayView`.
+/// from the FAB on `TodayView`, and from per-project surfaces (e.g.
+/// the "Unassigned" virtual project) which thread a project id
+/// through the optional context init so the new todo lands in the
+/// right bucket without an extra round-trip.
 @MainActor
 struct QuickAddView: View {
 
@@ -26,9 +29,54 @@ struct QuickAddView: View {
     @Environment(\.syncEngine) private var syncEngine
     @Environment(\.dismiss) private var dismiss
 
+    /// Optional project id to pre-fill on the wire payload. The
+    /// server's `NoteCreate.project` field accepts either a project
+    /// name, a project id, or the literal sentinel `"unassigned"`
+    /// (which clears any inferred project association). `nil` means
+    /// "no project context — let the server's defaults apply"
+    /// (Inbox-style capture from the Today FAB).
+    let prefilledProjectID: String?
+    /// Optional section slug to pre-fill on the wire payload. Must be
+    /// the slug, not the display name — the server rejects unknown
+    /// slugs with a 400. `nil` means "let the server pick the default
+    /// section" (typically `now`). Currently unused by callers; kept
+    /// for forward-compat with the in-flight per-section "+" affordance
+    /// on `ProjectDetailView`.
+    let prefilledSectionSlug: String?
+    /// Optional human-readable project name, used purely for the
+    /// in-sheet "Adding to <Project>" caption so the user knows where
+    /// the todo will land. Not sent on the wire.
+    let prefilledProjectName: String?
+
     @State private var rawText: String = ""
     @State private var isSubmitting: Bool = false
     @State private var errorMessage: String?
+
+    /// Designated init. All three context parameters default to `nil`
+    /// so existing callsites (the Today FAB) keep their previous
+    /// behaviour — no project, no section, no caption. New callsites
+    /// pass `projectID: "unassigned"` (the Unassigned virtual project)
+    /// or a real project UUID to scope the capture.
+    init(
+        projectID: String? = nil,
+        sectionSlug: String? = nil,
+        projectName: String? = nil
+    ) {
+        self.prefilledProjectID = projectID
+        self.prefilledSectionSlug = sectionSlug
+        self.prefilledProjectName = projectName
+    }
+
+    /// "Adding to <Project>" or "Adding to <Project> · <slug>" when a
+    /// section is also pinned. Returns `nil` when no project context
+    /// is set, so the Today FAB renders without a caption (unchanged).
+    var contextCaption: String? {
+        guard let name = prefilledProjectName else { return nil }
+        if let slug = prefilledSectionSlug {
+            return "Adding to \(name) · \(slug)"
+        }
+        return "Adding to \(name)"
+    }
 
     /// The parsed result is recomputed every keystroke. Cheap — the
     /// regex passes are linear in input length.
@@ -49,6 +97,13 @@ struct QuickAddView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
+                    if let contextCaption {
+                        Text(contextCaption)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .accessibilityIdentifier("quick-add.context")
+                    }
+
                     inputSection
 
                     if !parsed.title.isEmpty {
@@ -145,6 +200,13 @@ struct QuickAddView: View {
         errorMessage = nil
         defer { isSubmitting = false }
 
+        // Wire-payload `project` — pass through the prefilled id verbatim.
+        // The server resolves three cases:
+        //   * `nil`            → leave any inferred association alone
+        //   * `"unassigned"`   → clear `project_id` to NULL (sentinel)
+        //   * any UUID / name  → look up the project by id then by name
+        // See `src/brain/server.py` lines 1858, 2032-2044 for the
+        // create/update resolution path the server takes.
         let payload = CreateNotePayload(
             content: parsed.bodyForServer(),
             title: nil,
@@ -153,8 +215,8 @@ struct QuickAddView: View {
             dueTime: parsed.dueTimeHHMM(),
             priority: parsed.priority?.rawValue,
             recurrence: parsed.recurrence?.rawValue,
-            project: nil,
-            section: nil,
+            project: prefilledProjectID,
+            section: prefilledSectionSlug,
             url: nil,
             startTime: nil,
             endTime: nil,

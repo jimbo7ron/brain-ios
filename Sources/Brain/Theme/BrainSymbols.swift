@@ -34,6 +34,11 @@ enum BrainSymbols {
     /// Lucide `MapPin` — Appointments.
     static let location = "mappin.and.ellipse"
 
+    /// Lucide `Inbox` — the "Unassigned" virtual project (todos with
+    /// no `project_id`). Mirrors the inbox/tray metaphor the web uses
+    /// for the same surface in the sidebar.
+    static let inbox = "tray"
+
     // MARK: - App chrome
 
     /// Brain glyph used as the app icon and splash mark. `brain.head.profile`
