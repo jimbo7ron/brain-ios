@@ -33,6 +33,14 @@ struct SettingsView: View {
     @State private var statusMessage: String?
     @State private var isSigningOut: Bool = false
 
+    /// Mirrors the `@AppStorage("compactDensity")` flag read in
+    /// `BrainApp` — the same key, so changes here propagate to the
+    /// app-root `.dynamicTypeSize` modifier without further plumbing.
+    /// Defaults to `true` so first launches start in the user-
+    /// requested denser layout; flipping the toggle persists across
+    /// relaunches via `UserDefaults`.
+    @AppStorage("compactDensity") private var compactDensity: Bool = true
+
     /// Hide the "Done" toolbar button when this view is presented as a
     /// tab (no sheet to dismiss). The presence of an injected
     /// `dismiss` action isn't enough on its own — SwiftUI always
@@ -51,6 +59,11 @@ struct SettingsView: View {
                     Section {
                         LabeledContent("Signed in as", value: email)
                     }
+                }
+
+                Section("Display") {
+                    Toggle("Compact density", isOn: $compactDensity)
+                        .accessibilityHint("Shrinks the UI by ~15% to fit more on screen.")
                 }
 
                 Section {
