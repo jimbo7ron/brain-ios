@@ -42,6 +42,21 @@ struct ApiKeyRecord: Codable, Hashable {
     }
 }
 
+/// Response shape for `GET /api/v1/auth/api-keys` — mirrors
+/// `ApiKeyListResponse` in `brain/src/brain/schemas.py`. Used by the
+/// M30 4-step recovery in `BrainAPIClient.loginWithRecovery(...)`:
+/// after a 409 we list the user's keys (via JWT bearer auth, not the
+/// usual `X-API-Key` header — we don't have a key yet) and look for
+/// the orphan whose `name` matches the requested `device_name` and
+/// whose `revokedAt` is nil. The revokedAt filter is load-bearing —
+/// without it we'd try to revoke an already-revoked key and the
+/// server would happily no-op, leaving the orphan still blocking
+/// the next login attempt.
+struct ApiKeyListResponse: Codable {
+    let keys: [ApiKeyRecord]
+    let total: Int
+}
+
 /// Returned by `POST /auth/login`. When the request includes a
 /// `device_name` (M30), the server mints a named API key and inlines
 /// it on the response so the iOS client can stash the plaintext key

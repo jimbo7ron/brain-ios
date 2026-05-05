@@ -127,7 +127,14 @@ struct LoginView: View {
         Task { @MainActor in
             defer { isSubmitting = false }
             do {
-                let response = try await apiClient.login(
+                // Use the M30 recovery helper rather than the plain
+                // `login(...)` call. On a fresh install where a prior
+                // install's named API key is still active server-side,
+                // the bare login returns 409 — `loginWithRecovery`
+                // transparently revokes the orphan and retries (see
+                // its doc-comment for the 4-step contract). The user
+                // sees a single Sign-in tap.
+                let response = try await apiClient.loginWithRecovery(
                     email: trimmedEmail,
                     password: submittedPassword,
                     deviceName: deviceName
