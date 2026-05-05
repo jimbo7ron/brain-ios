@@ -36,6 +36,7 @@ import SwiftUI
 @MainActor
 struct UnassignedDetailView: View {
 
+    @Environment(\.brainAPIClient) private var client
     @Environment(\.syncEngine) private var syncEngine
 
     /// All todos in the working set, narrowed to type `"todo"` only at
@@ -74,10 +75,10 @@ struct UnassignedDetailView: View {
             }
     }
 
-    /// Drives the QuickAdd sheet for the "+ Add to Unassigned"
-    /// button. State lives on the detail view (not the row) because
-    /// the affordance is project-scoped, not row-scoped.
-    @State private var addingTodo: Bool = false
+    /// Transient inline-add error surfaced as a banner above the list.
+    /// Cleared on the next successful submit. Same shape
+    /// `ProjectDetailView` carries.
+    @State private var inlineAddError: String?
 
     /// Tracks whether the "Done (N)" tray is expanded. Defaults to
     /// collapsed — same default `ProjectDetailView` carries — so the
@@ -113,6 +114,16 @@ struct UnassignedDetailView: View {
                     .listRowSeparator(.hidden)
             }
 
+            if let inlineAddError {
+                Section {
+                    Text(inlineAddError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .accessibilityIdentifier("unassigned.inline-add.error")
+                        .listRowSeparator(.hidden)
+                }
+            }
+
             Section {
                 if openTodos.isEmpty {
                     EmptySectionLine(text: "Nothing here yet.")
@@ -122,14 +133,17 @@ struct UnassignedDetailView: View {
                     }
                 }
 
-                Button {
-                    addingTodo = true
-                } label: {
-                    Label("Add to Unassigned", systemImage: "plus.circle")
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("unassigned.add-button")
+                // Inline add — same affordance `ProjectDetailView`
+                // gets per-section. Replaces the M44 sheet-based
+                // button so the user can capture rapidly without
+                // summoning a sheet for one line of text.
+                InlineAddRow(
+                    placeholder: "Add to Unassigned",
+                    accessibilityIdentifier: "unassigned.inline-add",
+                    onCommit: { rawText in
+                        Task { await createTodoInline(content: rawText) }
+                    }
+                )
             } header: {
                 openSectionHeader
             }
@@ -152,16 +166,6 @@ struct UnassignedDetailView: View {
         .listStyle(.insetGrouped)
         .navigationTitle("Unassigned")
         .navigationBarTitleDisplayMode(.large)
-        .sheet(isPresented: $addingTodo) {
-            // Thread the `"unassigned"` sentinel through QuickAddView
-            // so the wire payload sends `project: "unassigned"`. The
-            // server resolves this to `project_id = NULL` on insert
-            // (`src/brain/server.py:1858, 2032-2044`).
-            QuickAddView(
-                projectID: ProjectListView.unassignedProjectID,
-                projectName: "Unassigned"
-            )
-        }
         .refreshable {
             // PTR pulls the freshly-created row through the sync
             // pipeline so it appears in the list without waiting for
@@ -200,6 +204,57 @@ struct UnassignedDetailView: View {
 
     private var headerSummary: String {
         "\(openCount) open · \(doneCount) done · \(totalCount) total"
+    }
+
+    // MARK: - Inline add
+
+    /// Create a todo from inline-add text in the Unassigned bucket.
+    /// Threads the `"unassigned"` sentinel through as the `project`
+    /// field — the server resolves this to `project_id = NULL` on
+    /// insert (`src/brain/server.py:1858, 2032-2044`). Same payload
+    /// shape as `ProjectDetailView.createTodoInline` so trailing
+    /// keywords behave identically.
+    private func createTodoInline(content: String) async {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        guard let client else {
+            inlineAddError = "Couldn't reach the server. Try again."
+            BrainHaptics.error()
+            return
+        }
+
+        let parsed = QuickAddParser.parse(trimmed)
+        let bodyContent = parsed.title.isEmpty ? trimmed : parsed.bodyForServer()
+
+        let payload = CreateNotePayload(
+            content: bodyContent,
+            title: nil,
+            type: "todo",
+            dueDate: parsed.dueDateISO(),
+            dueTime: parsed.dueTimeHHMM(),
+            priority: parsed.priority?.rawValue,
+            recurrence: parsed.recurrence?.rawValue,
+            project: ProjectListView.unassignedProjectID,
+            section: nil,
+            url: nil,
+            startTime: nil,
+            endTime: nil,
+            location: nil
+        )
+
+        do {
+            _ = try await client.createNote(payload)
+            inlineAddError = nil
+            Task { await syncEngine?.sync() }
+            BrainHaptics.light()
+        } catch let error as BrainAPIClient.Error {
+            inlineAddError = error.userFacingMessage
+            BrainHaptics.error()
+        } catch {
+            inlineAddError = "Couldn't save: \(error.localizedDescription)"
+            BrainHaptics.error()
+        }
     }
 
     /// Open-section header. Matches the visual cadence of
