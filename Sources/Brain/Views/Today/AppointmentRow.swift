@@ -92,5 +92,9 @@ struct AppointmentRow: View {
             Spacer(minLength: 0)
         }
         .contentShape(Rectangle())
+        // Match `TodoRow`'s tightened vertical row insets so the
+        // Appointments-today section reads at the same density as
+        // the todo sections above it.
+        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
     }
 }

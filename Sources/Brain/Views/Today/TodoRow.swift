@@ -150,6 +150,13 @@ struct TodoRow: View {
             }
         }
         .contentShape(Rectangle())
+        // Tighter row insets than the system default (~11pt top/bottom)
+        // for higher information density on iPhone. Halved vertically;
+        // horizontal kept at the system 16pt so the row aligns with
+        // section headers and other inset-grouped chrome. Tap targets
+        // remain reachable thanks to the row-area hit-testing below
+        // and the parent List's `defaultMinListRowHeight` of 32pt.
+        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
         // Long-press → Edit. The checkbox is its own `.borderless`
         // Button (see above), so the row itself isn't a button —
         // SwiftUI delivers the long-press gesture to the row content

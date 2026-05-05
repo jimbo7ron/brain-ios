@@ -246,6 +246,14 @@ struct TodayView: View {
                 }
         }
         .listStyle(.insetGrouped)
+        // Density pass: tighten the inter-section gutter (`.compact`
+        // on iOS 17+) and drop the system default min row height from
+        // 44pt to 32pt. Combined with the per-row `.listRowInsets`
+        // tightening on `TodoRow` / `AppointmentRow`, this knocks
+        // ~25-30% off each row's vertical footprint. Tap targets stay
+        // reachable thanks to row-area hit-testing.
+        .listSectionSpacing(.compact)
+        .environment(\.defaultMinListRowHeight, 32)
         // Reserve space at the bottom of the scroll content so the
         // FAB (M39) doesn't cover the last list row when the user
         // scrolls to the bottom. Budget: 56pt FAB + 16pt trailing
@@ -374,6 +382,11 @@ struct EmptySectionLine: View {
             .font(.subheadline)
             .italic()
             .foregroundStyle(.secondary)
+            // Tighter row insets so an empty section ("Nothing here
+            // yet.") doesn't reserve a full ~44pt row of vertical
+            // space. The italic subheadline reads as a hint, not as a
+            // full entry — the row should size to match.
+            .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
     }
 }
 
