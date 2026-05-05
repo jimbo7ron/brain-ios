@@ -24,5 +24,16 @@
 	-->
 	<key>aps-environment</key>
 	<string>development</string>
+
+	<!--
+		application-identifier is normally auto-injected by Xcode at
+		sign time from the team's App ID. On Xcode 26 / iOS 26 sim
+		builds it's NOT injected (sim destinations ad-hoc sign
+		without team identifier), which means Keychain rejects every
+		write with OSStatus -34018. Manual declaration here
+		guarantees it's present in the embedded entitlements.
+	-->
+	<key>application-identifier</key>
+	<string>XCHXTX3N92.io.mindkeeper.brain</string>
 </dict>
 </plist>
