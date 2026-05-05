@@ -117,7 +117,7 @@ struct UnassignedDetailView: View {
             if let inlineAddError {
                 Section {
                     Text(inlineAddError)
-                        .font(.caption)
+                        .font(.caption2)
                         .foregroundStyle(.red)
                         .accessibilityIdentifier("unassigned.inline-add.error")
                         .listRowSeparator(.hidden)
@@ -201,7 +201,7 @@ struct UnassignedDetailView: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(headerSummary)
-                    .font(.subheadline)
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
@@ -273,13 +273,13 @@ struct UnassignedDetailView: View {
                 .foregroundStyle(.secondary)
                 .imageScale(.small)
             Text("Open")
-                .font(.caption.bold())
+                .font(.caption2.bold())
                 .textCase(.uppercase)
                 .tracking(0.5)
                 .foregroundStyle(.secondary)
             Spacer(minLength: 0)
             Text("\(openCount)/\(totalCount)")
-                .font(.caption.weight(.regular))
+                .font(.caption2.weight(.regular))
                 .foregroundStyle(.secondary.opacity(0.7))
                 .monospacedDigit()
         }

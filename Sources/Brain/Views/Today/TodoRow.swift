@@ -105,7 +105,7 @@ struct TodoRow: View {
                 Task { await toggle() }
             } label: {
                 Image(systemName: note.completed ? BrainSymbols.checkmarkCircle : BrainSymbols.circle)
-                    .font(.title3)
+                    .font(.headline)
                     .foregroundStyle(note.completed ? accentColor : Color.secondary)
                     .contentShape(Rectangle())
             }
@@ -121,7 +121,7 @@ struct TodoRow: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(displayTitle)
-                    .font(.body)
+                    .font(.callout)
                     .strikethrough(note.completed)
                     .foregroundStyle(note.completed ? Color.secondary : Color.primary)
                     .lineLimit(2)
@@ -130,7 +130,7 @@ struct TodoRow: View {
                     HStack(spacing: 8) {
                         ForEach(subline, id: \.self) { piece in
                             Text(piece)
-                                .font(.caption)
+                                .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -144,7 +144,7 @@ struct TodoRow: View {
                 // medium are the unmarked default — rendering all
                 // three would clutter the row.
                 Image(systemName: "exclamationmark")
-                    .font(.caption.bold())
+                    .font(.caption2.bold())
                     .foregroundStyle(.orange)
                     .accessibilityLabel("High priority")
             }
