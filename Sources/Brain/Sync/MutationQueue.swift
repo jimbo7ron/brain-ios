@@ -254,6 +254,7 @@ final class MutationQueue {
                     item.nextRetryAt = .distantFuture
                     item.lastError = "Permanent failure: \(error)"
                     try? modelContext.save()
+                    rollbackOptimisticStateIfNeeded(for: item, reason: error)
                     lastError = error.userFacingMessage
                     continue
 
@@ -270,7 +271,8 @@ final class MutationQueue {
                     // SwiftUI debug pane) so an operator can spot it.
                     let attemptsAfter = item.attempts + 1
                     item.attempts = attemptsAfter
-                    if attemptsAfter >= Self.maxAttempts {
+                    let cappedToPoison = attemptsAfter >= Self.maxAttempts
+                    if cappedToPoison {
                         item.nextRetryAt = .distantFuture
                         item.lastError = "Retry cap exceeded after \(attemptsAfter) attempts: \(error)"
                     } else {
@@ -279,6 +281,9 @@ final class MutationQueue {
                         item.lastError = String(describing: error)
                     }
                     try? modelContext.save()
+                    if cappedToPoison {
+                        rollbackOptimisticStateIfNeeded(for: item, reason: error)
+                    }
                     // Surface the route-not-found case via lastError
                     // so the UI (M44 territory) can hint at the
                     // out-of-sync server. The message wording is
@@ -300,7 +305,8 @@ final class MutationQueue {
                     // genuinely-broken request can't retry forever.
                     let attemptsAfter = item.attempts + 1
                     item.attempts = attemptsAfter
-                    if attemptsAfter >= Self.maxAttempts {
+                    let cappedToPoison = attemptsAfter >= Self.maxAttempts
+                    if cappedToPoison {
                         item.nextRetryAt = .distantFuture
                         item.lastError = "Retry cap exceeded after \(attemptsAfter) attempts: \(error)"
                     } else {
@@ -314,6 +320,9 @@ final class MutationQueue {
                     // That's acceptable; the worst case is one extra
                     // retry on next launch.
                     try? modelContext.save()
+                    if cappedToPoison {
+                        rollbackOptimisticStateIfNeeded(for: item, reason: error)
+                    }
                     lastError = error.userFacingMessage
                     return
                 }
@@ -323,7 +332,8 @@ final class MutationQueue {
                 // above so we don't loop on a persistently broken row.
                 let attemptsAfter = item.attempts + 1
                 item.attempts = attemptsAfter
-                if attemptsAfter >= Self.maxAttempts {
+                let cappedToPoison = attemptsAfter >= Self.maxAttempts
+                if cappedToPoison {
                     item.nextRetryAt = .distantFuture
                     item.lastError = "Retry cap exceeded after \(attemptsAfter) attempts: \(error)"
                 } else {
@@ -332,6 +342,9 @@ final class MutationQueue {
                     item.lastError = String(describing: error)
                 }
                 try? modelContext.save()
+                if cappedToPoison {
+                    rollbackOptimisticStateIfNeeded(for: item, reason: error)
+                }
                 lastError = "Failed to send change: \(error.localizedDescription)"
                 return
             }
@@ -424,30 +437,116 @@ final class MutationQueue {
     /// optimistic insert has already saved, so there's no in-flight
     /// row colliding on the new id.
     ///
-    /// Idempotency: if a sync has *already* delivered the server's row
-    /// before the create replay completes (rare but possible — the
-    /// foreground Timer or scenePhase might have fired during the
-    /// network blip we were retrying through), the local stub looked
-    /// up by `clientId` no longer exists and the upsert from
-    /// `SyncEngine.upsert(_:)` already inserted a row keyed by the
-    /// server id. The lookup-by-clientId returns nil, we no-op, and
-    /// the queue row drains as normal. Worst case: the user briefly
-    /// saw two rows; the next sync convergence step never duplicates
-    /// because the server only emits one Note per id.
+    /// Dual-ModelContext propagation: the optimistic insert in
+    /// `QuickAddView.submit()` lands on the SwiftUI
+    /// `@Environment(\.modelContext)`, while the reconcile fetch +
+    /// rename + field copy here happens on the queue's own
+    /// `ModelContext` (constructed in `BrainApp.init` ~line 247).
+    /// Cross-context propagation works because SwiftData persists each
+    /// save to the shared SQLite store and a fresh fetch on the other
+    /// context re-reads from disk; the SwiftUI side's `@Query` picks
+    /// up the change via SwiftData's change-coalescing. The same
+    /// pattern is already in use by the archive / update flows; if it
+    /// ever stops propagating, look here first.
+    ///
+    /// Sync-race / unique-constraint defence (B1): if a sync delta
+    /// reached us *before* this create echo (the Timer or scenePhase
+    /// fires during a network blip while we're retrying through the
+    /// queue), `SyncEngine.upsert(_:)` will have inserted a separate
+    /// `LocalNote` keyed by the server id. The pre-existing
+    /// `shouldSkipEcho` defence in SyncEngine keys on `resourceId`
+    /// which for create rows is the *client* UUID, so it never fires
+    /// and the duplicate row goes through. Renaming the stub from
+    /// `clientId` -> `serverNote.id` would then hit the
+    /// `@Attribute(.unique)` constraint on `LocalNote.id` and crash
+    /// the save. We pre-empt that by fetching any row already keyed
+    /// on the server id and deleting it before the rename — the
+    /// stub's canonical fields are about to be overwritten with the
+    /// same `serverNote` payload anyway, so the sync-inserted row is
+    /// strictly redundant.
+    ///
+    /// Pending-edit rewrite (B2): if the user immediately edits the
+    /// fresh todo (long-press → EditTodoView before the create echo
+    /// returns), the resulting `updateTodo` queue row carries the
+    /// *client* UUID as its `resourceId`. After this method renames
+    /// the stub to the server id, replaying that queued update with
+    /// the now-stale client UUID would 404 on the server and get
+    /// poisoned — silent data loss. Rewrite any queue rows targeting
+    /// the client UUID to point at the server id *before* the rename
+    /// so the next replay tick sees a consistent picture.
+    ///
+    /// Idempotency: if a sync has *already* delivered the server's
+    /// row AND the local stub is gone (user wiped local data, or
+    /// SwiftData lost the optimistic insert across a kill-9 + restart
+    /// while the queue row survived), the lookup-by-clientId returns
+    /// nil and we no-op — the existing sync-inserted row already
+    /// represents the truth.
     private func reconcileCreateResponse(clientId: String, serverNote: Note) {
-        let descriptor: FetchDescriptor<LocalNote> = {
+        // B2: rewrite any queued mutations that still target the
+        // client UUID. Has to happen before the rename / field copy —
+        // those steps land via `try? modelContext.save()` below, and
+        // we want a single coherent post-state for the next replay
+        // tick. Best-effort save: a SwiftData fault here is rare and
+        // recoverable (worst case: the queue row replays once with
+        // the stale id, hits 404, gets poisoned — same as the pre-
+        // fix behaviour, so we're not making things worse).
+        let pendingDescriptor = FetchDescriptor<MutationQueueItem>(
+            predicate: #Predicate { $0.resourceId == clientId }
+        )
+        if let stalePending = try? modelContext.fetch(pendingDescriptor) {
+            for row in stalePending {
+                row.resourceId = serverNote.id
+            }
+        }
+
+        let stubDescriptor: FetchDescriptor<LocalNote> = {
             var d = FetchDescriptor<LocalNote>(
                 predicate: #Predicate { $0.id == clientId }
             )
             d.fetchLimit = 1
             return d
         }()
-        guard let stub = (try? modelContext.fetch(descriptor))?.first else {
-            // Local stub already gone — sync raced us, or the user
-            // wiped local data between enqueue and replay. The server
-            // row is canonical and (if not yet present) will land on
-            // the next sync. Nothing to do here.
+        guard let stub = (try? modelContext.fetch(stubDescriptor))?.first else {
+            // Local stub already gone. Either:
+            //   * Sync delivered the server row first AND the user
+            //     wiped local data between enqueue and replay (rare),
+            //     or
+            //   * The user restarted the app and SwiftData lost the
+            //     stub but the queue row survived to replay.
+            // In both cases the existing sync-inserted row (if any)
+            // already represents the truth, OR the next sync will
+            // deliver it. Don't touch any LocalNote keyed on
+            // `serverNote.id` — that's the canonical row we'd
+            // otherwise destroy. Save the B2 queue rewrite and bail.
+            try? modelContext.save()
             return
+        }
+
+        // B1: drop any LocalNote that sync already inserted under the
+        // server id. The about-to-be-renamed stub will be repopulated
+        // with the same canonical fields from `serverNote`, so the
+        // sync-inserted row is redundant — and leaving it would
+        // collide with the rename on the unique-id constraint.
+        // Only safe to do once we've confirmed the stub exists; in
+        // the stub-missing branch above the sync-inserted row IS the
+        // truth.
+        let serverId = serverNote.id
+        let dupeDescriptor: FetchDescriptor<LocalNote> = {
+            var d = FetchDescriptor<LocalNote>(
+                predicate: #Predicate { $0.id == serverId }
+            )
+            d.fetchLimit = 1
+            return d
+        }()
+        if let dupe = (try? modelContext.fetch(dupeDescriptor))?.first,
+           dupe !== stub {
+            modelContext.delete(dupe)
+            // Save now so the unique-id slot is freed before the
+            // rename below tries to claim it. If this throws we'll
+            // fall through and the rename's save will surface the
+            // collision — same failure mode as before the fix, just
+            // with a slightly different stack.
+            try? modelContext.save()
         }
         // Mirror the field copy that `SyncEngine.upsert(_:)` does on
         // an existing row. Keep this list in sync with the upsert path
@@ -484,6 +583,60 @@ final class MutationQueue {
         stub.appointmentEndTime = appointment?.endTime
         stub.appointmentLocation = appointment?.location
         stub.appointmentRecurrence = appointment?.recurrence
+    }
+
+    /// S1 rollback for the createTodo poison case. `.createTodo` is
+    /// the one mutation where the optimistic local state must be
+    /// rolled back on permanent failure: the user saw a row appear in
+    /// QuickAddView's optimistic insert and (without this) it would
+    /// stay on screen forever, never reflected on the server. Other
+    /// ops (toggle / archive / update) target an existing server row
+    /// — the next sync will overwrite any optimistic divergence with
+    /// the server's truth.
+    ///
+    /// Looks up the orphan `LocalNote` by `item.resourceId` (the
+    /// client UUID minted in `QuickAddView.submit()`) and deletes it.
+    /// Cross-context propagation: the stub was inserted on the
+    /// SwiftUI `ModelContext` and we're deleting it from the queue's
+    /// context — both share the SwiftData container, the delete
+    /// hits the SQLite store on save, and `@Query` on the SwiftUI
+    /// side picks up the disappearance via SwiftData's change-
+    /// coalescing. Same pattern as the rename path in
+    /// `reconcileCreateResponse`.
+    ///
+    /// No-ops for non-create ops, and silent (the only signal is the
+    /// existing `lastError` / NSLog path the caller has already
+    /// stamped). UI banners / toasts on this failure are a separate
+    /// UX decision; this just prevents the phantom-row data state.
+    private func rollbackOptimisticStateIfNeeded(
+        for item: MutationQueueItem,
+        reason: some Error
+    ) {
+        guard MutationOp(rawValue: item.op) == .createTodo else { return }
+        let stubId = item.resourceId
+        let descriptor: FetchDescriptor<LocalNote> = {
+            var d = FetchDescriptor<LocalNote>(
+                predicate: #Predicate { $0.id == stubId }
+            )
+            d.fetchLimit = 1
+            return d
+        }()
+        guard let stub = (try? modelContext.fetch(descriptor))?.first else {
+            return
+        }
+        modelContext.delete(stub)
+        do {
+            try modelContext.save()
+            NSLog(
+                "MutationQueue: rolled back optimistic createTodo stub " +
+                "\(stubId) after permanent failure: \(reason)"
+            )
+        } catch {
+            NSLog(
+                "MutationQueue: failed to roll back optimistic createTodo " +
+                "stub \(stubId): \(error)"
+            )
+        }
     }
 
     /// Local copy of the SyncEngine's date-parser. Duplicating this
@@ -613,6 +766,24 @@ extension EnvironmentValues {
 // MARK: - Debug-only sanity checks
 
 #if DEBUG
+
+extension MutationQueue {
+    /// Test-only window into the internal context so debug checks can
+    /// stage rows alongside the queue without going through the full
+    /// SwiftUI view stack. Only exposed under `#if DEBUG`.
+    var debugModelContext: ModelContext { modelContext }
+
+    /// Test-only entry point for `reconcileCreateResponse`. Exposes
+    /// the private helper to `BrainDebugMutationQueue`.
+    func debugReconcileCreateResponse(clientId: String, serverNote: Note) {
+        reconcileCreateResponse(clientId: clientId, serverNote: serverNote)
+    }
+
+    /// Test-only entry point for `rollbackOptimisticStateIfNeeded`.
+    func debugRollbackOptimisticState(for item: MutationQueueItem, reason: some Error) {
+        rollbackOptimisticStateIfNeeded(for: item, reason: reason)
+    }
+}
 
 /// Documentation-grade smoke checks (no test target exists yet — see
 /// the M37 spec). Call from a debug REPL or wire into a future
@@ -766,6 +937,206 @@ enum BrainDebugMutationQueue {
         assert(queue.pendingCount == 0)
     }
 
+    /// B1 (PR #31 review): `reconcileCreateResponse` must dedupe a
+    /// LocalNote that sync inserted under the server id while the
+    /// create echo was still in flight. Exactly one row keyed on the
+    /// server id should remain after reconcile, populated from the
+    /// echo (not the sync row), and no unique-id-constraint exception.
+    @MainActor
+    static func assertReconcileDedupesSyncRace() throws {
+        let schema = Schema([MutationQueueItem.self, LocalNote.self])
+        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+        let container = try ModelContainer(for: schema, configurations: [config])
+        let context = ModelContext(container)
+        let session = AuthSession(state: .signedOut)
+        let client = BrainAPIClient()
+        let queue = MutationQueue(modelContext: context, client: client, authSession: session)
+
+        let clientId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        let serverId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+        // Optimistic stub keyed on the client UUID.
+        let stub = LocalNote(
+            id: clientId,
+            shortId: "",
+            title: "draft title",
+            content: "draft content",
+            type: "todo"
+        )
+        queue.debugModelContext.insert(stub)
+
+        // Sync raced ahead and inserted a separate row under the
+        // server id with the canonical content.
+        let syncInserted = LocalNote(
+            id: serverId,
+            shortId: "abc123",
+            title: nil,
+            content: "canonical content",
+            type: "todo"
+        )
+        queue.debugModelContext.insert(syncInserted)
+        try queue.debugModelContext.save()
+
+        let serverNote = Note(
+            id: serverId,
+            shortId: "abc123",
+            title: nil,
+            content: "canonical content",
+            type: "todo",
+            tags: [],
+            createdAt: nil,
+            updatedAt: nil,
+            archived: false,
+            todo: nil,
+            appointment: nil
+        )
+
+        // Should not throw / crash on the unique-id constraint.
+        queue.debugReconcileCreateResponse(clientId: clientId, serverNote: serverNote)
+        try queue.debugModelContext.save()
+
+        // Exactly one LocalNote keyed on the server id, none on the
+        // client id, and the canonical content carried through.
+        let allNotes = try queue.debugModelContext.fetch(FetchDescriptor<LocalNote>())
+        let serverHits = allNotes.filter { $0.id == serverId }
+        let clientHits = allNotes.filter { $0.id == clientId }
+        assert(serverHits.count == 1,
+               "expected exactly one LocalNote keyed on serverId, found \(serverHits.count)")
+        assert(clientHits.isEmpty,
+               "client UUID should be gone after reconcile, found \(clientHits.count)")
+        assert(serverHits.first?.content == "canonical content",
+               "reconcile should overwrite content with serverNote payload")
+        assert(serverHits.first?.shortId == "abc123",
+               "reconcile should backfill shortId from serverNote")
+    }
+
+    /// B2 (PR #31 review): pending `MutationQueueItem` rows targeting
+    /// the client UUID must be rewritten to the server id during
+    /// reconcile. Otherwise an edit enqueued before the create echo
+    /// would 404 on replay (server doesn't know the client UUID) and
+    /// get poisoned — silent data loss.
+    @MainActor
+    static func assertReconcileRewritesPendingResourceIds() throws {
+        let schema = Schema([MutationQueueItem.self, LocalNote.self])
+        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+        let container = try ModelContainer(for: schema, configurations: [config])
+        let context = ModelContext(container)
+        let session = AuthSession(state: .signedOut)
+        let client = BrainAPIClient()
+        let queue = MutationQueue(modelContext: context, client: client, authSession: session)
+
+        let clientId = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        let serverId = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+
+        // Optimistic stub.
+        let stub = LocalNote(
+            id: clientId,
+            shortId: "",
+            title: nil,
+            content: "stub",
+            type: "todo"
+        )
+        queue.debugModelContext.insert(stub)
+        // User long-pressed and edited before the create echo
+        // returned — produces an updateTodo queue row keyed on the
+        // client UUID.
+        let pendingEdit = try queue.enqueue(
+            op: .updateTodo,
+            resourceType: "todo",
+            resourceId: clientId,
+            payload: Data(),
+            baseUpdatedAt: nil
+        )
+        assert(pendingEdit.resourceId == clientId)
+
+        let serverNote = Note(
+            id: serverId,
+            shortId: "x9z",
+            title: nil,
+            content: "stub",
+            type: "todo",
+            tags: [],
+            createdAt: nil,
+            updatedAt: nil,
+            archived: false,
+            todo: nil,
+            appointment: nil
+        )
+        queue.debugReconcileCreateResponse(clientId: clientId, serverNote: serverNote)
+        try queue.debugModelContext.save()
+
+        // Queue row should now point at the server id.
+        let pendingAfter = queue.pendingMutation(forResourceId: serverId)
+        assert(pendingAfter?.id == pendingEdit.id,
+               "queued updateTodo should now be findable under serverId")
+        assert(queue.pendingMutation(forResourceId: clientId) == nil,
+               "no queue row should still target the now-phantom client UUID")
+        // Stub renamed — so no leftover under the client UUID.
+        let allNotes = try queue.debugModelContext.fetch(FetchDescriptor<LocalNote>())
+        assert(allNotes.contains(where: { $0.id == serverId }),
+               "stub should have been renamed to serverId")
+        assert(!allNotes.contains(where: { $0.id == clientId }),
+               "no LocalNote should remain under the client UUID")
+    }
+
+    /// S1 (PR #31 review): when a `.createTodo` mutation hits a
+    /// poison-class error, the optimistic local stub must be deleted
+    /// — otherwise the user is left with a phantom row that has no
+    /// server counterpart and no UI signal of failure.
+    @MainActor
+    static func assertCreateTodoPoisonRollsBackStub() throws {
+        let schema = Schema([MutationQueueItem.self, LocalNote.self])
+        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+        let container = try ModelContainer(for: schema, configurations: [config])
+        let context = ModelContext(container)
+        let session = AuthSession(state: .signedOut)
+        let client = BrainAPIClient()
+        let queue = MutationQueue(modelContext: context, client: client, authSession: session)
+
+        let clientId = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+
+        // Stub the user saw appear.
+        let stub = LocalNote(
+            id: clientId,
+            shortId: "",
+            title: nil,
+            content: "doomed",
+            type: "todo"
+        )
+        queue.debugModelContext.insert(stub)
+        // Matching createTodo queue row (the one that's about to be
+        // poisoned by the simulated 422).
+        let item = try queue.enqueue(
+            op: .createTodo,
+            resourceType: "todo",
+            resourceId: clientId,
+            payload: Data()
+        )
+
+        // Simulate the poison-class arm of `replay()`: stamp the row
+        // and call the rollback helper directly. The integration with
+        // the real catch-arm is exercised by callers; here we're
+        // covering the helper's contract.
+        item.attempts += 1
+        item.nextRetryAt = .distantFuture
+        item.lastError = "simulated 422"
+        try queue.debugModelContext.save()
+        queue.debugRollbackOptimisticState(
+            for: item,
+            reason: BrainAPIClient.Error.validationError(detail: "simulated")
+        )
+
+        let allNotes = try queue.debugModelContext.fetch(FetchDescriptor<LocalNote>())
+        assert(!allNotes.contains(where: { $0.id == clientId }),
+               "createTodo poison rollback should delete the orphan stub")
+        // Queue row stays — the rollback only touches the LocalNote.
+        // The poisoned row will sit forever (parked) and is fine; a
+        // future retry hook could reap it.
+        let queueRows = try queue.debugModelContext.fetch(FetchDescriptor<MutationQueueItem>())
+        assert(queueRows.contains(where: { $0.id == item.id }),
+               "queue row should remain parked after rollback")
+    }
+
     /// Run every check. Convenience entrypoint for a future debug menu /
     /// CI smoke step.
     @MainActor
@@ -776,6 +1147,9 @@ enum BrainDebugMutationQueue {
             try await assertEmptyReplayIsNoOp()
             try assertLWWDropIncrementsCounter()
             try assertClearResetsConflictCounter()
+            try assertReconcileDedupesSyncRace()
+            try assertReconcileRewritesPendingResourceIds()
+            try assertCreateTodoPoisonRollsBackStub()
         } catch {
             assertionFailure("BrainDebugMutationQueue: setup failed: \(error)")
         }
