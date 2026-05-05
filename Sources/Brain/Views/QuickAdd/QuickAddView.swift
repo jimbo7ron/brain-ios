@@ -18,10 +18,11 @@ import SwiftData
 import SwiftUI
 
 /// Modal sheet that converts free-form text into a todo. Presented
-/// from the FAB on `TodayView`, and from per-project surfaces (e.g.
-/// the "Unassigned" virtual project) which thread a project id
-/// through the optional context init so the new todo lands in the
-/// right bucket without an extra round-trip.
+/// from the FAB on `TodayView`, from per-project surfaces (e.g. the
+/// "Unassigned" virtual project), and from the per-section "+" row on
+/// `ProjectDetailView` — each callsite threads a project id (and
+/// optionally a section slug) through the optional context init so
+/// the new todo lands in the right bucket without an extra round-trip.
 @MainActor
 struct QuickAddView: View {
 
@@ -39,9 +40,9 @@ struct QuickAddView: View {
     /// Optional section slug to pre-fill on the wire payload. Must be
     /// the slug, not the display name — the server rejects unknown
     /// slugs with a 400. `nil` means "let the server pick the default
-    /// section" (typically `now`). Currently unused by callers; kept
-    /// for forward-compat with the in-flight per-section "+" affordance
-    /// on `ProjectDetailView`.
+    /// section" (typically `now`). Used by the per-section "+" row on
+    /// `ProjectDetailView` to drop the new todo straight into the
+    /// section the user tapped.
     let prefilledSectionSlug: String?
     /// Optional human-readable project name, used purely for the
     /// in-sheet "Adding to <Project>" caption so the user knows where
@@ -56,7 +57,8 @@ struct QuickAddView: View {
     /// so existing callsites (the Today FAB) keep their previous
     /// behaviour — no project, no section, no caption. New callsites
     /// pass `projectID: "unassigned"` (the Unassigned virtual project)
-    /// or a real project UUID to scope the capture.
+    /// or a real project UUID (optionally with a section slug) to
+    /// scope the capture.
     init(
         projectID: String? = nil,
         sectionSlug: String? = nil,
@@ -65,17 +67,6 @@ struct QuickAddView: View {
         self.prefilledProjectID = projectID
         self.prefilledSectionSlug = sectionSlug
         self.prefilledProjectName = projectName
-    }
-
-    /// "Adding to <Project>" or "Adding to <Project> · <slug>" when a
-    /// section is also pinned. Returns `nil` when no project context
-    /// is set, so the Today FAB renders without a caption (unchanged).
-    var contextCaption: String? {
-        guard let name = prefilledProjectName else { return nil }
-        if let slug = prefilledSectionSlug {
-            return "Adding to \(name) · \(slug)"
-        }
-        return "Adding to \(name)"
     }
 
     /// The parsed result is recomputed every keystroke. Cheap — the
@@ -91,6 +82,19 @@ struct QuickAddView: View {
     /// final guard so the user can't submit just whitespace.
     private var canSubmit: Bool {
         !isSubmitting && !rawText.trimmingCharacters(in: .whitespaces).isEmpty && !parsed.title.isEmpty
+    }
+
+    /// "Adding to <Project>" or "Adding to <Project> · <slug>" when a
+    /// section is also pinned. Returns `nil` when no project context is
+    /// set, so the Today FAB renders without a caption (unchanged).
+    /// Exposed as `internal` so the DEBUG checks file can verify the
+    /// formatter without going through SwiftUI rendering.
+    var contextCaption: String? {
+        guard let name = prefilledProjectName else { return nil }
+        if let slug = prefilledSectionSlug {
+            return "Adding to \(name) · \(slug)"
+        }
+        return "Adding to \(name)"
     }
 
     var body: some View {

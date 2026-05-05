@@ -49,8 +49,31 @@ struct ProjectDetailView: View {
     /// without a re-fetch.
     @State private var isEditPresented: Bool = false
 
+    /// Slug of the section the user just tapped "+" on. When non-nil,
+    /// the sheet presents `QuickAddView` pre-filled with this project's
+    /// id + the slug so the new todo lands in the right bucket. Storing
+    /// the slug (rather than a `Spec`) keeps the state hashable for
+    /// SwiftUI's `.sheet(item:)` and matches the wire field's expected
+    /// shape — see (5) in the M44 plan.
+    @State private var addingToSection: AddingToSection?
+
+    /// Identifiable wrapper so `.sheet(item:)` can distinguish presents.
+    /// SwiftUI re-presents the sheet whenever the bound item's id
+    /// changes, which is exactly what we want when the user taps "+"
+    /// on a different section without first dismissing.
+    struct AddingToSection: Identifiable, Hashable {
+        let slug: String
+        var id: String { slug }
+    }
+
     init(project: LocalProject) {
         self.project = project
+        // Type-check shortcut: a 3-condition AND inside `#Predicate`
+        // with an optional `projectId` exhausts the constraint solver
+        // under Xcode 26 (per the swiftc-parse-insufficient feedback
+        // note). Pin the optional to a typed local + use `!archived`
+        // instead of `== false`, then split predicate / sort out so
+        // each piece type-checks in isolation.
         let projectID: String? = project.id
         let predicate = #Predicate<LocalNote> { note in
             note.type == "todo" && !note.archived && note.projectId == projectID
@@ -137,7 +160,10 @@ struct ProjectDetailView: View {
                                 expandedDoneSlugs.remove(spec.slug)
                             }
                         }
-                    )
+                    ),
+                    onAddTapped: {
+                        addingToSection = AddingToSection(slug: spec.slug)
+                    }
                 )
             }
 
@@ -174,6 +200,18 @@ struct ProjectDetailView: View {
         }
         .sheet(isPresented: $isEditPresented) {
             EditProjectView(project: project)
+        }
+        .sheet(item: $addingToSection) { target in
+            // The slug is the wire field; the display name is purely
+            // for the in-sheet caption. Look the name up from the
+            // ordered section list (which already includes the
+            // synthesised default trio when the project has none of
+            // its own).
+            QuickAddView(
+                projectID: project.id,
+                sectionSlug: target.slug,
+                projectName: project.name
+            )
         }
     }
 
@@ -238,6 +276,11 @@ struct SectionView: View {
     /// known color mapping.
     let accentColor: Color
     @Binding var isDoneTrayExpanded: Bool
+    /// Invoked when the user taps the "+ Add to <Section>" row at the
+    /// bottom of this section's open todos. The parent owns the sheet
+    /// state and the project context — the section block just signals
+    /// intent.
+    var onAddTapped: () -> Void
 
     private var openTodos: [LocalNote] { todos.filter { !$0.completed } }
     private var completedTodos: [LocalNote] {
@@ -282,17 +325,24 @@ struct SectionView: View {
                 ForEach(openTodos, id: \.id) { note in
                     TodoRow(note: note, accentColor: accentColor)
                 }
+            }
 
-                if !completedTodos.isEmpty {
-                    DoneTrayHeader(
-                        count: completedTodos.count,
-                        isExpanded: $isDoneTrayExpanded
-                    )
+            // "+ Add to <Section>" row. Always rendered — including
+            // empty sections — because that's the most useful place to
+            // tap. Sits below the open todos and above the Done tray
+            // so the affordance never gets pushed off-screen by a
+            // long completed list.
+            AddToSectionRow(sectionName: spec.name, action: onAddTapped)
 
-                    if isDoneTrayExpanded {
-                        ForEach(completedTodos, id: \.id) { note in
-                            TodoRow(note: note, accentColor: accentColor)
-                        }
+            if !completedTodos.isEmpty {
+                DoneTrayHeader(
+                    count: completedTodos.count,
+                    isExpanded: $isDoneTrayExpanded
+                )
+
+                if isDoneTrayExpanded {
+                    ForEach(completedTodos, id: \.id) { note in
+                        TodoRow(note: note, accentColor: accentColor)
                     }
                 }
             }
@@ -305,6 +355,36 @@ struct SectionView: View {
                 totalCount: todos.count
             )
         }
+    }
+}
+
+// MARK: - Add-to-section row
+
+/// Tappable "+ Add to <Section>" row. Mirrors the web's per-section
+/// add affordance. Lives at the bottom of each section's open todos
+/// list so a user who's just finished scanning the section sees the
+/// "+" exactly where they're already looking.
+struct AddToSectionRow: View {
+
+    let sectionName: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: "plus.circle")
+                    .foregroundStyle(.secondary)
+                Text("Add to \(sectionName)")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Add todo to \(sectionName)")
+        .accessibilityIdentifier("project.section.add.\(sectionName)")
     }
 }
 
