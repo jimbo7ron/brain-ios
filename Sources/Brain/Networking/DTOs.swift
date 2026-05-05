@@ -291,6 +291,35 @@ struct UpdateProjectPayload: Encodable, Hashable {
     }
 }
 
+/// Body for `POST /api/v1/projects` — mirrors `ProjectCreate` in
+/// `brain/src/brain/schemas.py`. Used by the iOS "New project" sheet
+/// to create a project directly through the API. `name` is required;
+/// `color` and `sortOrder` are optional and the server applies sane
+/// defaults when omitted.
+///
+/// Note: this struct intentionally does NOT carry `archived` — the
+/// server's `ProjectCreate` schema has no such field (a freshly-created
+/// project is always non-archived). It also does NOT carry `sections`
+/// for the iOS create flow: M26's `DEFAULT_SECTIONS` (Now/Next/Later)
+/// are applied server-side when `sections` is omitted, which is the
+/// shape we want here. Custom sections are reachable later via
+/// `EditProjectView` once the project exists.
+struct CreateProjectPayload: Encodable, Hashable {
+    /// Required by the server — minimum 1, maximum 200 characters.
+    let name: String
+    /// Raw CSS colour string (e.g. `hsl(262 83% 58%)`). Pick from
+    /// `BrainColors.palette` so iOS and web render identically.
+    let color: String?
+    /// Optional — server defaults to 0.
+    let sortOrder: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case color
+        case sortOrder = "sort_order"
+    }
+}
+
 /// Body for `POST /api/v1/notes` — mirrors `NoteCreate` in
 /// `brain/src/brain/schemas.py`. Used by M39's quick-add flow to mint a
 /// todo (or, in future, an appointment) directly through the API. Every

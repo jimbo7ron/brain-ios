@@ -575,6 +575,34 @@ actor BrainAPIClient {
         return try await perform(request, as: Note.self)
     }
 
+    /// `POST /api/v1/projects` — create a new project. Direct call (NOT
+    /// via the M37 mutation queue) because the user is in an interactive
+    /// "New project" sheet and benefits from immediate feedback, and
+    /// because the M37 queue's `MutationOp.createProject` isn't fully
+    /// wired yet (M41+ territory). Same direct-call rationale as
+    /// `createNote(...)` for the M39 quick-add path.
+    ///
+    /// Returns the freshly-created project (with server-assigned id,
+    /// sort_order, and the canonical M26 default sections — Now/Next/
+    /// Later). The caller (`NewProjectView`) discards the response and
+    /// instead fires a sync; the next sync delta writes the new row into
+    /// SwiftData and the Projects list re-renders via `@Query`.
+    func createProject(_ payload: CreateProjectPayload) async throws -> Project {
+        let body: Data
+        do {
+            body = try encoder.encode(payload)
+        } catch {
+            throw Error.unknown(statusCode: -1, body: "failed to encode create-project body: \(error)")
+        }
+        let request = try makeRequest(
+            method: "POST",
+            path: "/api/v1/projects",
+            body: body,
+            requiresAuth: true
+        )
+        return try await perform(request, as: Project.self)
+    }
+
     /// `POST /api/v1/projects/{id}/sections` — append a new section
     /// to a project. Implemented in M40 for the edit-project dialog.
     /// Direct call (NOT via the M37 mutation queue) because the
