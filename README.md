@@ -6,16 +6,24 @@ knowledge / todo / appointment system at [mindkeeper.io](https://mindkeeper.io).
 This repo is mirrored from the brain server's data model and uses the public
 HTTP API at `https://api.mindkeeper.io`. SwiftUI + SwiftData, iOS 17+.
 
-> **Status:** M43 (polish — dark mode, haptics, in-app search, App
-> Intents / Siri Shortcuts, placeholder app icon). Email/password
-> sign-in mints a named device API key (M30), the read path syncs
-> incrementally (M33), the write path queues and replays mutations
-> with idempotency keys (M37), Today / Projects / Quick add / edit
-> dialogs are wired (M34/M35/M39/M40), APNs registration kicks on
-> first sign-in (M41), and notification preferences round-trip
-> (M42). M43 adds the polish pass: tactile feedback at every commit
-> point, a dedicated Search tab, and "What's due in Brain?" / "Add
-> to Brain: …" Siri triggers. See the
+> **Status:** v0.1 shipped to internal **TestFlight** on
+> 2026-05-05 as **Mindkeeper** ([App Store
+> Connect](https://appstoreconnect.apple.com) → My Apps → Mindkeeper,
+> bundle id `io.mindkeeper.brain`). The home-screen icon is still
+> labelled **brain** — the App Store name "brain" was taken, so the
+> store listing uses *Mindkeeper* (matching the
+> [mindkeeper.io](https://mindkeeper.io) domain) while
+> `CFBundleDisplayName` keeps the original *brain* name for the
+> lock-/home-screen tile.
+>
+> v0.1 ships **without push notifications** — APNs registration code
+> (M41/M42) is in the tree but disabled until a `.p8` APNs auth key
+> lands on the prod server. Push returns in v0.2. Everything else
+> from M30–M43 is in: email/password sign-in, incremental read sync,
+> queued/replayed writes with idempotency keys, Today / Projects /
+> Quick add / edit / Search tabs, swipe-to-archive on todos, dark
+> mode, haptics, and "What's due in Brain?" / "Add to Brain: …" Siri
+> triggers. See the
 > [iOS roadmap](https://github.com/jimbo7ron/brain/blob/main/docs/ios-roadmap.md)
 > for the full milestone plan.
 
@@ -82,6 +90,25 @@ brain-ios/
 The `.xcodeproj` is **not** committed — regenerate it with `xcodegen generate`
 whenever `project.yml` changes or when you first clone the repo.
 
+## TestFlight builds
+
+Before each archive uploaded to App Store Connect, **bump
+`CURRENT_PROJECT_VERSION` in `project.yml`** (1 → 2 → 3 …) and re-run
+`xcodegen generate`. App Store Connect rejects uploads whose
+`(MARKETING_VERSION, CURRENT_PROJECT_VERSION)` pair has been seen
+before, so re-archiving without a bump fails with a duplicate-build
+error. `MARKETING_VERSION` only needs to change between
+user-facing releases (0.1.0 → 0.2.0).
+
+## Releases
+
+- **v0.1.0 (build 1) — 2026-05-05** — first internal TestFlight build,
+  shipped as *Mindkeeper*. Includes basic CRUD across notes / todos /
+  appointments, swipe-to-archive on todos, compact-density list
+  rows, dark mode, haptics, Siri shortcuts, and Search.
+  *Not in v0.1:* push notifications (waiting on APNs `.p8` on the
+  prod server), final app icon (placeholder only).
+
 ## Roadmap
 
 See [`docs/ios-roadmap.md`](https://github.com/jimbo7ron/brain/blob/main/docs/ios-roadmap.md)
@@ -91,7 +118,7 @@ in the brain repo for the full M28–M44 plan. Short version:
 - **Phase 2** (M34–M36): Today, Project list/detail, toggle complete.
 - **Phase 3** (M37–M40): mutation queue, conflicts, quick add, edit flows.
 - **Phase 4** (M41–M42): APNs push notifications + preferences.
-- **Phase 5** (M43–M44): polish, App Icon, TestFlight.
+- **Phase 5** (M43–M44): polish, App Icon, TestFlight (v0.1 shipped 2026-05-05).
 
 ## License
 
