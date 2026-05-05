@@ -83,6 +83,15 @@ struct BrainApp: App {
     /// environment.
     @State private var notificationManager: NotificationManager
 
+    /// "Compact density" toggle (Settings → Display). When `true`, the
+    /// root content view is wrapped in `.dynamicTypeSize(.xSmall)` to
+    /// shrink fonts, paddings, and list row heights by ~14-16%. SwiftUI
+    /// keeps tap targets at the platform-minimum 44pt regardless, so
+    /// the cap is safe from an accessibility-affordance standpoint.
+    /// Defaults to `true` per the user's explicit request to start
+    /// denser; flip in Settings to revert to system default sizing.
+    @AppStorage("compactDensity") private var compactDensity: Bool = true
+
     /// `@MainActor` because `AuthSession` and `SyncEngine` are both
     /// main-actor-isolated and we construct them here. SwiftUI
     /// already runs `App.init` on the main thread; this just makes
@@ -397,6 +406,13 @@ struct BrainApp: App {
                 // SettingsView can trigger registration and surface
                 // current authorization status.
                 .environment(\.notificationManager, notificationManager)
+                // Apply the global "Compact density" cap. `.xSmall` is
+                // ~86% of the default `.large`, hitting the user-
+                // requested ~15% shrink while letting SwiftUI scale
+                // associated paddings / list row heights proportionally
+                // and keeping tap targets ≥44pt. Toggle in
+                // Settings → Display.
+                .dynamicTypeSize(compactDensity ? .xSmall : .large)
         }
         .modelContainer(modelContainer)
     }
