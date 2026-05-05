@@ -8,11 +8,19 @@
 // parsed result so the user can confirm we understood them before
 // hitting Add.
 //
-// Submission goes straight through `BrainAPIClient.createNote` — direct
-// call, not via the M37 mutation queue. M40 will revisit when the full
-// edit dialog lands and the queue grows a `createTodo` arm. Until then
-// the round-trip is short and the user sees the new row appear after
-// the next sync (foreground 5-min Timer or PTR on Today).
+// Submission is OPTIMISTIC: we mint a client UUID, insert a `LocalNote`
+// stub immediately, save, and dismiss the sheet. The list view's
+// `@Query` re-renders with the new row right away — no waiting on the
+// network. We then enqueue a `.createTodo` mutation; the M37 queue
+// replays it in the background, the server returns the canonical
+// note, and `MutationQueue.reconcileCreateResponse` patches the
+// stub's id / shortId / timestamps in place.
+//
+// This replaces the original M39 direct-call shape (`await
+// client.createNote(...)` then dismiss) which made rapid adds appear
+// to "pile up" — the user would type three todos in a row but only
+// see them all once a sync completed. The optimistic insert renders
+// each one instantly; the create round-trip becomes invisible.
 
 import SwiftData
 import SwiftUI
@@ -26,8 +34,20 @@ import SwiftUI
 @MainActor
 struct QuickAddView: View {
 
-    @Environment(\.brainAPIClient) private var client
-    @Environment(\.syncEngine) private var syncEngine
+    /// SwiftData context for the optimistic local insert. The new
+    /// `LocalNote` is staged here before we hand the create off to
+    /// the mutation queue. Same context the rest of the app uses, so
+    /// the @Query in `TodayView` / `ProjectDetailView` /
+    /// `UnassignedDetailView` picks up the row in the next render
+    /// pass.
+    @Environment(\.modelContext) private var modelContext
+    /// Mutation queue (M37) — owns the create round-trip after the
+    /// optimistic insert. Optional because the env-key default is
+    /// `nil`; in production `BrainApp` always injects a real queue.
+    /// Previews / non-production hosts fall back to the local-only
+    /// insert (no server replay), which is fine for the preview
+    /// surface.
+    @Environment(\.mutationQueue) private var mutationQueue
     @Environment(\.dismiss) private var dismiss
 
     /// Optional project id to pre-fill on the wire payload. The
@@ -135,7 +155,13 @@ struct QuickAddView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button {
-                        Task { await submit() }
+                        // submit() is synchronous now — the optimistic
+                        // local insert lands immediately and the create
+                        // round-trip is enqueued on the M37 mutation
+                        // queue. No `Task { await … }` wrapper needed;
+                        // the spinner state survives only as a
+                        // belt-and-braces guard against double-taps.
+                        submit()
                     } label: {
                         if isSubmitting {
                             ProgressView()
@@ -190,20 +216,37 @@ struct QuickAddView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    /// Build the wire payload, fire `createNote`, kick a sync to
-    /// rehydrate the row through the read path, then dismiss.
-    /// On any error we surface a message but stay open so the user
-    /// can retry without re-typing.
-    private func submit() async {
-        guard canSubmit, let client else {
-            errorMessage = "Couldn't reach the server. Try again."
-            return
-        }
+    /// Optimistic-add path. Insert a local stub keyed by a client-minted
+    /// UUID, save it so SwiftUI's @Query picks it up immediately, then
+    /// enqueue a `.createTodo` mutation for the M37 queue to replay
+    /// against `POST /api/v1/notes`. The replayer reconciles the
+    /// server's canonical id back onto the same SwiftData object via
+    /// `MutationQueue.reconcileCreateResponse`, so the user never sees
+    /// a duplicate row.
+    ///
+    /// We deliberately stop awaiting the server here — the original
+    /// M39 shape held the sheet open until the round-trip resolved,
+    /// which (per the M44.x bug report) made rapid adds appear to
+    /// "pile up" on a slow network. The dismiss now fires the moment
+    /// the local save succeeds; the network round-trip becomes
+    /// invisible to the user.
+    private func submit() {
+        guard canSubmit else { return }
 
         isSubmitting = true
         errorMessage = nil
+        // We don't await anything below — the operation is a single
+        // synchronous SwiftData save plus a non-blocking enqueue —
+        // so the busy state is reset immediately. We still flip the
+        // flag for symmetry with the spinner in the toolbar; in the
+        // common case the spinner never even renders because the
+        // save completes within a frame.
         defer { isSubmitting = false }
 
+        // Build the wire payload first so we can encode it for the
+        // queue and use the same parsed values when seeding the
+        // optimistic local stub.
+        //
         // Wire-payload `project` — pass through the prefilled id verbatim.
         // The server resolves three cases:
         //   * `nil`            → leave any inferred association alone
@@ -227,25 +270,133 @@ struct QuickAddView: View {
             location: nil
         )
 
+        // Mint a client UUID — used as the LocalNote primary key AND
+        // as the queue row's `resourceId` so the replayer can find the
+        // stub to patch when the server confirms the create.
+        let clientID = UUID().uuidString.lowercased()
+        let now = Date()
+        // Resolve the projectId to stash on the local stub. Only the
+        // canonical-UUID form survives the trip (the server also
+        // accepts a project NAME, but we can't safely use a name as a
+        // SwiftData foreign-id — Today / Projects views match on UUID).
+        // For name-only or nil project context, leave projectId nil and
+        // let the next sync delta backfill it after the server resolves
+        // the project.
+        let resolvedProjectID: String? = {
+            guard let prefilled = prefilledProjectID else { return nil }
+            // "unassigned" is the server-side clear sentinel — should
+            // surface as nil locally too (otherwise the row would carry
+            // a literal "unassigned" string in `projectId`, which no
+            // @Query predicate looks for).
+            if prefilled == "unassigned" { return nil }
+            return UUID(uuidString: prefilled) != nil ? prefilled : nil
+        }()
+        // Title preview already strips wiki-link brackets and tags;
+        // mirror it here so the optimistic row reads the same as the
+        // preview the user just confirmed. The server runs its own
+        // extraction on `content` — once the create echo lands, the
+        // title may be patched (typically to nil because the server
+        // derives it lazily).
+        let optimisticTitle: String? = {
+            let trimmed = parsed.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }()
+        let stub = LocalNote(
+            id: clientID,
+            // shortId is server-assigned; leave empty until the create
+            // echo backfills it. No view filters on shortId so an
+            // empty string here is invisible.
+            shortId: "",
+            title: optimisticTitle,
+            content: parsed.bodyForServer(),
+            type: "todo",
+            archived: false,
+            createdAt: now,
+            updatedAt: now,
+            tagsCSV: parsed.tags.joined(separator: ","),
+            dueDate: parsed.dueDateISO(),
+            dueTime: parsed.dueTimeHHMM(),
+            completed: false,
+            priority: parsed.priority?.rawValue ?? "medium",
+            recurrence: parsed.recurrence?.rawValue,
+            projectId: resolvedProjectID,
+            section: prefilledSectionSlug,
+            sortOrder: 0
+        )
+        modelContext.insert(stub)
         do {
-            _ = try await client.createNote(payload)
-            // Pull the newly-created row through the read-path sync so
-            // it appears on Today / Projects without waiting for the
-            // 5-minute Timer. Fire-and-forget — we've already saved
-            // server-side, so the user can dismiss even if sync lags.
-            Task { await syncEngine?.sync() }
-            // M43: light haptic on dismiss. Matches the M36 toggle-
-            // complete pattern — a brief confirmation that the capture
-            // landed before the sheet animates away.
-            BrainHaptics.light()
-            dismiss()
-        } catch let error as BrainAPIClient.Error {
-            errorMessage = error.userFacingMessage
-            BrainHaptics.error()
+            try modelContext.save()
         } catch {
+            // SwiftData fault — extremely rare. Surface inline and
+            // bail; nothing was enqueued, nothing leaked to the queue.
+            // The user can retry the Add tap.
             errorMessage = "Couldn't save: \(error.localizedDescription)"
             BrainHaptics.error()
+            return
         }
+
+        // Encode the wire payload for the queue. Done after the local
+        // save so a payload-encoding fault doesn't leave a half-saved
+        // local stub with no replay arm — encoding a fixed Codable
+        // struct can't realistically fail, but the throws-style API
+        // forces us to handle it.
+        let encoder = JSONEncoder()
+        let body: Data
+        do {
+            body = try encoder.encode(payload)
+        } catch {
+            // Local stub is already saved; if encoding fails we'd be
+            // stuck with a permanent stub the queue can't replay.
+            // Roll back the optimistic insert in this (essentially
+            // unreachable) path so the user isn't left with a phantom
+            // todo.
+            modelContext.delete(stub)
+            try? modelContext.save()
+            errorMessage = "Couldn't encode the request. Try again."
+            BrainHaptics.error()
+            return
+        }
+
+        // Enqueue the create. The queue's post-enqueue Task fires a
+        // replay automatically — no need to call `replay()` here.
+        // `baseUpdatedAt` is nil (no pre-existing resource), which
+        // matches the M37 / M38 contract for create ops.
+        if let queue = mutationQueue {
+            do {
+                _ = try queue.enqueue(
+                    op: .createTodo,
+                    resourceType: "todo",
+                    resourceId: clientID,
+                    payload: body,
+                    baseUpdatedAt: nil
+                )
+            } catch {
+                // Enqueue failure (SwiftData fault on the queue row).
+                // The optimistic local stub is already visible; rather
+                // than ripping it back out on a transient SwiftData
+                // hiccup, leave it and surface a haptic. The next
+                // sync delta won't bring back a server row (we never
+                // replayed), so the row will sit locally until the
+                // user re-edits or restarts. This trade-off matches
+                // the archive flow's "don't roll back on enqueue
+                // fault" decision in TodoRow.archive().
+                BrainHaptics.error()
+                NSLog(
+                    "QuickAddView: failed to enqueue createTodo for \(clientID): \(error). " +
+                    "Local stub remains visible; no server replay."
+                )
+            }
+        } else {
+            // Preview / non-production host: local insert is the
+            // entire effect. Production never hits this branch.
+            NSLog("QuickAddView: no mutation queue in environment — local-only insert.")
+        }
+
+        // M43: light haptic on dismiss. Matches the M36 toggle-
+        // complete pattern — a brief confirmation that the capture
+        // landed before the sheet animates away.
+        BrainHaptics.light()
+        dismiss()
     }
 }
 

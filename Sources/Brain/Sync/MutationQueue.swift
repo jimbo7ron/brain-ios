@@ -206,7 +206,23 @@ final class MutationQueue {
 
         while let item = nextReadyItem() {
             do {
-                try await client.executeMutation(item)
+                let serverNote = try await client.executeMutation(item)
+                // M44.x optimistic-add reconciliation: when a `.createTodo`
+                // replay succeeds the server returns the canonical Note
+                // (with a server-assigned UUID + short_id + timestamps).
+                // The local stub was inserted at enqueue time keyed off
+                // the client UUID we put in `item.resourceId`; patch it
+                // in place so it picks up the server's id without a
+                // visible flicker. Doing this *before* deleting the
+                // queue row keeps the row's id the source of truth for
+                // matching. Other ops (complete / update / archive)
+                // return nil and skip the reconcile branch.
+                if let serverNote {
+                    reconcileCreateResponse(
+                        clientId: item.resourceId,
+                        serverNote: serverNote
+                    )
+                }
                 modelContext.delete(item)
                 try modelContext.save()
                 // Clear the surfaced error once we make any forward
@@ -388,6 +404,113 @@ final class MutationQueue {
     }
 
     // MARK: - Internal helpers
+
+    /// Patch the local optimistic stub (keyed by the client-minted
+    /// UUID we used as `resourceId`) with the server's canonical Note
+    /// so the row picks up the server's id, short id, and timestamps
+    /// in a single SwiftData update — no flicker, no duplicate.
+    ///
+    /// Why this rather than "delete the stub and let the next sync
+    /// upsert the server row": the sync round-trip can take seconds,
+    /// and a delete-then-insert window lets the row vanish from the
+    /// list mid-glance. Mutating in place keeps the @Query's identity
+    /// stable from the user's POV — the row they typed and the row
+    /// the server confirmed are the same SwiftData object, just with
+    /// the id rewritten.
+    ///
+    /// `@Attribute(.unique)` on `LocalNote.id` is a uniqueness
+    /// constraint, not an immutability constraint — SwiftData rechecks
+    /// the new value on save. The replayer always runs after the local
+    /// optimistic insert has already saved, so there's no in-flight
+    /// row colliding on the new id.
+    ///
+    /// Idempotency: if a sync has *already* delivered the server's row
+    /// before the create replay completes (rare but possible — the
+    /// foreground Timer or scenePhase might have fired during the
+    /// network blip we were retrying through), the local stub looked
+    /// up by `clientId` no longer exists and the upsert from
+    /// `SyncEngine.upsert(_:)` already inserted a row keyed by the
+    /// server id. The lookup-by-clientId returns nil, we no-op, and
+    /// the queue row drains as normal. Worst case: the user briefly
+    /// saw two rows; the next sync convergence step never duplicates
+    /// because the server only emits one Note per id.
+    private func reconcileCreateResponse(clientId: String, serverNote: Note) {
+        let descriptor: FetchDescriptor<LocalNote> = {
+            var d = FetchDescriptor<LocalNote>(
+                predicate: #Predicate { $0.id == clientId }
+            )
+            d.fetchLimit = 1
+            return d
+        }()
+        guard let stub = (try? modelContext.fetch(descriptor))?.first else {
+            // Local stub already gone — sync raced us, or the user
+            // wiped local data between enqueue and replay. The server
+            // row is canonical and (if not yet present) will land on
+            // the next sync. Nothing to do here.
+            return
+        }
+        // Mirror the field copy that `SyncEngine.upsert(_:)` does on
+        // an existing row. Keep this list in sync with the upsert path
+        // — both produce the same final state, just from different
+        // entry points (sync delta vs create echo).
+        let createdAt = parseServerDate(serverNote.createdAt)
+        let updatedAt = parseServerDate(serverNote.updatedAt)
+        let tagsCSV = serverNote.tags.joined(separator: ",")
+        let todo = serverNote.todo
+        let appointment = serverNote.appointment
+        stub.id = serverNote.id
+        stub.shortId = serverNote.shortId
+        stub.title = serverNote.title
+        stub.content = serverNote.content
+        stub.type = serverNote.type
+        stub.archived = serverNote.archived
+        stub.createdAt = createdAt
+        stub.updatedAt = updatedAt
+        stub.tagsCSV = tagsCSV
+        stub.dueDate = todo?.dueDate
+        stub.dueTime = todo?.dueTime
+        stub.completed = todo?.completed ?? false
+        stub.completedAt = parseServerDate(todo?.completedAt)
+        stub.priority = todo?.priority ?? "medium"
+        stub.recurrence = todo?.recurrence ?? appointment?.recurrence
+        stub.projectId = todo?.projectId
+        stub.section = todo?.section
+        stub.url = todo?.url
+        stub.urlTitle = todo?.urlTitle
+        stub.urlState = todo?.urlState
+        stub.urlFetchedAt = parseServerDate(todo?.urlFetchedAt)
+        stub.sortOrder = todo?.sortOrder ?? 0
+        stub.appointmentStartTime = appointment?.startTime
+        stub.appointmentEndTime = appointment?.endTime
+        stub.appointmentLocation = appointment?.location
+        stub.appointmentRecurrence = appointment?.recurrence
+    }
+
+    /// Local copy of the SyncEngine's date-parser. Duplicating this
+    /// (rather than wiring a shared utility) keeps `MutationQueue`
+    /// dependency-light — it doesn't otherwise need to know about
+    /// SyncEngine — and the formatters are cheap to instantiate
+    /// once. If the server's timestamp shape ever drifts, update both
+    /// places.
+    private func parseServerDate(_ raw: String?) -> Date? {
+        guard let raw, !raw.isEmpty else { return nil }
+        if let date = Self.isoFractional.date(from: raw) {
+            return date
+        }
+        return Self.isoBasic.date(from: raw)
+    }
+
+    private static let isoBasic: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    private static let isoFractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
 
     /// Pull the oldest queue item that's ready for replay. Ready means
     /// either no `nextRetryAt` set (fresh row) or one whose `nextRetryAt`
