@@ -5,6 +5,11 @@
 	<!--
 		M41 — Apple Push Notification service entitlement.
 
+		Intentionally disabled for the v0.1 TestFlight build to
+		avoid a `.p8` APNs key dependency on the prod server.
+		Re-enable for v0.2 once the key is provisioned and the
+		brain push module (M29) is wired through to production.
+
 		`development` is correct for Simulator builds and for
 		dev-signed device builds. Xcode automatically rewrites this
 		key to `production` when creating an archive for TestFlight
@@ -22,8 +27,11 @@
 		actually embedded — `codesign -d --entitlements - <path>`
 		on the .app bundle should show this key.
 	-->
+	<!--
 	<key>aps-environment</key>
 	<string>development</string>
+	-->
+
 
 	<!--
 		application-identifier is normally auto-injected by Xcode at
