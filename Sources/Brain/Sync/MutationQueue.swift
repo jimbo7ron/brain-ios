@@ -482,30 +482,97 @@ final class MutationQueue {
     /// nil and we no-op — the existing sync-inserted row already
     /// represents the truth.
     private func reconcileCreateResponse(clientId: String, serverNote: Note) {
+        // M45 Wave 0: the per-entity field copy lives on
+        // `LocalNote.copyFields(from:parseDate:)`; the create-echo
+        // ceremony (B1 dedupe + B2 pending-mutation rewrite + stub
+        // fetch + adoptServerID + save) lives in `reconcileCreate<T:>`
+        // below. The shared ceremony works generically over
+        // `OptimisticStub` so adding a second entity (project create,
+        // section create, ...) is a one-line conformance plus a
+        // closure, not a copy-paste of the dedupe + rewrite logic.
+        try? reconcileCreate(
+            clientId: clientId,
+            serverId: serverNote.id,
+            type: LocalNote.self
+        ) { stub in
+            stub.copyFields(from: serverNote, parseDate: parseServerDate)
+        }
+    }
+
+    /// Shared create-echo ceremony, generic over an `OptimisticStub`
+    /// model. Performs the M45 Wave 0 sequence:
+    ///
+    ///   1. **B2** — rewrite any pending `MutationQueueItem` rows that
+    ///      target `clientId` to point at `serverId` instead. Has to
+    ///      happen *before* the rename / field copy below so a single
+    ///      `modelContext.save()` lands the whole state transition
+    ///      atomically. Even runs when the local stub is missing —
+    ///      otherwise a queued edit-during-create would replay against
+    ///      the stale client UUID, 404, and get poisoned (silent data
+    ///      loss).
+    ///
+    ///   2. **Stub fetch** — look up the optimistic local row keyed by
+    ///      `clientId`. If it's gone (user wiped local data, or
+    ///      SwiftData lost the stub across a kill-9 + restart while the
+    ///      queue row survived), save the B2 rewrite and return — the
+    ///      sync-inserted row keyed on `serverId` (if any) is the
+    ///      canonical truth and must NOT be touched.
+    ///
+    ///   3. **B1** — if a sync delta inserted a separate row keyed on
+    ///      `serverId` while this create echo was in flight, delete it.
+    ///      Otherwise the rename in step 5 would collide on the
+    ///      `@Attribute(.unique)` constraint. Save immediately so the
+    ///      unique slot is freed before the rename claims it.
+    ///
+    ///   4. **Field copy** — invoke `copyFields` to mirror server-
+    ///      derived fields onto the stub. The closure is per-entity so
+    ///      we don't try to fold ~22-field note copies and ~7-field
+    ///      project copies (with M26 default-section reconcile) under
+    ///      a single contract that fits neither. The closure must NOT
+    ///      mutate `stub.id` — that's the ceremony's job in step 5.
+    ///
+    ///   5. **adoptServerID** — rename the stub's `id` String column
+    ///      from `clientId` to `serverId`. SwiftData's
+    ///      `@Attribute(.unique)` is rechecked on save, but the
+    ///      uniqueness slot is already free thanks to step 3.
+    ///
+    /// The final `modelContext.save()` is the caller's responsibility —
+    /// `replay()` already calls `try modelContext.save()` after the
+    /// `delete(item)` further down, which lands the rename + field copy
+    /// in the same transaction as the queue-row deletion. Cross-context
+    /// observability (SwiftUI `@Query` on a different `ModelContext`
+    /// picks up the change) hangs off SwiftData's shared SQLite store,
+    /// same pattern documented at `MutationQueue.swift:450-460`.
+    ///
+    /// `#Predicate` macro caveat — see `OptimisticStub.swift` header.
+    /// Each conformance owns its own `makeFetchByID(_:)` because the
+    /// macro doesn't accept generic type parameters cleanly on iOS 17.
+    /// We invoke `T.makeFetchByID(...)` here rather than constructing
+    /// a `FetchDescriptor<T>(predicate: #Predicate { ... })` inline.
+    func reconcileCreate<T: OptimisticStub>(
+        clientId: String,
+        serverId: String,
+        type: T.Type,
+        copyFields: (T) -> Void
+    ) throws {
         // B2: rewrite any queued mutations that still target the
         // client UUID. Has to happen before the rename / field copy —
-        // those steps land via `try? modelContext.save()` below, and
-        // we want a single coherent post-state for the next replay
-        // tick. Best-effort save: a SwiftData fault here is rare and
-        // recoverable (worst case: the queue row replays once with
-        // the stale id, hits 404, gets poisoned — same as the pre-
-        // fix behaviour, so we're not making things worse).
+        // those steps land via the save below, and we want a single
+        // coherent post-state for the next replay tick. Best-effort
+        // fetch: a SwiftData fault here is rare and recoverable (worst
+        // case: the queue row replays once with the stale id, hits
+        // 404, gets poisoned — same as the pre-M45 behaviour, so
+        // we're not making things worse).
         let pendingDescriptor = FetchDescriptor<MutationQueueItem>(
             predicate: #Predicate { $0.resourceId == clientId }
         )
         if let stalePending = try? modelContext.fetch(pendingDescriptor) {
             for row in stalePending {
-                row.resourceId = serverNote.id
+                row.resourceId = serverId
             }
         }
 
-        let stubDescriptor: FetchDescriptor<LocalNote> = {
-            var d = FetchDescriptor<LocalNote>(
-                predicate: #Predicate { $0.id == clientId }
-            )
-            d.fetchLimit = 1
-            return d
-        }()
+        let stubDescriptor = T.makeFetchByID(clientId)
         guard let stub = (try? modelContext.fetch(stubDescriptor))?.first else {
             // Local stub already gone. Either:
             //   * Sync delivered the server row first AND the user
@@ -515,35 +582,27 @@ final class MutationQueue {
             //     stub but the queue row survived to replay.
             // In both cases the existing sync-inserted row (if any)
             // already represents the truth, OR the next sync will
-            // deliver it. Don't touch any LocalNote keyed on
-            // `serverNote.id` — that's the canonical row we'd
-            // otherwise destroy. Save the B2 queue rewrite and bail.
+            // deliver it. Don't touch any row keyed on `serverId` —
+            // that's the canonical row we'd otherwise destroy. Save
+            // the B2 queue rewrite and bail.
             try? modelContext.save()
             return
         }
 
-        // B1: drop any LocalNote that sync already inserted under the
-        // server id. The about-to-be-renamed stub will be repopulated
-        // with the same canonical fields from `serverNote`, so the
-        // sync-inserted row is redundant — and leaving it would
-        // collide with the rename on the unique-id constraint.
-        // Only safe to do once we've confirmed the stub exists; in
-        // the stub-missing branch above the sync-inserted row IS the
-        // truth.
-        let serverId = serverNote.id
-        let dupeDescriptor: FetchDescriptor<LocalNote> = {
-            var d = FetchDescriptor<LocalNote>(
-                predicate: #Predicate { $0.id == serverId }
-            )
-            d.fetchLimit = 1
-            return d
-        }()
+        // B1: drop any row that sync already inserted under the server
+        // id. The about-to-be-renamed stub will be repopulated with
+        // the same canonical fields by `copyFields`, so the sync-
+        // inserted row is redundant — and leaving it would collide
+        // with the rename on the unique-id constraint. Only safe to
+        // do once we've confirmed the stub exists; in the stub-
+        // missing branch above the sync-inserted row IS the truth.
+        let dupeDescriptor = T.makeFetchByID(serverId)
         if let dupe = (try? modelContext.fetch(dupeDescriptor))?.first,
            dupe !== stub {
             modelContext.delete(dupe)
             // Save now so the unique-id slot is freed before the
             // rename below tries to claim it. If this throws we'll
-            // fall through and the rename's save will surface the
+            // fall through and the final save will surface the
             // collision — same failure mode as before the fix, just
             // with a slightly different stack. Log so a recurring
             // failure isn't hidden behind the silent `try?` it used
@@ -554,46 +613,19 @@ final class MutationQueue {
                 NSLog(
                     "MutationQueue: reconcile dupe-delete save failed " +
                     "for clientId \(clientId) -> serverId \(serverId): " +
-                    "\(error). Falling through; the rename's save will " +
+                    "\(error). Falling through; the final save will " +
                     "surface the constraint collision."
                 )
             }
         }
-        // Mirror the field copy that `SyncEngine.upsert(_:)` does on
-        // an existing row. Keep this list in sync with the upsert path
-        // — both produce the same final state, just from different
-        // entry points (sync delta vs create echo).
-        let createdAt = parseServerDate(serverNote.createdAt)
-        let updatedAt = parseServerDate(serverNote.updatedAt)
-        let tagsCSV = serverNote.tags.joined(separator: ",")
-        let todo = serverNote.todo
-        let appointment = serverNote.appointment
-        stub.id = serverNote.id
-        stub.shortId = serverNote.shortId
-        stub.title = serverNote.title
-        stub.content = serverNote.content
-        stub.type = serverNote.type
-        stub.archived = serverNote.archived
-        stub.createdAt = createdAt
-        stub.updatedAt = updatedAt
-        stub.tagsCSV = tagsCSV
-        stub.dueDate = todo?.dueDate
-        stub.dueTime = todo?.dueTime
-        stub.completed = todo?.completed ?? false
-        stub.completedAt = parseServerDate(todo?.completedAt)
-        stub.priority = todo?.priority ?? "medium"
-        stub.recurrence = todo?.recurrence ?? appointment?.recurrence
-        stub.projectId = todo?.projectId
-        stub.section = todo?.section
-        stub.url = todo?.url
-        stub.urlTitle = todo?.urlTitle
-        stub.urlState = todo?.urlState
-        stub.urlFetchedAt = parseServerDate(todo?.urlFetchedAt)
-        stub.sortOrder = todo?.sortOrder ?? 0
-        stub.appointmentStartTime = appointment?.startTime
-        stub.appointmentEndTime = appointment?.endTime
-        stub.appointmentLocation = appointment?.location
-        stub.appointmentRecurrence = appointment?.recurrence
+
+        // Per-entity field copy first, then rename. Doing the rename
+        // last means the stub's identity is stable for the duration of
+        // the field copy — important for any closures that capture
+        // `stub.id` (none today, but cheap to preserve as an
+        // invariant).
+        copyFields(stub)
+        stub.adoptServerID(serverId)
     }
 
     /// S1 rollback for the createTodo poison case. `.createTodo` is
