@@ -115,25 +115,76 @@ struct BrainApp: App {
             // unrelated rows under the old schema version, so a
             // SwiftData migration check could still fail at launch.
             //
-            // Destructive fallback: wipe the on-disk store and retry
-            // once. We never had user data on the old schema (M33
-            // sync only landed the read-path models), so the reset
-            // costs at most a re-sync from the server. Acceptable
-            // trade for not crashing the app on first launch after
-            // upgrade.
+            // Destructive fallback (NARROWED in the polish round): we
+            // only wipe the on-disk store when the failure is plausibly
+            // a schema mismatch. Other failure modes (disk full,
+            // sandbox permissions, file-system corruption) wiping the
+            // store would be a hard data-loss event for a TestFlight
+            // user with a populated database — and wouldn't even
+            // recover, since the next init would fail for the same
+            // reason. So those crash with `fatalError` instead, which
+            // surfaces in the TestFlight crash log.
             //
-            // This is a one-time concession for the M37 migration
-            // boundary. Once the schema has been stable across one
-            // shipped release, tighten back to a hard `fatalError`.
-            NSLog("BrainApp: ModelContainer init failed (\(error)). Attempting destructive fallback.")
-            Self.removeOnDiskStore()
-            do {
-                modelContainer = try ModelContainer(for: schema, configurations: [configuration])
-            } catch {
-                // Second failure means something fundamentally wrong
-                // (disk full, sandbox permissions). Crash so it shows
-                // up in the crash log rather than silently breaking.
-                fatalError("Failed to create SwiftData ModelContainer after destructive fallback: \(error)")
+            // Even on the schema-mismatch branch we BACK UP the store
+            // to `<original>.backup-<timestamp>.store` (and -shm/-wal
+            // siblings) by RENAMING. The user's data is quarantined,
+            // not destroyed; a developer can recover it manually if
+            // anyone reports loss. The next sync from the server
+            // re-populates the read models; queued mutations on the
+            // old schema do not survive (acceptable — see queue clear
+            // semantics in `MutationQueue.handleUnauthorized`).
+            //
+            // If the backup move itself fails (permissions, disk
+            // full, etc.) the helper LEAVES THE ORIGINAL STORE IN
+            // PLACE and re-throws. We then crash with `fatalError`
+            // rather than silently deleting user data. No data is
+            // deleted in any failure path.
+            //
+            // The proper fix is a real `SchemaMigrationPlan`, tracked
+            // separately. This is the conservative pre-TestFlight
+            // narrowing that prevents a non-migration init failure
+            // from wiping user data.
+            if Self.isSchemaIncompatibilityError(error) {
+                NSLog(
+                    "BrainApp: ModelContainer init failed with schema-incompatibility error " +
+                    "(\(error)). Backing up store and retrying with a fresh store."
+                )
+                let backedUpTo: URL?
+                do {
+                    backedUpTo = try Self.backUpOnDiskStore()
+                } catch {
+                    // Backup move failed — original store is preserved
+                    // (the helper does NOT delete on failure). Crash
+                    // with a clear message so the TestFlight crash
+                    // report surfaces the underlying I/O error; the
+                    // user's data is intact on disk and recoverable.
+                    fatalError(
+                        "ModelContainer schema-fallback backup failed; original store " +
+                        "preserved on disk: \(error)"
+                    )
+                }
+                if let backedUpTo {
+                    NSLog("BrainApp: existing store quarantined to \(backedUpTo.path).")
+                } else {
+                    NSLog("BrainApp: no existing store to back up.")
+                }
+                do {
+                    modelContainer = try ModelContainer(for: schema, configurations: [configuration])
+                } catch {
+                    // Second failure post-backup means something
+                    // fundamentally wrong (disk full, sandbox
+                    // permissions). Crash so it shows up in the crash
+                    // log rather than silently breaking. Backed-up
+                    // copy on disk preserves any user data we
+                    // quarantined during the wipe.
+                    fatalError("Failed to create SwiftData ModelContainer after backup + retry: \(error)")
+                }
+            } else {
+                // Non-recoverable: not a schema-mismatch error, so
+                // wiping the store wouldn't help and would destroy
+                // user data. Crash and let the TestFlight crash report
+                // surface the actual underlying cause.
+                fatalError("ModelContainer init failed (non-recoverable, not a schema mismatch): \(error)")
             }
         }
         self.modelContainer = modelContainer
@@ -230,31 +281,105 @@ struct BrainApp: App {
         BrainIntentsBridge.modelContainer = modelContainer
     }
 
-    /// Best-effort wipe of the on-disk SwiftData store. Used by the
-    /// destructive-fallback branch in `init` when `ModelContainer`
-    /// fails to open — typically because of an M37 migration mismatch
-    /// on a dev / TestFlight device. Removes the default
-    /// `default.store` (and its `-shm` / `-wal` siblings) under
-    /// `Application Support`. We don't fail the app if the removal
-    /// itself fails — the retry will just re-fail and we'll
-    /// `fatalError` from that path instead.
-    private static func removeOnDiskStore() {
+    /// Heuristic: is `error` plausibly a SwiftData / Core Data schema
+    /// mismatch (where wiping + retrying might recover) rather than a
+    /// non-recoverable failure (disk full, sandbox permissions)?
+    ///
+    /// SwiftData is built on Core Data and surfaces its underlying
+    /// errors through `NSCocoaErrorDomain`. The persistent-store error
+    /// codes are the 134xxx range in `CoreDataErrors.h`:
+    ///
+    ///   * 134100 `NSPersistentStoreIncompatibleVersionHashError`
+    ///     — store on disk has a different schema hash than the model.
+    ///   * 134110 `NSMigrationMissingSourceModelError`
+    ///     — a migration is required but no source model is registered.
+    ///   * 134111 `NSMigrationMissingMappingModelError`
+    ///   * 134130 `NSPersistentStoreIncompatibleSchemaError`
+    ///   * 134140 `NSPersistentStoreIncompatibleVersionHashError`
+    ///
+    /// Apple does NOT publish a stable list of which exact codes
+    /// SwiftData re-raises (the SwiftData layer can also throw its own
+    /// `SwiftDataError` types that bridge to `NSError`), so we treat
+    /// the entire `134000...134999` range as "schema-related, safe to
+    /// wipe + retry". Non-Cocoa errors (e.g. POSIX `ENOSPC` for disk
+    /// full) and non-134xxx Cocoa errors fall through to a hard crash.
+    /// This is conservative on the recovery side — it won't silently
+    /// wipe data on a permissions / disk error — but accepts that a
+    /// genuine schema mismatch we don't recognise will also crash.
+    private static func isSchemaIncompatibilityError(_ error: Swift.Error) -> Bool {
+        let nsError = error as NSError
+        guard nsError.domain == NSCocoaErrorDomain else { return false }
+        // Cocoa persistent-store error codes are 134000-134999. Apple's
+        // CoreDataErrors.h defines the named constants, but the range
+        // is reserved for this family.
+        return (134000...134999).contains(nsError.code)
+    }
+
+    /// Backup-then-quarantine of the on-disk SwiftData store. Used by
+    /// the schema-incompatibility branch in `init` when the
+    /// `ModelContainer` fails to open in a way we recognise as
+    /// recoverable.
+    ///
+    /// Renames the default `default.store` (and its `-shm` / `-wal`
+    /// siblings) to `default.backup-<unix-ts>.store{,-shm,-wal}`
+    /// under `Application Support`, so the user's data is quarantined
+    /// rather than destroyed. The next `ModelContainer(...)` call sees
+    /// no store and creates a fresh one.
+    ///
+    /// Returns the URL of the primary backed-up store file (the
+    /// `.store` itself, not the `-shm`/`-wal`) for logging, or `nil`
+    /// if there was no store to back up.
+    ///
+    /// **Failure semantics:** if a `moveItem` call fails (permissions,
+    /// disk full, etc.) we leave the original store untouched and
+    /// re-throw. The previous version silently `removeItem`'d the
+    /// original on move failure as a "best-effort cleanup", which
+    /// contradicted the quarantine guarantee — a transient permissions
+    /// error would have wiped a TestFlight user's data with no
+    /// recovery path. The retry in `init` will likely also fail
+    /// against the still-incompatible store, which surfaces as a
+    /// `fatalError` and a TestFlight crash report — strictly better
+    /// than silent data destruction. **No data is deleted in any
+    /// failure path.**
+    private static func backUpOnDiskStore() throws -> URL? {
         let fileManager = FileManager.default
         guard let appSupport = try? fileManager.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
             appropriateFor: nil,
             create: false
-        ) else { return }
-        let candidates = [
-            "default.store",
-            "default.store-shm",
-            "default.store-wal",
-        ]
-        for name in candidates {
-            let url = appSupport.appendingPathComponent(name)
-            try? fileManager.removeItem(at: url)
+        ) else { return nil }
+        // Use a single timestamp across all three sidecar files so the
+        // backup set is recognisable as one snapshot.
+        let timestamp = Int(Date().timeIntervalSince1970)
+        let suffixes = ["", "-shm", "-wal"]
+        var primaryBackup: URL?
+        for suffix in suffixes {
+            let original = appSupport.appendingPathComponent("default.store\(suffix)")
+            // Skip files that don't exist — `-shm` / `-wal` are only
+            // present when SQLite has an open WAL.
+            guard fileManager.fileExists(atPath: original.path) else { continue }
+            let backup = appSupport.appendingPathComponent("default.backup-\(timestamp).store\(suffix)")
+            do {
+                try fileManager.moveItem(at: original, to: backup)
+                if suffix.isEmpty {
+                    primaryBackup = backup
+                }
+            } catch {
+                // Move failed. Leave the original in place and
+                // propagate — we'd rather surface a launch failure
+                // than silently delete user data. The retry in `init`
+                // will likely also fail against the still-incompatible
+                // store, which crashes with `fatalError` and shows up
+                // in the TestFlight crash log so the user can recover.
+                NSLog(
+                    "[BrainApp] schema-fallback backup failed; leaving original store at " +
+                    "\(original.path): \(error)"
+                )
+                throw error
+            }
         }
+        return primaryBackup
     }
 
     var body: some Scene {
@@ -276,3 +401,16 @@ struct BrainApp: App {
         .modelContainer(modelContainer)
     }
 }
+
+#if DEBUG
+/// Debug-only test surface for the destructive-fallback narrowing
+/// (polish-round). Exposes the schema-incompatibility classifier so
+/// `BrainDebugSchemaFallbackChecks` (in the matching checks file) can
+/// exercise it without making the production helper internal. The
+/// production binary strips this whole extension.
+extension BrainApp {
+    static func _debug_isSchemaIncompatibilityError(_ error: Swift.Error) -> Bool {
+        isSchemaIncompatibilityError(error)
+    }
+}
+#endif
