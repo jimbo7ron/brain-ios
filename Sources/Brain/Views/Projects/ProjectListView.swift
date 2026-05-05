@@ -90,11 +90,12 @@ struct ProjectListView: View {
     }
 
     /// Swift-narrowed Unassigned working set: open, non-archived,
-    /// no-project todos. Drives both the open-count chip and the
-    /// "show or hide the row" decision (we render Unassigned only
-    /// when the user has at least one such todo OR they have no real
-    /// projects, mirroring the web's hardcoded
-    /// `/projects/unassigned` link).
+    /// no-project todos. Drives the open-count chip on the row.
+    /// The row itself is rendered unconditionally (mirroring the web
+    /// sidebar's hardcoded `/projects/unassigned` link in
+    /// `web/src/app/layout.tsx:39`), so we no longer gate visibility
+    /// on this set being non-empty — discoverability matters more
+    /// than a zero-count chip.
     private var openUnassignedTodos: [LocalNote] {
         openUnassignedTodosRaw.filter {
             !$0.completed && !$0.archived && $0.projectId == nil
@@ -103,21 +104,6 @@ struct ProjectListView: View {
 
     /// Open-todo count surfaced on the synthetic "Unassigned" row.
     private var unassignedOpenCount: Int { openUnassignedTodos.count }
-
-    /// Whether the user has any open unassigned todos. When `false`
-    /// AND the user has at least one real project, we suppress the
-    /// Unassigned row to avoid a permanent zero-count entry above the
-    /// real list. When the user has *no* real projects we show it
-    /// regardless so they always have a surface to land on (matches
-    /// the web's hardcoded sidebar link).
-    private var hasUnassignedTodos: Bool { !openUnassignedTodos.isEmpty }
-
-    /// Combine the two visibility checks into one expression so the
-    /// sidebar body and the empty-state branch read off a single
-    /// source of truth.
-    private var shouldShowUnassignedRow: Bool {
-        hasUnassignedTodos || projects.isEmpty
-    }
 
     /// `projectId` → open-todo count. Rebuilt per render — cheap
     /// (linear scan over a small list) and SwiftUI's diffing means
@@ -165,17 +151,18 @@ struct ProjectListView: View {
     @ViewBuilder
     private var sidebar: some View {
         List(selection: $selectedProjectID) {
-            // "Unassigned" virtual project — always shown when the
-            // user has no real projects yet (so they have *some*
-            // surface to land on), or when they have at least one
-            // open unassigned todo. Kept deliberately *outside* the
-            // `ForEach(projects)` so it has no context menu (Edit /
-            // Archive don't apply to a synthetic row), and so it sits
-            // above real projects regardless of their `sortOrder`.
-            if shouldShowUnassignedRow {
-                NavigationLink(value: ProjectListView.unassignedProjectID) {
-                    UnassignedRow(openTodoCount: unassignedOpenCount)
-                }
+            // "Unassigned" virtual project — always rendered at the
+            // top of the sidebar, matching the web's hardcoded
+            // `/projects/unassigned` link (`web/src/app/layout.tsx:39`).
+            // QuickAdd-created undated/unprojected todos need a
+            // permanent surface to land in regardless of current
+            // count, so we never gate visibility. Kept deliberately
+            // *outside* the `ForEach(projects)` so it has no context
+            // menu (Edit / Archive don't apply to a synthetic row),
+            // and so it sits above real projects regardless of their
+            // `sortOrder`.
+            NavigationLink(value: ProjectListView.unassignedProjectID) {
+                UnassignedRow(openTodoCount: unassignedOpenCount)
             }
 
             if projects.isEmpty {
