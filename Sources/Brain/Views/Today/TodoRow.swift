@@ -59,13 +59,20 @@ struct TodoRow: View {
     /// otherwise oscillate.
     @State private var isToggling: Bool = false
 
-    /// Drives the M40 edit-todo sheet. Long-press → context menu →
-    /// "Edit" sets this to true and the sheet binding presents
-    /// `EditTodoView` for the row's note. State lives here (not on
-    /// the parent) because the row is the natural owner of the
-    /// per-row affordance — promoting it would force the parent to
-    /// track which row is being edited via id, which is more wiring
-    /// than the gain.
+    /// Drives the M40 edit-todo sheet. Long-press on the row sets
+    /// this to true and the sheet binding presents `EditTodoView` for
+    /// the row's note. State lives here (not on the parent) because
+    /// the row is the natural owner of the per-row affordance —
+    /// promoting it would force the parent to track which row is
+    /// being edited via id, which is more wiring than the gain.
+    ///
+    /// Pre-M44.1 the affordance lived behind a `.contextMenu` with
+    /// "Edit" and a disabled "Archive" placeholder. Live iPhone
+    /// testing flagged the menu as friction — long-press → tap-edit
+    /// is two beats for an action that's the only enabled menu item.
+    /// We swapped the menu for a direct `onLongPressGesture`. Archive
+    /// will come back via a swipe-action when M41+ wires archive
+    /// through the mutation queue.
     @State private var isEditPresented: Bool = false
 
     init(note: LocalNote, accentColor: Color = .accentColor) {
@@ -143,17 +150,20 @@ struct TodoRow: View {
             }
         }
         .contentShape(Rectangle())
-        .contextMenu {
-            // M40 — long-press → Edit. Mirrors the web todo-item's
-            // edit affordance behind a context menu so the row stays
-            // visually clean. We don't surface an inline pencil button
-            // because long-press is the iOS-canonical secondary action
-            // and matches what the M35 placeholder advertised.
-            Button {
-                isEditPresented = true
-            } label: {
-                Label("Edit", systemImage: BrainSymbols.edit)
-            }
+        // Long-press → Edit. The checkbox is its own `.borderless`
+        // Button (see above), so the row itself isn't a button —
+        // SwiftUI delivers the long-press gesture to the row content
+        // without intercepting the checkbox tap. Tapping the checkbox
+        // still toggles complete; long-pressing anywhere on the row
+        // (including the checkbox) opens the edit sheet.
+        //
+        // Pre-M44.1 this lived behind a `.contextMenu` with "Edit"
+        // and a disabled "Archive" placeholder. Going straight to the
+        // sheet shaves a tap and removes the dead Archive entry that
+        // was confusing in live testing.
+        .onLongPressGesture(minimumDuration: 0.4) {
+            BrainHaptics.light()
+            isEditPresented = true
         }
         .sheet(isPresented: $isEditPresented) {
             EditTodoView(note: note)

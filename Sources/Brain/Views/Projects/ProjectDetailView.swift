@@ -27,6 +27,9 @@ import SwiftUI
 @MainActor
 struct ProjectDetailView: View {
 
+    @Environment(\.brainAPIClient) private var client
+    @Environment(\.syncEngine) private var syncEngine
+
     /// The project this view describes. Bindable so SwiftData
     /// updates from the sync engine flow through without us having
     /// to re-fetch.
@@ -49,22 +52,12 @@ struct ProjectDetailView: View {
     /// without a re-fetch.
     @State private var isEditPresented: Bool = false
 
-    /// Slug of the section the user just tapped "+" on. When non-nil,
-    /// the sheet presents `QuickAddView` pre-filled with this project's
-    /// id + the slug so the new todo lands in the right bucket. Storing
-    /// the slug (rather than a `Spec`) keeps the state hashable for
-    /// SwiftUI's `.sheet(item:)` and matches the wire field's expected
-    /// shape — see (5) in the M44 plan.
-    @State private var addingToSection: AddingToSection?
-
-    /// Identifiable wrapper so `.sheet(item:)` can distinguish presents.
-    /// SwiftUI re-presents the sheet whenever the bound item's id
-    /// changes, which is exactly what we want when the user taps "+"
-    /// on a different section without first dismissing.
-    struct AddingToSection: Identifiable, Hashable {
-        let slug: String
-        var id: String { slug }
-    }
+    /// Transient inline-add error surfaced as a banner above the list.
+    /// Cleared on the next successful submit. We don't gate on
+    /// per-section error state because the user is only typing into
+    /// one field at a time; a single banner reads cleaner than a
+    /// red row buried inside a section.
+    @State private var inlineAddError: String?
 
     init(project: LocalProject) {
         self.project = project
@@ -146,6 +139,16 @@ struct ProjectDetailView: View {
                     .listRowSeparator(.hidden)
             }
 
+            if let inlineAddError {
+                Section {
+                    Text(inlineAddError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .accessibilityIdentifier("project.inline-add.error")
+                        .listRowSeparator(.hidden)
+                }
+            }
+
             ForEach(orderedSections, id: \.slug) { spec in
                 SectionView(
                     spec: spec,
@@ -161,8 +164,13 @@ struct ProjectDetailView: View {
                             }
                         }
                     ),
-                    onAddTapped: {
-                        addingToSection = AddingToSection(slug: spec.slug)
+                    onInlineAdd: { rawText in
+                        Task {
+                            await createTodoInline(
+                                content: rawText,
+                                sectionSlug: spec.slug
+                            )
+                        }
                     }
                 )
             }
@@ -201,17 +209,63 @@ struct ProjectDetailView: View {
         .sheet(isPresented: $isEditPresented) {
             EditProjectView(project: project)
         }
-        .sheet(item: $addingToSection) { target in
-            // The slug is the wire field; the display name is purely
-            // for the in-sheet caption. Look the name up from the
-            // ordered section list (which already includes the
-            // synthesised default trio when the project has none of
-            // its own).
-            QuickAddView(
-                projectID: project.id,
-                sectionSlug: target.slug,
-                projectName: project.name
-            )
+    }
+
+    // MARK: - Inline add
+
+    /// Create a todo from inline-add text, scoped to `sectionSlug`. The
+    /// text rides through `QuickAddParser` so trailing keywords
+    /// ("tomorrow", "!high", "#tag") behave the same way they do in
+    /// `QuickAddView.submit()` — same payload shape, same server
+    /// resolution path, same post-create sync kick. Errors are
+    /// surfaced via the `inlineAddError` banner above the list; the
+    /// `InlineAddRow` keeps the user's text in place on failure (it
+    /// only clears on a successful `onCommit` callback — see
+    /// `InlineAddRow.body`).
+    private func createTodoInline(content: String, sectionSlug: String) async {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        guard let client else {
+            inlineAddError = "Couldn't reach the server. Try again."
+            BrainHaptics.error()
+            return
+        }
+
+        let parsed = QuickAddParser.parse(trimmed)
+        let bodyContent = parsed.title.isEmpty ? trimmed : parsed.bodyForServer()
+
+        let payload = CreateNotePayload(
+            content: bodyContent,
+            title: nil,
+            type: "todo",
+            dueDate: parsed.dueDateISO(),
+            dueTime: parsed.dueTimeHHMM(),
+            priority: parsed.priority?.rawValue,
+            recurrence: parsed.recurrence?.rawValue,
+            project: project.id,
+            section: sectionSlug,
+            url: nil,
+            startTime: nil,
+            endTime: nil,
+            location: nil
+        )
+
+        do {
+            _ = try await client.createNote(payload)
+            inlineAddError = nil
+            // Pull the newly-created row through the read-path sync so
+            // it appears in the section without waiting for the
+            // 5-minute foreground Timer. Same shape `QuickAddView.submit()`
+            // uses — fire-and-forget; the server already saved.
+            Task { await syncEngine?.sync() }
+            BrainHaptics.light()
+        } catch let error as BrainAPIClient.Error {
+            inlineAddError = error.userFacingMessage
+            BrainHaptics.error()
+        } catch {
+            inlineAddError = "Couldn't save: \(error.localizedDescription)"
+            BrainHaptics.error()
         }
     }
 
@@ -276,11 +330,12 @@ struct SectionView: View {
     /// known color mapping.
     let accentColor: Color
     @Binding var isDoneTrayExpanded: Bool
-    /// Invoked when the user taps the "+ Add to <Section>" row at the
-    /// bottom of this section's open todos. The parent owns the sheet
-    /// state and the project context — the section block just signals
-    /// intent.
-    var onAddTapped: () -> Void
+    /// Invoked when the user submits inline-add text at the bottom of
+    /// this section's open todos. The parent (`ProjectDetailView` /
+    /// `UnassignedDetailView`) owns the project context, so it threads
+    /// the project id + section slug onto the wire payload — the
+    /// section block just hands up the raw user-typed text.
+    var onInlineAdd: (String) -> Void
 
     private var openTodos: [LocalNote] { todos.filter { !$0.completed } }
     private var completedTodos: [LocalNote] {
@@ -327,12 +382,19 @@ struct SectionView: View {
                 }
             }
 
-            // "+ Add to <Section>" row. Always rendered — including
-            // empty sections — because that's the most useful place to
-            // tap. Sits below the open todos and above the Done tray
-            // so the affordance never gets pushed off-screen by a
-            // long completed list.
-            AddToSectionRow(sectionName: spec.name, action: onAddTapped)
+            // Inline add row. Always rendered — including empty
+            // sections — because that's the most useful place to tap.
+            // Sits below the open todos and above the Done tray so
+            // the affordance never gets pushed off-screen by a long
+            // completed list. Replaces the M44-era sheet-based
+            // affordance: the user types into the field directly and
+            // submits with return; the field stays focused so they can
+            // capture rapidly without dismissing the keyboard.
+            InlineAddRow(
+                placeholder: "Add to \(spec.name)",
+                accessibilityIdentifier: "project.section.add.\(spec.name)",
+                onCommit: onInlineAdd
+            )
 
             if !completedTodos.isEmpty {
                 DoneTrayHeader(
@@ -358,33 +420,61 @@ struct SectionView: View {
     }
 }
 
-// MARK: - Add-to-section row
+// MARK: - Inline add row
 
-/// Tappable "+ Add to <Section>" row. Mirrors the web's per-section
-/// add affordance. Lives at the bottom of each section's open todos
-/// list so a user who's just finished scanning the section sees the
-/// "+" exactly where they're already looking.
-struct AddToSectionRow: View {
+/// Inline add affordance at the bottom of each section. Shows a
+/// placeholder text field that the user can tap straight into; on
+/// return the text is handed up to the parent (which threads the
+/// project id + section slug onto the wire payload) and the field
+/// clears + re-focuses so the user can keep capturing without
+/// dismissing the keyboard.
+///
+/// Replaces the M44-era `AddToSectionRow` button that opened a
+/// `QuickAddView` sheet. The sheet still ships — it's the right
+/// affordance for the global Today FAB, where there's no section
+/// context — but for a user already scrolled to "Now" in a project,
+/// summoning a sheet for one line of text is too much friction.
+///
+/// `QuickAddParser` still runs in the parent's commit handler, so
+/// trailing keywords ("tomorrow", "!high", "#work") behave exactly the
+/// same as in the sheet — only the surface changes.
+struct InlineAddRow: View {
 
-    let sectionName: String
-    let action: () -> Void
+    let placeholder: String
+    /// Accessibility identifier the parent assigns. Kept distinct from
+    /// the placeholder so we can locate the row in UI tests without
+    /// depending on the section name's localised form.
+    let accessibilityIdentifier: String
+    let onCommit: (String) -> Void
+
+    @State private var text: String = ""
+    @FocusState private var focused: Bool
 
     var body: some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                Image(systemName: "plus.circle")
-                    .foregroundStyle(.secondary)
-                Text("Add to \(sectionName)")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 6)
-            .contentShape(Rectangle())
+        HStack(spacing: 8) {
+            Image(systemName: "plus.circle")
+                .foregroundStyle(.secondary)
+            TextField(placeholder, text: $text)
+                .focused($focused)
+                .submitLabel(.done)
+                .onSubmit(submit)
+                .accessibilityIdentifier(accessibilityIdentifier)
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Add todo to \(sectionName)")
-        .accessibilityIdentifier("project.section.add.\(sectionName)")
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+    }
+
+    /// Trim, guard against empty submits, hand up to the parent, then
+    /// clear + re-focus so the user can keep typing the next todo
+    /// without dismissing the keyboard. Empty / whitespace-only
+    /// submits are a deliberate no-op — the user pressed return on an
+    /// empty field, which usually means "I'm done capturing".
+    private func submit() {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        onCommit(trimmed)
+        text = ""
+        focused = true
     }
 }
 
