@@ -396,9 +396,23 @@ actor BrainAPIClient {
                 idempotencyKey: key
             )
             try await performIgnoringBody(request)
+        case .archiveNote:
+            // M44.x: DELETE /api/v1/notes/{id} — the brain server treats
+            // DELETE as soft-delete / archive (see `delete_note_endpoint`
+            // in `brain/src/brain/server.py`). No body; the resource id
+            // rides in the path. Idempotency-Key still threaded through
+            // so a retried delete after a network blip dedupes server-
+            // side rather than 404-ing the second attempt.
+            let request = try makeRequest(
+                method: "DELETE",
+                path: "/api/v1/notes/\(resourceId)",
+                body: nil,
+                requiresAuth: true,
+                idempotencyKey: key
+            )
+            try await performIgnoringBody(request)
         case .uncompleteTodo,
              .createTodo,
-             .archiveNote,
              .createProject,
              .addSection:
             // TODO(M41+): Wire each of these to its server endpoint.

@@ -52,6 +52,11 @@ struct TodoRow: View {
     /// waiting up to 5 minutes for the next sync tick to detect the
     /// revoked key. See `toggle()` for the catch-block branching.
     @Environment(\.syncEngine) private var syncEngine
+    /// Mutation queue used by the M44.x swipe-to-archive action.
+    /// Optional — same defaulting rationale as `client` / `syncEngine`.
+    /// In production `BrainApp` always injects a real queue; previews
+    /// fall through to a local-only archive flip with no server replay.
+    @Environment(\.mutationQueue) private var mutationQueue
 
     /// Tracks whether a toggle is currently in flight. Prevents a
     /// rapid double-tap from firing two POSTs against the server
@@ -174,6 +179,84 @@ struct TodoRow: View {
         }
         .sheet(isPresented: $isEditPresented) {
             EditTodoView(note: note)
+        }
+        // M44.x: trailing swipe → Archive. The destructive role gives us
+        // the standard right-edge red treatment and (with the default
+        // `allowsFullSwipe: true`) a full swipe also triggers the action,
+        // matching iOS Mail / Reminders. The optimistic flip happens
+        // inside `archive()` *before* the queue replays so the row leaves
+        // the @Query result set immediately. The TodoRow's own pre-M44.1
+        // doc-comment promised this affordance once the queue understood
+        // archive — that wiring landed in M44.x via `MutationOp.archiveNote`.
+        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+            Button(role: .destructive) {
+                archive()
+            } label: {
+                Label("Archive", systemImage: BrainSymbols.archive)
+            }
+            .tint(.red)
+        }
+    }
+
+    /// Optimistic local archive + enqueue the server-side archive
+    /// mutation. Mirrors the `toggle()` shape: capture rollback state,
+    /// flip the local row, hand off to the M37 queue. The queue replays
+    /// `DELETE /api/v1/notes/{id}` (the brain server treats DELETE as
+    /// soft-delete / archive — see `delete_note_endpoint`).
+    ///
+    /// We do NOT roll back on enqueue failure: a SwiftData fault here
+    /// is rare and surfacing it requires an inline error UI we don't
+    /// have on the row. The next sync brings down the server's
+    /// authoritative `archived` state, which is the correct recovery
+    /// path either way. If the queue is missing (preview / non-
+    /// production host), we still flip locally so SwiftUI previews
+    /// feel responsive.
+    private func archive() {
+        // Already archived — defensive guard. Shouldn't happen because
+        // the row is filtered out of every list that hosts it before
+        // the user can swipe, but a stale query result + a fast tap
+        // could in theory race here.
+        guard !note.archived else { return }
+
+        // Optimistic flip — render-immediate. The `@Query` predicates
+        // in TodayView / ProjectDetailView / UnassignedDetailView all
+        // filter on `!archived`, so the row drops out of the list as
+        // soon as `try? modelContext.save()` lands.
+        note.archived = true
+        try? modelContext.save()
+
+        // Light haptic: matches the M36 complete-toggle weight rather
+        // than the heavier `.medium` used for multi-field saves. An
+        // archive is a single-tap action, so the lighter pulse keeps
+        // the haptic vocabulary consistent with the rest of the row.
+        BrainHaptics.light()
+
+        guard let queue = mutationQueue else {
+            // Preview / non-production host: the local-only flip above
+            // is the entire effect. Production never hits this branch.
+            return
+        }
+
+        // Empty payload — DELETE has no body. The replay path in
+        // `BrainAPIClient.executeMutation` reads only the resourceId
+        // and idempotencyKey from the queue row.
+        do {
+            _ = try queue.enqueue(
+                op: .archiveNote,
+                resourceType: "todo",
+                resourceId: note.id,
+                payload: Data(),
+                baseUpdatedAt: note.updatedAt
+            )
+        } catch {
+            // Enqueue failure (SwiftData fault). The local archive is
+            // already applied; without a clean snapshot to revert to
+            // and no inline error UI on the row, the simplest correct
+            // move is to surface a haptic and let the next sync
+            // reconcile against the server's state. The user can
+            // always re-archive from the edit dialog if the row
+            // resurfaces.
+            BrainHaptics.error()
         }
     }
 
