@@ -51,3 +51,19 @@ targets:
         # Xcode rewrites it to `production` automatically when
         # archiving for TestFlight / App Store distribution.
         CODE_SIGN_ENTITLEMENTS: Brain.entitlements
+
+# OS_ACTIVITY_MODE=disable silences the unified-logging spam from
+# CFNetwork, libsystem_*, CoreData, hapticpatternlibrary, RTI, etc.
+# in the Xcode debug console. The brain app's own NSLog/print calls
+# still appear. Remove or set to "default" if debugging anything that
+# relies on system-subsystem logs (e.g. networking issues, Keychain
+# diagnostics — see the M37 destructive-fallback path).
+schemes:
+  Brain:
+    build:
+      targets:
+        Brain: all
+    run:
+      config: Debug
+      environmentVariables:
+        OS_ACTIVITY_MODE: disable
