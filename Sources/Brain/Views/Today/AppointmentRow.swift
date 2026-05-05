@@ -71,7 +71,7 @@ struct AppointmentRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: BrainSymbols.location)
-                .font(.title3)
+                .font(.headline)
                 // Match the section header tint (web `--section-later`
                 // / slate) so the row icon doesn't disagree with the
                 // header it sits beneath.
@@ -80,11 +80,11 @@ struct AppointmentRow: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(displayTitle)
-                    .font(.body)
+                    .font(.callout)
                     .lineLimit(2)
                 if !subline.isEmpty {
                     Text(subline)
-                        .font(.caption)
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
             }

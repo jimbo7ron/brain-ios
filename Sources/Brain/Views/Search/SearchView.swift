@@ -224,7 +224,7 @@ struct SearchView: View {
                             recentSearches = []
                             persistRecentSearches()
                         }
-                        .font(.caption)
+                        .font(.caption2)
                         .foregroundStyle(.tint)
                     }
                 }
@@ -241,7 +241,7 @@ struct SearchView: View {
             if let errorMessage {
                 Section {
                     Text(errorMessage)
-                        .font(.caption)
+                        .font(.caption2)
                         .foregroundStyle(.red)
                 }
             }
@@ -282,7 +282,7 @@ struct SearchView: View {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
                         Text("Updating…")
-                            .font(.caption)
+                            .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -477,18 +477,18 @@ struct SearchResultRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: typeIcon)
-                .font(.title3)
+                .font(.headline)
                 .foregroundStyle(accentColor)
                 .frame(width: 24, alignment: .center)
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(displayTitle)
-                    .font(.body)
+                    .font(.callout)
                     .foregroundStyle(Color.primary)
                     .lineLimit(2)
                 if let subtitle, !subtitle.isEmpty {
                     Text(subtitle)
-                        .font(.caption)
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }

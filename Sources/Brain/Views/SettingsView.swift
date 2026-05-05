@@ -76,7 +76,7 @@ struct SettingsView: View {
                 } footer: {
                     Text("Defaults to https://api.mindkeeper.io. Override to point at " +
                          "a local `brain serve` instance for development.")
-                        .font(.caption)
+                        .font(.caption2)
                 }
 
                 Section {
@@ -91,7 +91,7 @@ struct SettingsView: View {
                 if let status = statusMessage {
                     Section {
                         Text(status)
-                            .font(.caption)
+                            .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -164,7 +164,7 @@ struct SettingsView: View {
             }
             if let lastError = notificationManager?.lastError {
                 Text(lastError)
-                    .font(.caption)
+                    .font(.caption2)
                     .foregroundStyle(.secondary)
             }
         } header: {
@@ -174,7 +174,7 @@ struct SettingsView: View {
                  "Push delivery requires the brain server to be configured " +
                  "with an APNs key — registration here just stores the " +
                  "device token.")
-                .font(.caption)
+                .font(.caption2)
         }
     }
 

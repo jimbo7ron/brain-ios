@@ -142,7 +142,7 @@ struct ProjectDetailView: View {
             if let inlineAddError {
                 Section {
                     Text(inlineAddError)
-                        .font(.caption)
+                        .font(.caption2)
                         .foregroundStyle(.red)
                         .accessibilityIdentifier("project.inline-add.error")
                         .listRowSeparator(.hidden)
@@ -296,7 +296,7 @@ struct ProjectDetailView: View {
                 // line shows the count summary the web puts under the
                 // header. Mirrors "X open · Y done · Z total".
                 Text(headerSummary)
-                    .font(.subheadline)
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
@@ -464,6 +464,7 @@ struct InlineAddRow: View {
             Image(systemName: "plus.circle")
                 .foregroundStyle(.secondary)
             TextField(placeholder, text: $text)
+                .font(.callout)
                 .focused($focused)
                 .submitLabel(.done)
                 .onSubmit(submit)
@@ -512,7 +513,7 @@ struct ProjectSectionHeader: View {
                 .foregroundStyle(tint)
                 .imageScale(.small)
             Text(title)
-                .font(.caption.bold())
+                .font(.caption2.bold())
                 .textCase(.uppercase)
                 .tracking(0.5)
                 .foregroundStyle(tint)
@@ -520,7 +521,7 @@ struct ProjectSectionHeader: View {
             // "open / total" — mirrors `{completed}/{total}` on the
             // web but flipped to lead with the actionable number.
             Text("\(openCount)/\(totalCount)")
-                .font(.caption.weight(.regular))
+                .font(.caption2.weight(.regular))
                 .foregroundStyle(tint.opacity(0.7))
                 .monospacedDigit()
         }
@@ -551,7 +552,7 @@ struct DoneTrayHeader: View {
                     .imageScale(.small)
                     .opacity(0.6)
                 Text("\(count) completed")
-                    .font(.caption)
+                    .font(.caption2)
                     .monospacedDigit()
                 Spacer(minLength: 0)
             }
@@ -575,10 +576,10 @@ struct EmptyProjectStateView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("All caught up.")
-                .font(.body.weight(.medium))
+                .font(.callout.weight(.medium))
                 .foregroundStyle(.primary)
             Text("Nothing open in this project right now.")
-                .font(.footnote)
+                .font(.caption)
                 .foregroundStyle(.secondary)
         }
         .padding(.vertical, 4)

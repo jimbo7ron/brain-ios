@@ -210,7 +210,7 @@ struct TodayView: View {
                             // the user sees "Tomorrow", "Mon May 5"
                             // etc. Matches the web grouping.
                             Text(TodayDate.relativeDayLabel(forISO: day.date))
-                                .font(.caption.weight(.medium))
+                                .font(.caption2.weight(.medium))
                                 .foregroundStyle(.secondary)
                                 .textCase(.uppercase)
                                 .listRowBackground(Color.clear)
@@ -350,19 +350,19 @@ struct TodaySectionHeader: View {
                 .foregroundStyle(tint)
                 .imageScale(.small)
             Text(title)
-                .font(.caption.bold())
+                .font(.caption2.bold())
                 .textCase(.uppercase)
                 .tracking(0.5)
                 .foregroundStyle(tint)
             if let count, count > 0 {
                 Text("\(count)")
-                    .font(.caption.weight(.regular))
+                    .font(.caption2.weight(.regular))
                     .foregroundStyle(tint.opacity(0.7))
                     .monospacedDigit()
             }
             if let trailingNote {
                 Text(trailingNote)
-                    .font(.caption)
+                    .font(.caption2)
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
@@ -379,7 +379,7 @@ struct EmptySectionLine: View {
 
     var body: some View {
         Text(text)
-            .font(.subheadline)
+            .font(.footnote)
             .italic()
             .foregroundStyle(.secondary)
             // Tighter row insets so an empty section ("Nothing here

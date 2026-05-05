@@ -291,7 +291,7 @@ struct UnassignedRow: View {
                 .foregroundStyle(.secondary)
 
             Text("Unassigned")
-                .font(.body)
+                .font(.callout)
                 .lineLimit(1)
                 .truncationMode(.tail)
 
@@ -299,7 +299,7 @@ struct UnassignedRow: View {
 
             if openTodoCount > 0 {
                 Text("\(openTodoCount)")
-                    .font(.caption.weight(.medium))
+                    .font(.caption2.weight(.medium))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
                     .accessibilityLabel("\(openTodoCount) open todos")
@@ -318,10 +318,10 @@ struct EmptyProjectListView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("No projects yet.")
-                .font(.body)
+                .font(.callout)
                 .foregroundStyle(.secondary)
             Text("Create one on the web — project creation on iOS is coming soon.")
-                .font(.footnote)
+                .font(.caption)
                 .foregroundStyle(.tertiary)
         }
         .padding(.vertical, 8)

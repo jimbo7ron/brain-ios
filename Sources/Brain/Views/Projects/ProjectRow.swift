@@ -58,7 +58,7 @@ struct ProjectRow: View {
                 )
 
             Text(project.name)
-                .font(.body)
+                .font(.callout)
                 .lineLimit(1)
                 .truncationMode(.tail)
 
@@ -66,7 +66,7 @@ struct ProjectRow: View {
 
             if openTodoCount > 0 {
                 Text("\(openTodoCount)")
-                    .font(.caption.weight(.medium))
+                    .font(.caption2.weight(.medium))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
                     .accessibilityLabel("\(openTodoCount) open todos")
