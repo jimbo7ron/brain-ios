@@ -55,6 +55,15 @@ actor BrainAPIClient {
         case routeNotFound
         case rateLimited(retryAfter: TimeInterval?)
         case validationError(detail: String)
+        /// Server returned 409 — a uniqueness constraint was violated.
+        /// In the auth flow this is M30's "non-revoked named API key
+        /// with the same name already exists" rejection (see
+        /// `brain/src/brain/server.py:805-807` and the recovery
+        /// contract at `:824-840`). Surfaced as a typed case so
+        /// `loginWithRecovery(...)` can intercept and run the
+        /// 4-step orphan-revoke flow without the caller seeing a
+        /// generic `.unknown` error.
+        case nameConflict(detail: String)
         case network(URLError)
         case decoding(DecodingError)
         case unknown(statusCode: Int, body: String)
@@ -76,6 +85,8 @@ actor BrainAPIClient {
                 return "Rate limited."
             case .validationError(let detail):
                 return "Validation error: \(detail)"
+            case .nameConflict(let detail):
+                return "Name conflict: \(detail)"
             case .network(let urlError):
                 return "Network error: \(urlError.localizedDescription)"
             case .decoding(let decodingError):
@@ -178,14 +189,136 @@ actor BrainAPIClient {
     /// wipe Keychain. Authenticates with the current `apiKey` via
     /// `X-API-Key` so the server can authorise the deletion against
     /// the same user.
-    func revokeApiKey(id: String) async throws {
+    ///
+    /// `bearerToken` is set only by `loginWithRecovery(...)` during
+    /// the M30 4-step orphan-revoke: at that point we have a JWT but
+    /// no API key yet (the orphan is the one currently squatting on
+    /// the requested name). When set, the request authenticates via
+    /// `Authorization: Bearer` instead of `X-API-Key`. Mutually
+    /// exclusive with the actor's persisted `apiKey` — see
+    /// `makeRequest` for the routing rule.
+    func revokeApiKey(id: String, bearerToken: String? = nil) async throws {
         let request = try makeRequest(
             method: "DELETE",
             path: "/api/v1/auth/api-keys/\(id)",
             body: nil,
-            requiresAuth: true
+            requiresAuth: true,
+            bearerToken: bearerToken
         )
         try await performIgnoringBody(request)
+    }
+
+    /// `GET /api/v1/auth/api-keys` — list the current user's named API
+    /// keys (no plaintext, no hashes). Used by `loginWithRecovery(...)`
+    /// during the M30 4-step recovery to find an orphan device key
+    /// whose name matches the requested `device_name`.
+    ///
+    /// `bearerToken` follows the same convention as `revokeApiKey`:
+    /// when set, the request authenticates via `Authorization: Bearer`
+    /// instead of the actor's persisted `apiKey`. The recovery flow is
+    /// the only legitimate caller that supplies it; future code that
+    /// surfaces "your devices" in Settings should pass nil and let the
+    /// usual `X-API-Key` path do its job.
+    ///
+    /// We always pass `include_revoked=true` (the server's default) so
+    /// the recovery can also notice keys that were revoked but whose
+    /// names are still indexed — though M30's uniqueness constraint
+    /// only fires on non-revoked keys, so the `revokedAt == nil`
+    /// filter on the result is what actually identifies the orphan.
+    func listApiKeys(bearerToken: String? = nil) async throws -> ApiKeyListResponse {
+        let request = try makeRequest(
+            method: "GET",
+            path: "/api/v1/auth/api-keys",
+            body: nil,
+            requiresAuth: true,
+            bearerToken: bearerToken
+        )
+        return try await perform(request, as: ApiKeyListResponse.self)
+    }
+
+    /// Login with auto-recovery from M30's HTTP 409 ("named API key
+    /// with that device name already exists"). The brain server
+    /// documents the recovery contract at
+    /// `brain/src/brain/server.py:824-840`; iOS implements it
+    /// transparently here so the user sees a single Sign-in tap with
+    /// no error path.
+    ///
+    /// Steps:
+    ///   1. Try `POST /auth/login` WITH `device_name` (mints a fresh
+    ///      key + returns its plaintext on the response).
+    ///   2. On 409: retry login WITHOUT `device_name`. The server
+    ///      returns a JWT but no key — we use the JWT as Bearer for
+    ///      the next two calls because no API key is in Keychain yet.
+    ///   3. `GET /auth/api-keys` (with the JWT). Find the entry whose
+    ///      `name == deviceName` AND `revokedAt == nil`. Both filters
+    ///      are load-bearing: if we revoke the wrong row we lose an
+    ///      unrelated device's access; if we don't filter on
+    ///      `revokedAt == nil` we'll keep retrying-then-revoking the
+    ///      same dead row forever.
+    ///   4. `DELETE /auth/api-keys/{id}` (with the JWT) to revoke the
+    ///      orphan. Skip cleanly if no match — step 5 will then
+    ///      surface the original 409 for the caller to handle.
+    ///   5. Retry login WITH `device_name`. Returns the response with
+    ///      the new plaintext key inlined.
+    ///
+    /// Termination: the recovery is single-shot — if step 5 still
+    /// throws (e.g. a race where another client minted a key in
+    /// between, or step 4 was a no-op), we let the second 409 propagate
+    /// to the caller as `.nameConflict` rather than looping. Looping
+    /// would mask a genuine server-side bug or a duplicate-mint race
+    /// the human needs to know about.
+    ///
+    /// Why this lives on the client (not in the server's login path):
+    /// the server contract explicitly hands the policy choice to the
+    /// caller (see `server.py:815-840` — clients can choose to retry
+    /// with a name suffix instead of revoking). iOS chooses revoke
+    /// because the orphan is by definition unreachable (its plaintext
+    /// is lost forever in Keychain on the prior install).
+    func loginWithRecovery(
+        email: String,
+        password: String,
+        deviceName: String
+    ) async throws -> LoginResponse {
+        do {
+            return try await login(
+                email: email,
+                password: password,
+                deviceName: deviceName
+            )
+        } catch BrainAPIClient.Error.nameConflict {
+            // Step 2: re-login without device_name to obtain a JWT
+            // we can use to clean up the orphan. The server returns
+            // a JWT-only response (no `api_key` block) on this path
+            // because `device_name` is omitted.
+            let jwtResponse = try await login(
+                email: email,
+                password: password,
+                deviceName: nil
+            )
+            // Step 3: list keys with the JWT and find the orphan.
+            let listing = try await listApiKeys(bearerToken: jwtResponse.token)
+            // Step 4: revoke the orphan iff one is present. If no
+            // match (the 409 was for some other reason — e.g. a
+            // server-side race where the row already got revoked),
+            // we skip cleanly and let step 5 either succeed or
+            // surface a fresh 409 to the caller.
+            if let orphan = listing.keys.first(
+                where: { $0.name == deviceName && $0.revokedAt == nil }
+            ) {
+                try await revokeApiKey(
+                    id: orphan.id,
+                    bearerToken: jwtResponse.token
+                )
+            }
+            // Step 5: retry the original login. A second 409 here is
+            // intentionally NOT recovered — see the doc-comment for
+            // the rationale.
+            return try await login(
+                email: email,
+                password: password,
+                deviceName: deviceName
+            )
+        }
     }
 
     /// Replay one queued mutation (M37). The replayer hands us the queue
@@ -609,22 +742,32 @@ actor BrainAPIClient {
         path: String,
         body: Data?,
         requiresAuth: Bool,
-        idempotencyKey: String? = nil
+        idempotencyKey: String? = nil,
+        bearerToken: String? = nil
     ) throws -> URLRequest {
         let url = endpoint(path)
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        if requiresAuth, let apiKey = apiKey {
-            // Use `X-API-Key` (not `Authorization: Bearer`) so the
-            // server routes through `get_api_key_user`, which sets
-            // `request.state.api_key_id` for audit logging and updates
-            // `last_used_at` on the device key row. The bearer path
-            // runs `decode_jwt_token` first and 401s on a non-JWT key.
-            // See the `apiKey` doc-comment above for the full
-            // rationale.
-            request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+        if requiresAuth {
+            // `bearerToken` and the actor's persisted `apiKey` are
+            // mutually exclusive — only one auth header is set per
+            // request. The bearer path is reserved for the M30 4-step
+            // recovery in `loginWithRecovery(...)`, where we have a
+            // freshly-issued JWT but the previous device's API key is
+            // still occupying the requested name server-side and
+            // there's no key in Keychain yet. Every other authenticated
+            // call falls through to the `X-API-Key` branch so audit
+            // attribution (`request.state.api_key_id`) and
+            // `last_used_at` bookkeeping stay correct on the device
+            // key row. See the `apiKey` doc-comment above for the full
+            // rationale on the header choice.
+            if let bearerToken = bearerToken {
+                request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
+            } else if let apiKey = apiKey {
+                request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+            }
         }
         if let idempotencyKey = idempotencyKey {
             request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
@@ -650,6 +793,13 @@ actor BrainAPIClient {
             throw Error.unauthorized
         case 404:
             throw Self.classify404(response: http, data: data, decoder: decoder)
+        case 409:
+            // M30 device-key name conflict — see the `nameConflict`
+            // doc-comment for the recovery contract.
+            let detail = (try? decoder.decode(ErrorEnvelope.self, from: data))?.detail
+                ?? String(data: data, encoding: .utf8)
+                ?? "name conflict"
+            throw Error.nameConflict(detail: detail)
         case 422:
             let detail = (try? decoder.decode(ErrorEnvelope.self, from: data))?.detail
                 ?? String(data: data, encoding: .utf8)
@@ -680,6 +830,17 @@ actor BrainAPIClient {
             throw Error.unauthorized
         case 404:
             throw Self.classify404(response: http, data: data, decoder: decoder)
+        case 409:
+            // Mirror `perform`'s 409 handling. No-body endpoints
+            // currently never legitimately 409 (DELETE is idempotent
+            // server-side, so revoking an already-revoked key is a
+            // 200 no-op), but the case is wired here for symmetry so
+            // a future endpoint that returns 409 + empty body doesn't
+            // silently fall through to `.unknown`.
+            let detail = (try? decoder.decode(ErrorEnvelope.self, from: data))?.detail
+                ?? String(data: data, encoding: .utf8)
+                ?? "name conflict"
+            throw Error.nameConflict(detail: detail)
         case 422:
             let detail = (try? decoder.decode(ErrorEnvelope.self, from: data))?.detail
                 ?? String(data: data, encoding: .utf8)
@@ -825,6 +986,13 @@ extension BrainAPIClient.Error {
             return "Too many attempts — try again soon."
         case .validationError(let detail):
             return detail
+        case .nameConflict:
+            // Rarely surfaced — the login flow handles 409 internally
+            // via `loginWithRecovery(...)`. This copy only shows if
+            // the recovery itself fails (e.g. step 5 still 409s after
+            // the orphan revoke), which means something genuinely odd
+            // is going on server-side and the user should retry.
+            return "That name is already in use. Try again."
         case .network:
             return "Couldn't reach the server. Check your connection."
         case .decoding:
