@@ -134,6 +134,11 @@ struct ProjectListView: View {
     /// without per-row state.
     @State private var projectToEdit: LocalProject?
 
+    /// Drives the "+" toolbar button → `NewProjectView` sheet. Bool
+    /// (rather than `sheet(item:)`) because there's no row context to
+    /// thread through — the sheet always starts from a blank form.
+    @State private var isCreatingProject: Bool = false
+
     var body: some View {
         NavigationSplitView {
             sidebar
@@ -205,6 +210,25 @@ struct ProjectListView: View {
             }
         }
         .navigationTitle("Projects")
+        .toolbar {
+            // Trailing "+" → `NewProjectView` sheet. Mirrors the web
+            // sidebar's create affordance (`web/src/app/layout.tsx`)
+            // and closes the gap surfaced by live iPhone testing —
+            // before this, projects could only be created on the web
+            // even though the brain server's `POST /api/v1/projects`
+            // has been there since M23.
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    isCreatingProject = true
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .accessibilityLabel("New project")
+            }
+        }
+        .sheet(isPresented: $isCreatingProject) {
+            NewProjectView()
+        }
         .sheet(item: $projectToEdit) { project in
             EditProjectView(project: project)
         }
@@ -310,17 +334,18 @@ struct UnassignedRow: View {
     }
 }
 
-/// Empty-state copy for the project list. Mirrors the web sidebar:
-/// "No projects yet — hit + to create one." iOS doesn't yet have a
-/// project-create affordance (M40 ships *edit* only — create lands in
-/// a follow-up), so we point the user at the web in the meantime.
+/// Empty-state copy for the project list. Mirrors the web sidebar's
+/// "No projects yet — hit + to create one." Now that iOS has its own
+/// "+" toolbar affordance (see `sidebar`'s `.toolbar` block above),
+/// we point the user at it directly rather than redirecting them to
+/// the web.
 struct EmptyProjectListView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("No projects yet.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
-            Text("Create one on the web — project creation on iOS is coming soon.")
+            Text("Tap + to create your first project.")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
         }
