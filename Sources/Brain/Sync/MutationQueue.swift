@@ -545,8 +545,19 @@ final class MutationQueue {
             // rename below tries to claim it. If this throws we'll
             // fall through and the rename's save will surface the
             // collision — same failure mode as before the fix, just
-            // with a slightly different stack.
-            try? modelContext.save()
+            // with a slightly different stack. Log so a recurring
+            // failure isn't hidden behind the silent `try?` it used
+            // to be.
+            do {
+                try modelContext.save()
+            } catch {
+                NSLog(
+                    "MutationQueue: reconcile dupe-delete save failed " +
+                    "for clientId \(clientId) -> serverId \(serverId): " +
+                    "\(error). Falling through; the rename's save will " +
+                    "surface the constraint collision."
+                )
+            }
         }
         // Mirror the field copy that `SyncEngine.upsert(_:)` does on
         // an existing row. Keep this list in sync with the upsert path
@@ -608,6 +619,11 @@ final class MutationQueue {
     /// existing `lastError` / NSLog path the caller has already
     /// stamped). UI banners / toasts on this failure are a separate
     /// UX decision; this just prevents the phantom-row data state.
+    ///
+    /// Known limitation (M44+): if the user typed the stub, then
+    /// long-pressed and edited it locally before the create cap was
+    /// hit, this rollback nukes their edit silently. See the TODO at
+    /// the delete site below.
     private func rollbackOptimisticStateIfNeeded(
         for item: MutationQueueItem,
         reason: some Error
@@ -624,6 +640,11 @@ final class MutationQueue {
         guard let stub = (try? modelContext.fetch(descriptor))?.first else {
             return
         }
+        // TODO(M44+): If the user edited the stub locally before the create
+        // hit the cap (typed → long-press edit → create fails permanently),
+        // this rollback nukes their edit silently. The rewritten updateTodo
+        // will then 404 and poison. Consider preserving local-only edits or
+        // surfacing the failure in UI before deleting.
         modelContext.delete(stub)
         do {
             try modelContext.save()
@@ -942,20 +963,35 @@ enum BrainDebugMutationQueue {
     /// create echo was still in flight. Exactly one row keyed on the
     /// server id should remain after reconcile, populated from the
     /// echo (not the sync row), and no unique-id-constraint exception.
+    ///
+    /// Cross-context coverage: production wires the optimistic insert
+    /// to the SwiftUI `\.modelContext` (one `ModelContext`) and the
+    /// reconcile fetch / delete / rename to the queue's separate
+    /// `ModelContext` (constructed in `BrainApp.swift` against the same
+    /// `ModelContainer`). The bug class B1 was caught against only
+    /// triggers when those two contexts coexist — both backed by the
+    /// same SQLite store, both saving before reconcile runs. We model
+    /// that here with a `swiftUIContext` (stub + sync row inserter) and
+    /// a `queueContext` (reconciler), assert on a third read-side
+    /// context, and require the assertions hold on all three.
     @MainActor
     static func assertReconcileDedupesSyncRace() throws {
         let schema = Schema([MutationQueueItem.self, LocalNote.self])
         let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
         let container = try ModelContainer(for: schema, configurations: [config])
-        let context = ModelContext(container)
+        // Mirror production's two-context layout: SwiftUI owns one
+        // context, the queue owns another, both share the container.
+        let swiftUIContext = ModelContext(container)
+        let queueContext = ModelContext(container)
         let session = AuthSession(state: .signedOut)
         let client = BrainAPIClient()
-        let queue = MutationQueue(modelContext: context, client: client, authSession: session)
+        let queue = MutationQueue(modelContext: queueContext, client: client, authSession: session)
 
         let clientId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         let serverId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
-        // Optimistic stub keyed on the client UUID.
+        // Optimistic stub on the SwiftUI context (where QuickAddView
+        // would actually have inserted it).
         let stub = LocalNote(
             id: clientId,
             shortId: "",
@@ -963,10 +999,15 @@ enum BrainDebugMutationQueue {
             content: "draft content",
             type: "todo"
         )
-        queue.debugModelContext.insert(stub)
+        swiftUIContext.insert(stub)
+        try swiftUIContext.save()
 
         // Sync raced ahead and inserted a separate row under the
-        // server id with the canonical content.
+        // server id with the canonical content. SyncEngine runs on
+        // its own context in production; we use the queue context as
+        // a stand-in for "some other context backed by the same
+        // store" — what matters is that the row hits the SQLite
+        // store before reconcile runs.
         let syncInserted = LocalNote(
             id: serverId,
             shortId: "abc123",
@@ -974,8 +1015,8 @@ enum BrainDebugMutationQueue {
             content: "canonical content",
             type: "todo"
         )
-        queue.debugModelContext.insert(syncInserted)
-        try queue.debugModelContext.save()
+        queueContext.insert(syncInserted)
+        try queueContext.save()
 
         let serverNote = Note(
             id: serverId,
@@ -991,13 +1032,15 @@ enum BrainDebugMutationQueue {
             appointment: nil
         )
 
-        // Should not throw / crash on the unique-id constraint.
+        // Should not throw / crash on the unique-id constraint even
+        // though the stub was created on a different context.
         queue.debugReconcileCreateResponse(clientId: clientId, serverNote: serverNote)
-        try queue.debugModelContext.save()
+        try queueContext.save()
 
-        // Exactly one LocalNote keyed on the server id, none on the
-        // client id, and the canonical content carried through.
-        let allNotes = try queue.debugModelContext.fetch(FetchDescriptor<LocalNote>())
+        // Read back from a fresh third context to defeat any per-
+        // context caching — exercises the full SQLite round-trip.
+        let readContext = ModelContext(container)
+        let allNotes = try readContext.fetch(FetchDescriptor<LocalNote>())
         let serverHits = allNotes.filter { $0.id == serverId }
         let clientHits = allNotes.filter { $0.id == clientId }
         assert(serverHits.count == 1,
@@ -1015,6 +1058,14 @@ enum BrainDebugMutationQueue {
     /// reconcile. Otherwise an edit enqueued before the create echo
     /// would 404 on replay (server doesn't know the client UUID) and
     /// get poisoned — silent data loss.
+    ///
+    /// Multi-op coverage: the realistic scenario is a user typing →
+    /// long-press editing → toggling complete → archiving, all before
+    /// the create reconciles. The fix's predicate is on `resourceId`
+    /// only with no op filter, so every queued op against the client
+    /// UUID must end up rewritten. We enqueue a representative mix
+    /// here (`updateTodo`, `completeTodo`, `archiveNote`) and assert
+    /// each one's `resourceId` lands on the server id.
     @MainActor
     static func assertReconcileRewritesPendingResourceIds() throws {
         let schema = Schema([MutationQueueItem.self, LocalNote.self])
@@ -1037,9 +1088,9 @@ enum BrainDebugMutationQueue {
             type: "todo"
         )
         queue.debugModelContext.insert(stub)
-        // User long-pressed and edited before the create echo
-        // returned — produces an updateTodo queue row keyed on the
-        // client UUID.
+        // User long-pressed and edited, then toggled complete, then
+        // archived — all before the create echo returned. Produces
+        // three queue rows, all keyed on the client UUID.
         let pendingEdit = try queue.enqueue(
             op: .updateTodo,
             resourceType: "todo",
@@ -1047,7 +1098,24 @@ enum BrainDebugMutationQueue {
             payload: Data(),
             baseUpdatedAt: nil
         )
+        let pendingComplete = try queue.enqueue(
+            op: .completeTodo,
+            resourceType: "todo",
+            resourceId: clientId,
+            payload: Data(),
+            baseUpdatedAt: nil
+        )
+        let pendingArchive = try queue.enqueue(
+            op: .archiveNote,
+            resourceType: "note",
+            resourceId: clientId,
+            payload: Data(),
+            baseUpdatedAt: nil
+        )
+        let pendingIds = Set([pendingEdit.id, pendingComplete.id, pendingArchive.id])
         assert(pendingEdit.resourceId == clientId)
+        assert(pendingComplete.resourceId == clientId)
+        assert(pendingArchive.resourceId == clientId)
 
         let serverNote = Note(
             id: serverId,
@@ -1065,18 +1133,83 @@ enum BrainDebugMutationQueue {
         queue.debugReconcileCreateResponse(clientId: clientId, serverNote: serverNote)
         try queue.debugModelContext.save()
 
-        // Queue row should now point at the server id.
-        let pendingAfter = queue.pendingMutation(forResourceId: serverId)
-        assert(pendingAfter?.id == pendingEdit.id,
-               "queued updateTodo should now be findable under serverId")
-        assert(queue.pendingMutation(forResourceId: clientId) == nil,
-               "no queue row should still target the now-phantom client UUID")
+        // Every queue row that targeted the client UUID should now
+        // target the server id. Fetch the full queue and partition
+        // by resourceId rather than relying on `pendingMutation` (a
+        // single-row helper).
+        let allQueueRows = try queue.debugModelContext.fetch(FetchDescriptor<MutationQueueItem>())
+        let serverRows = allQueueRows.filter { $0.resourceId == serverId }
+        let clientRows = allQueueRows.filter { $0.resourceId == clientId }
+        assert(clientRows.isEmpty,
+               "no queue row should still target the now-phantom client UUID, found \(clientRows.count)")
+        assert(serverRows.count == 3,
+               "all 3 queued ops should be rewritten to serverId, found \(serverRows.count)")
+        let serverRowIds = Set(serverRows.map { $0.id })
+        assert(serverRowIds == pendingIds,
+               "rewritten queue rows should be the same rows we enqueued")
         // Stub renamed — so no leftover under the client UUID.
         let allNotes = try queue.debugModelContext.fetch(FetchDescriptor<LocalNote>())
         assert(allNotes.contains(where: { $0.id == serverId }),
                "stub should have been renamed to serverId")
         assert(!allNotes.contains(where: { $0.id == clientId }),
                "no LocalNote should remain under the client UUID")
+    }
+
+    /// B2 (PR #31 review, second pass): the rewrite must also fire
+    /// when the optimistic stub is missing from the local store.
+    /// Production reaches this branch when the user wiped local data
+    /// (or SwiftData lost the stub across a kill-9 + restart) while
+    /// queue rows survived. The fix moved the rewrite *above* the
+    /// stub-missing guard so this path stays covered; this test locks
+    /// that ordering in.
+    @MainActor
+    static func assertReconcileRewritesPendingResourceIdsWhenStubMissing() throws {
+        let schema = Schema([MutationQueueItem.self, LocalNote.self])
+        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+        let container = try ModelContainer(for: schema, configurations: [config])
+        let context = ModelContext(container)
+        let session = AuthSession(state: .signedOut)
+        let client = BrainAPIClient()
+        let queue = MutationQueue(modelContext: context, client: client, authSession: session)
+
+        let clientId = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        let serverId = "99999999-9999-9999-9999-999999999999"
+
+        // No stub insert — simulates the "stub gone, queue row
+        // survived" branch.
+        let pendingEdit = try queue.enqueue(
+            op: .updateTodo,
+            resourceType: "todo",
+            resourceId: clientId,
+            payload: Data(),
+            baseUpdatedAt: nil
+        )
+        assert(pendingEdit.resourceId == clientId)
+
+        let serverNote = Note(
+            id: serverId,
+            shortId: "ghi456",
+            title: nil,
+            content: "canonical",
+            type: "todo",
+            tags: [],
+            createdAt: nil,
+            updatedAt: nil,
+            archived: false,
+            todo: nil,
+            appointment: nil
+        )
+        queue.debugReconcileCreateResponse(clientId: clientId, serverNote: serverNote)
+        try queue.debugModelContext.save()
+
+        // Even with no stub, the queue row must have been rewritten
+        // before the early return. Otherwise the row would replay
+        // with the stale client UUID and get poisoned.
+        let pendingAfter = queue.pendingMutation(forResourceId: serverId)
+        assert(pendingAfter?.id == pendingEdit.id,
+               "queued updateTodo should be rewritten to serverId even when stub is missing")
+        assert(queue.pendingMutation(forResourceId: clientId) == nil,
+               "no queue row should still target the now-phantom client UUID")
     }
 
     /// S1 (PR #31 review): when a `.createTodo` mutation hits a
@@ -1149,6 +1282,7 @@ enum BrainDebugMutationQueue {
             try assertClearResetsConflictCounter()
             try assertReconcileDedupesSyncRace()
             try assertReconcileRewritesPendingResourceIds()
+            try assertReconcileRewritesPendingResourceIdsWhenStubMissing()
             try assertCreateTodoPoisonRollsBackStub()
         } catch {
             assertionFailure("BrainDebugMutationQueue: setup failed: \(error)")
