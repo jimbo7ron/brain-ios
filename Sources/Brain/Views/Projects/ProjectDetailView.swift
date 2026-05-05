@@ -135,7 +135,7 @@ struct ProjectDetailView: View {
             Section {
                 header
                     .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 12, trailing: 0))
+                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 6, trailing: 0))
                     .listRowSeparator(.hidden)
             }
 
@@ -189,6 +189,15 @@ struct ProjectDetailView: View {
             }
         }
         .listStyle(.insetGrouped)
+        // Density pass: collapse the inter-section gutter (`compact`
+        // on iOS 17+) and drop the system default row min-height from
+        // 44pt to 32pt. Combined with the per-row `.listRowInsets`
+        // tightening on `TodoRow`, this knocks ~25-30% off the
+        // vertical space each row occupies. Tap targets stay reachable
+        // because hit-testing on a List row extends to the full row
+        // area, not just the icon glyphs.
+        .listSectionSpacing(.compact)
+        .environment(\.defaultMinListRowHeight, 32)
         .navigationTitle(project.name)
         .navigationBarTitleDisplayMode(.large)
         .toolbar {
@@ -276,10 +285,10 @@ struct ProjectDetailView: View {
             Circle()
                 .fill(headerDotColor)
                 .frame(width: 14, height: 14)
-                .padding(.top, 6)
+                .padding(.top, 3)
                 .overlay(
                     Circle().stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)
-                        .padding(.top, 6)
+                        .padding(.top, 3)
                 )
 
             VStack(alignment: .leading, spacing: 4) {
@@ -460,8 +469,13 @@ struct InlineAddRow: View {
                 .onSubmit(submit)
                 .accessibilityIdentifier(accessibilityIdentifier)
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 2)
         .contentShape(Rectangle())
+        // Halve the vertical row insets vs. the system default so the
+        // inline-add line doesn't visually punch a 44pt hole in an
+        // otherwise dense section. The text field's own intrinsic
+        // height keeps the tap target large enough to land on.
+        .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
     }
 
     /// Trim, guard against empty submits, hand up to the parent, then
@@ -545,6 +559,11 @@ struct DoneTrayHeader: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        // Tighter row insets — the tray header is a ~12pt-tall caption,
+        // so the system's 11pt vertical row inset more than doubles
+        // the visual height. Drop to 4pt each side for a row that
+        // reads as "header" rather than "another full-height entry".
+        .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
         .accessibilityLabel(isExpanded ? "Hide \(count) completed" : "Show \(count) completed")
     }
 }
@@ -554,7 +573,7 @@ struct DoneTrayHeader: View {
 /// Rendered when a project has no open todos in any section.
 struct EmptyProjectStateView: View {
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 6) {
             Text("All caught up.")
                 .font(.body.weight(.medium))
                 .foregroundStyle(.primary)
@@ -562,7 +581,7 @@ struct EmptyProjectStateView: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
-        .padding(.vertical, 8)
+        .padding(.vertical, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

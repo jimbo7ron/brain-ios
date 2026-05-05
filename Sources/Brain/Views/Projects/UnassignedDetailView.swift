@@ -110,7 +110,7 @@ struct UnassignedDetailView: View {
             Section {
                 header
                     .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 12, trailing: 0))
+                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 6, trailing: 0))
                     .listRowSeparator(.hidden)
             }
 
@@ -164,6 +164,12 @@ struct UnassignedDetailView: View {
             }
         }
         .listStyle(.insetGrouped)
+        // Density pass: mirror `ProjectDetailView`. `.compact` section
+        // spacing trims the inter-section gutter, and the lower row
+        // min-height lets the inline-add row + done-tray header read
+        // as compact chrome rather than full-height entries.
+        .listSectionSpacing(.compact)
+        .environment(\.defaultMinListRowHeight, 32)
         .navigationTitle("Unassigned")
         .navigationBarTitleDisplayMode(.large)
         .refreshable {
@@ -191,7 +197,7 @@ struct UnassignedDetailView: View {
             Image(systemName: BrainSymbols.inbox)
                 .foregroundStyle(.secondary)
                 .frame(width: 14, height: 14)
-                .padding(.top, 4)
+                .padding(.top, 2)
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(headerSummary)
