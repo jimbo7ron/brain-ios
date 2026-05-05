@@ -99,6 +99,17 @@ final class SyncEngine: ObservableObject {
     /// already-replaced view would be misleading.
     @Published private(set) var lastError: String?
 
+    /// Running count of inbound sync rows skipped because they were
+    /// the echo of a pending mutation (M40 polish — when a queue item
+    /// is in flight and a sync arrives before the queue replays, the
+    /// server's row carries the *pre-edit* `updated_at` and applying
+    /// it would briefly clobber the optimistic local state). Surfaced
+    /// for observability — a future Settings panel / debug toast can
+    /// render this. Reset on `handleUnauthorized()` so the count is
+    /// meaningful per signed-in session, mirroring
+    /// `MutationQueue.conflictsResolved`.
+    @Published private(set) var echoSkips: Int = 0
+
     /// Foreground Timer. Started lazily on the first `sync()` call (so
     /// signed-out launches don't tick) and torn down in `signedOut()`.
     /// Held as `Timer` rather than the Combine publisher so we can
@@ -241,6 +252,9 @@ final class SyncEngine: ObservableObject {
         authSession.signedOut()
         lastError = nil
         lastSyncedAt = nil
+        // Reset the echo-skip counter so it's meaningful per signed-in
+        // session, mirroring `MutationQueue.conflictsResolved`.
+        echoSkips = 0
     }
 
     // MARK: - Cursor
@@ -293,6 +307,17 @@ final class SyncEngine: ObservableObject {
     /// id, but the upsert-then-delete order makes the behaviour
     /// predictable if it ever does.
     ///
+    /// Per-row order: (1) conflict-drop check (server strictly newer
+    /// than the queue item's base — drop the queued mutation), then
+    /// (2) echo-skip check (server's `updated_at` equals the queue
+    /// item's `baseUpdatedAt` — server hasn't yet seen our pending
+    /// edit; the row would clobber the optimistic local state), then
+    /// (3) upsert. Steps 1 and 2 are mutually exclusive — they're
+    /// gated on different inequalities on the same pair of timestamps
+    /// — but we run them in this fixed order so a misbehaving server
+    /// (e.g. one that didn't bump `updated_at` on a remote write)
+    /// can't sneak past both gates.
+    ///
     /// The single `save()` at the end commits the data deltas AND the
     /// cursor row together. If it throws, neither is persisted — the
     /// next sync will re-pull the same payload starting from the
@@ -300,17 +325,25 @@ final class SyncEngine: ObservableObject {
     /// idempotent (upsert by id, delete-if-exists).
     private func applyAndAdvanceCursor(_ response: SyncResponse) throws {
         for project in response.projects {
+            let serverUpdatedAt = parseDate(project.updatedAt)
             resolveConflictIfNeeded(
                 resourceId: project.id,
-                serverUpdatedAt: parseDate(project.updatedAt)
+                serverUpdatedAt: serverUpdatedAt
             )
+            if shouldSkipEcho(resourceId: project.id, serverUpdatedAt: serverUpdatedAt) {
+                continue
+            }
             upsert(project)
         }
         for note in response.notes {
+            let serverUpdatedAt = parseDate(note.updatedAt)
             resolveConflictIfNeeded(
                 resourceId: note.id,
-                serverUpdatedAt: parseDate(note.updatedAt)
+                serverUpdatedAt: serverUpdatedAt
             )
+            if shouldSkipEcho(resourceId: note.id, serverUpdatedAt: serverUpdatedAt) {
+                continue
+            }
             upsert(note)
         }
         for projectID in response.tombstones.projects {
@@ -323,6 +356,61 @@ final class SyncEngine: ObservableObject {
         // SwiftData's save() commits everything together.
         stageCursor(response.serverTime)
         try modelContext.save()
+    }
+
+    // MARK: - Echo skip (M40 polish)
+
+    /// Detect the optimistic-edit echo case and tell the apply step to
+    /// skip overwriting the local row. Triggered when the user just
+    /// queued an edit (so a `MutationQueueItem` exists for the same
+    /// resource with a `baseUpdatedAt`) and an inbound sync fires
+    /// before the queue replay completes — the server's row still
+    /// reflects the pre-edit state (`server.updated_at ==
+    /// pending.baseUpdatedAt`), and applying it would briefly
+    /// overwrite the user's optimistic UI until the replay finishes.
+    ///
+    /// Compared to `resolveConflictIfNeeded`, which fires on
+    /// `server.updated_at > pending.baseUpdatedAt` (server strictly
+    /// newer — drop the queued mutation), this fires on equality
+    /// (server hasn't moved — keep the queued mutation AND skip the
+    /// apply). The two are mutually exclusive, so the fixed
+    /// conflict-then-echo ordering in `applyAndAdvanceCursor` is
+    /// safe.
+    ///
+    /// False-positive analysis: the only way `server.updated_at`
+    /// could equal `pending.baseUpdatedAt` while genuinely carrying
+    /// the user's edit is if the server failed to bump `updated_at`
+    /// on a write — that would be a server bug, and the next sync
+    /// after the queue replay completes would correct any drift
+    /// anyway (the row will then carry a strictly-greater
+    /// `updated_at` from the replayed mutation).
+    ///
+    /// `echoSkips` is incremented for observability — surfacing how
+    /// often this fires in practice helps catch a misbehaving server
+    /// early. It mirrors the `conflictsResolved` counter on the
+    /// queue.
+    private func shouldSkipEcho(resourceId: String, serverUpdatedAt: Date?) -> Bool {
+        guard let queue = mutationQueue else { return false }
+        guard let serverUpdatedAt else { return false }
+        guard let pending = queue.pendingMutation(forResourceId: resourceId) else { return false }
+        guard let baseUpdatedAt = pending.baseUpdatedAt else { return false }
+        guard baseUpdatedAt == serverUpdatedAt else { return false }
+        echoSkips += 1
+        return true
+    }
+
+    // MARK: - 401 handoff (public surface)
+
+    /// Public entry point for the 401-handoff flow. Used by view-layer
+    /// code (e.g. `TodoRow.toggle()`) that hits an `unauthorized`
+    /// response on a direct-to-API call and wants to surface the
+    /// sign-out immediately rather than waiting up to 5 minutes for
+    /// the next sync tick to detect the revoked key. Mirrors the
+    /// internal `handleUnauthorized()` post-conditions: stop the
+    /// Timer, wipe the queue, wipe Keychain, clear the API client's
+    /// in-memory key, flip AuthSession to `.signedOut`.
+    func signOutDueToUnauthorized() async {
+        await handleUnauthorized()
     }
 
     // MARK: - Conflict resolution (M38)
@@ -616,3 +704,262 @@ extension EnvironmentValues {
         set { self[SyncEngineKey.self] = newValue }
     }
 }
+
+// MARK: - Debug-only sanity checks
+
+#if DEBUG
+
+/// Documentation-grade smoke checks for the sync apply path. No XCTest
+/// target exists yet — these mirror the `BrainDebugMutationQueue`
+/// shape so a future CI hook running `BrainDebugSyncEngine.runAll()`
+/// would catch the obvious regressions.
+enum BrainDebugSyncEngine {
+
+    /// Build an in-memory SwiftData container wired with the schema
+    /// the engines expect. Shared across the checks below.
+    @MainActor
+    private static func makeContext() throws -> ModelContext {
+        let schema = Schema([
+            LocalProject.self,
+            LocalSection.self,
+            LocalNote.self,
+            LocalSyncState.self,
+            MutationQueueItem.self
+        ])
+        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+        let container = try ModelContainer(for: schema, configurations: [config])
+        return ModelContext(container)
+    }
+
+    /// Build a `Date` truncated to whole seconds, offset from now by
+    /// `seconds`. Whole-second precision matters for these checks
+    /// because `ServerDateChecks.formatForWire` parses on
+    /// `.withInternetDateTime` (no fractional component), so a
+    /// fractional input would round-trip to a different `Date` than
+    /// the one passed in and the equality assertion in
+    /// `shouldSkipEcho` would miss.
+    private static func wholeSecondDate(secondsFromNow seconds: TimeInterval) -> Date {
+        let raw = Date().addingTimeInterval(seconds).timeIntervalSince1970
+        return Date(timeIntervalSince1970: floor(raw))
+    }
+
+    /// M40 polish: the echo-skip path fires when a queue item's
+    /// `baseUpdatedAt` exactly equals the inbound server row's
+    /// `updated_at`. Builds a `LocalNote` (so we can detect a
+    /// *would-be* upsert by reading its fields back), seeds the
+    /// queue with a matching base, and runs the apply. Asserts the
+    /// echoSkips counter ticks up and the local row is untouched.
+    @MainActor
+    static func assertEchoSkipFires() throws {
+        let context = try makeContext()
+        let session = AuthSession(state: .signedOut)
+        let client = BrainAPIClient()
+        let queue = MutationQueue(modelContext: context, client: client, authSession: session)
+        let engine = SyncEngine(client: client, modelContext: context, authSession: session)
+        engine.attach(mutationQueue: queue)
+
+        // Seed a local note with the user's optimistic edit already
+        // applied. The "echo" arrives from the server still showing
+        // the *pre-edit* title. Truncate to whole seconds so the
+        // baseUpdatedAt round-trips through `formatForWire` →
+        // `parseDate` byte-identically; any fractional component
+        // would drop on wire-format and the equality check would
+        // miss.
+        let resourceId = "33333333-3333-3333-3333-333333333333"
+        let optimisticTitle = "User just typed this"
+        let preEditUpdatedAt = wholeSecondDate(secondsFromNow: -30)
+        let local = LocalNote(
+            id: resourceId,
+            shortId: "abc",
+            title: optimisticTitle,
+            content: "",
+            type: "todo",
+            archived: false,
+            createdAt: preEditUpdatedAt,
+            updatedAt: preEditUpdatedAt
+        )
+        context.insert(local)
+        try context.save()
+
+        // Enqueue a pending mutation with `baseUpdatedAt` matching the
+        // server's pre-edit timestamp.
+        _ = try queue.enqueue(
+            op: .updateTodo,
+            resourceType: "todo",
+            resourceId: resourceId,
+            payload: Data(),
+            baseUpdatedAt: preEditUpdatedAt
+        )
+
+        // Build a fake inbound sync response with the server's
+        // pre-edit row (its `updated_at` exactly equals the queue
+        // item's base — the echo signature).
+        let serverRow = Note.echoTestFixture(
+            id: resourceId,
+            title: "Pre-edit title",
+            updatedAt: ServerDateChecks.formatForWire(preEditUpdatedAt)
+        )
+        let response = SyncResponse(
+            projects: [],
+            notes: [serverRow],
+            tombstones: SyncTombstones(notes: [], projects: []),
+            serverTime: ServerDateChecks.formatForWire(Date())
+        )
+
+        let initialEchoSkips = engine.echoSkips
+        try engine.applyForTesting(response)
+
+        // Echo-skip should have fired exactly once for the note.
+        assert(engine.echoSkips == initialEchoSkips + 1,
+               "echoSkips should bump when server.updatedAt == pending.baseUpdatedAt")
+        // The local row's title should still reflect the user's
+        // optimistic edit — the upsert was skipped.
+        assert(local.title == optimisticTitle,
+               "echo-skip path must not overwrite the optimistic local row")
+    }
+
+    /// Counterpart: when the server row's `updated_at` is strictly
+    /// newer than the queue item's base, the conflict-drop path
+    /// fires (handled by `MutationQueue.dropPendingMutation`) and
+    /// the echo-skip path does NOT fire — i.e. the upsert proceeds.
+    @MainActor
+    static func assertEchoSkipDoesNotFireForNewerServer() throws {
+        let context = try makeContext()
+        let session = AuthSession(state: .signedOut)
+        let client = BrainAPIClient()
+        let queue = MutationQueue(modelContext: context, client: client, authSession: session)
+        let engine = SyncEngine(client: client, modelContext: context, authSession: session)
+        engine.attach(mutationQueue: queue)
+
+        let resourceId = "44444444-4444-4444-4444-444444444444"
+        let optimisticTitle = "User just typed this"
+        // Whole-second precision — see `wholeSecondDate` for why.
+        let baseUpdatedAt = wholeSecondDate(secondsFromNow: -60)
+        let serverNewerUpdatedAt = wholeSecondDate(secondsFromNow: -10)
+        let local = LocalNote(
+            id: resourceId,
+            shortId: "def",
+            title: optimisticTitle,
+            content: "",
+            type: "todo",
+            archived: false,
+            createdAt: baseUpdatedAt,
+            updatedAt: baseUpdatedAt
+        )
+        context.insert(local)
+        try context.save()
+
+        _ = try queue.enqueue(
+            op: .updateTodo,
+            resourceType: "todo",
+            resourceId: resourceId,
+            payload: Data(),
+            baseUpdatedAt: baseUpdatedAt
+        )
+
+        let serverTitle = "Web client wrote this"
+        let serverRow = Note.echoTestFixture(
+            id: resourceId,
+            title: serverTitle,
+            updatedAt: ServerDateChecks.formatForWire(serverNewerUpdatedAt)
+        )
+        let response = SyncResponse(
+            projects: [],
+            notes: [serverRow],
+            tombstones: SyncTombstones(notes: [], projects: []),
+            serverTime: ServerDateChecks.formatForWire(Date())
+        )
+
+        let initialEchoSkips = engine.echoSkips
+        try engine.applyForTesting(response)
+
+        assert(engine.echoSkips == initialEchoSkips,
+               "echoSkips must not bump when server is strictly newer than base")
+        // Server-newer wins: the local row should now reflect the
+        // server's title. (And the conflict-drop path should have
+        // removed the queue item, but we don't assert that here —
+        // it's covered by `BrainDebugMutationQueue` already.)
+        assert(local.title == serverTitle,
+               "server-newer apply must overwrite the local row")
+    }
+
+    /// Run every check. Convenience entrypoint for a future CI hook.
+    @MainActor
+    static func runAll() {
+        do {
+            try assertEchoSkipFires()
+            try assertEchoSkipDoesNotFireForNewerServer()
+        } catch {
+            assertionFailure("BrainDebugSyncEngine: setup failed: \(error)")
+        }
+    }
+}
+
+extension SyncEngine {
+    /// Test-only entry point that runs the same apply path as a real
+    /// sync. We deliberately do not expose `applyAndAdvanceCursor`
+    /// itself because it's also responsible for staging the cursor
+    /// row, which we don't need to exercise here.
+    @MainActor
+    fileprivate func applyForTesting(_ response: SyncResponse) throws {
+        try applyAndAdvanceCursor(response)
+    }
+}
+
+extension Note {
+    /// Build a minimal `Note` DTO suitable for the echo-skip checks.
+    /// All other fields default to empty/false because the echo path
+    /// only inspects `id` and `updatedAt`.
+    static func echoTestFixture(id: String, title: String, updatedAt: String) -> Note {
+        Note(
+            id: id,
+            shortId: "test",
+            title: title,
+            content: "",
+            type: "todo",
+            tags: [],
+            createdAt: updatedAt,
+            updatedAt: updatedAt,
+            archived: false,
+            todo: TodoFields(
+                dueDate: nil,
+                dueTime: nil,
+                completed: false,
+                completedAt: nil,
+                priority: "medium",
+                recurrence: nil,
+                projectId: nil,
+                section: "default",
+                url: nil,
+                urlTitle: nil,
+                urlState: nil,
+                urlFetchedAt: nil,
+                sortOrder: 0
+            ),
+            appointment: nil
+        )
+    }
+}
+
+extension ServerDateChecks {
+    /// Wire-format a `Date` so it round-trips through
+    /// `SyncEngine.parseDate`. The engine uses
+    /// `ISO8601DateFormatter` with `.withInternetDateTime`, which
+    /// REQUIRES a `Z` (or explicit offset) designator — naive
+    /// `yyyy-MM-dd'T'HH:mm:ss` does not parse. Truncate to whole
+    /// seconds so the engine's non-fractional formatter handles the
+    /// string cleanly, and equality comparisons against
+    /// `baseUpdatedAt` (which is *also* parsed back through the same
+    /// formatter on the next round-trip) line up exactly.
+    static func formatForWire(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        // Truncate to whole seconds — the same formatter parses with
+        // second precision, so a fractional input would round-trip to
+        // a different `Date` than the one we passed in.
+        let truncated = Date(timeIntervalSince1970: floor(date.timeIntervalSince1970))
+        return formatter.string(from: truncated)
+    }
+}
+
+#endif

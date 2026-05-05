@@ -246,6 +246,14 @@ struct TodayView: View {
                 }
         }
         .listStyle(.insetGrouped)
+        // Reserve space at the bottom of the scroll content so the
+        // FAB (M39) doesn't cover the last list row when the user
+        // scrolls to the bottom. Budget: 56pt FAB + 16pt trailing
+        // padding either side + buffer = 80pt. `.scrollContent`
+        // applies the inset to the scrollable area only, so the
+        // section background still extends edge-to-edge — what we
+        // want for `.insetGrouped`.
+        .contentMargins(.bottom, 80, for: .scrollContent)
         .refreshable {
             // Pull-to-refresh: explicit user-initiated sync.
             // SyncEngine debounces if a sync just ran, so this
