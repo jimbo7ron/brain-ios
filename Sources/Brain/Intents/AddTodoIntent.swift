@@ -41,8 +41,7 @@ struct AddTodoIntent: AppIntent {
     static var title: LocalizedStringResource = "Add a todo"
 
     static var description = IntentDescription(
-        "Creates a Brain todo from free-form text. Trailing keywords like " +
-        "'tomorrow', '!high', and '#tag' are parsed automatically."
+        "Creates a Brain todo from free-form text. Trailing keywords like 'tomorrow', '!high', and '#tag' are parsed automatically."
     )
 
     /// `false` because the intent is one-shot — Siri speaks the

@@ -51,15 +51,15 @@ struct ProjectDetailView: View {
 
     init(project: LocalProject) {
         self.project = project
-        let projectID = project.id
-        _todos = Query(
-            filter: #Predicate<LocalNote> {
-                $0.type == "todo"
-                    && $0.archived == false
-                    && $0.projectId == projectID
-            },
-            sort: [SortDescriptor(\LocalNote.sortOrder), SortDescriptor(\LocalNote.createdAt)]
-        )
+        let projectID: String? = project.id
+        let predicate = #Predicate<LocalNote> { note in
+            note.type == "todo" && !note.archived && note.projectId == projectID
+        }
+        let sortDescriptors: [SortDescriptor<LocalNote>] = [
+            SortDescriptor(\.sortOrder),
+            SortDescriptor(\.createdAt),
+        ]
+        _todos = Query(filter: predicate, sort: sortDescriptors)
     }
 
     // MARK: - Derived state

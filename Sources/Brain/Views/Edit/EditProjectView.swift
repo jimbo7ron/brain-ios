@@ -469,7 +469,7 @@ struct EditProjectView: View {
     /// `@Query` re-render). We don't wait for the next sync — the
     /// server's response IS the canonical view, so applying it
     /// immediately keeps the UI from looking stale.
-    private func applyServerSections(_ wireSections: [Section]) {
+    private func applyServerSections(_ wireSections: [SectionDTO]) {
         // Update local @State for the dialog.
         sections = wireSections
             .sorted { $0.position < $1.position }

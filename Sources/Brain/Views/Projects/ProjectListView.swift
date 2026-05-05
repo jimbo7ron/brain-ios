@@ -37,7 +37,7 @@ struct ProjectListView: View {
     /// list refreshes immediately after the next sync writes a new
     /// project or flips an archived flag.
     @Query(
-        filter: #Predicate<LocalProject> { $0.archived == false },
+        filter: #Predicate<LocalProject> { !$0.archived },
         sort: [SortDescriptor(\LocalProject.sortOrder), SortDescriptor(\LocalProject.name)]
     )
     private var projects: [LocalProject]

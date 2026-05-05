@@ -46,13 +46,18 @@ struct TodayView: View {
     /// view's working set. Sort by `dueDate` (string sort matches
     /// calendar order for `yyyy-MM-dd`) then `sortOrder` so within
     /// a day the user's manual ordering still wins — same as the web.
-    @Query(
-        filter: #Predicate<LocalNote> {
-            $0.type == "todo" && $0.completed == false && $0.dueDate != nil && $0.archived == false
-        },
-        sort: [SortDescriptor(\.dueDate), SortDescriptor(\.sortOrder)]
-    )
-    private var openTodos: [LocalNote]
+    @Query(filter: TodayView.todoPredicate)
+    private var openTodosRaw: [LocalNote]
+
+    private static let todoPredicate: Predicate<LocalNote> = #Predicate { note in
+        note.type == "todo"
+    }
+
+    /// Open todos with a due date — narrowed in Swift since the SwiftData
+    /// predicate macro chokes on the 4-condition form.
+    private var openTodos: [LocalNote] {
+        openTodosRaw.filter { !$0.completed && !$0.archived && $0.dueDate != nil }
+    }
 
     /// All non-archived appointments. We filter to "today" in Swift
     /// because the appointment start time is a server-emitted naive
@@ -60,20 +65,25 @@ struct TodayView: View {
     /// server is pinned to UTC (per roadmap M28), so we parse it as
     /// UTC and compare via `Calendar.current` to land on the user's
     /// local "today".
-    @Query(
-        filter: #Predicate<LocalNote> {
-            $0.type == "appointment" && $0.archived == false && $0.appointmentStartTime != nil
-        },
-        sort: [SortDescriptor(\.appointmentStartTime)]
-    )
-    private var appointments: [LocalNote]
+    @Query(filter: TodayView.appointmentPredicate)
+    private var appointmentsRaw: [LocalNote]
+
+    private static let appointmentPredicate: Predicate<LocalNote> = #Predicate { note in
+        note.type == "appointment"
+    }
+
+    /// Appointments with a parseable start — narrow in Swift for the
+    /// same reason as `openTodos`.
+    private var appointments: [LocalNote] {
+        appointmentsRaw.filter { !$0.archived && $0.appointmentStartTime != nil }
+    }
 
     /// All non-archived projects. We hoist this to the view level
     /// so each `TodoRow` can look up its project's accent color from
     /// a parent-built dict rather than running its own per-row
     /// `@Query`. Project lists are personal-app scale (<50), so
     /// fetching them all is cheaper than 100+ individual queries.
-    @Query(filter: #Predicate<LocalProject> { $0.archived == false })
+    @Query(filter: #Predicate<LocalProject> { !$0.archived })
     private var projects: [LocalProject]
 
     /// `projectId` → `LocalProject` lookup, rebuilt per render.

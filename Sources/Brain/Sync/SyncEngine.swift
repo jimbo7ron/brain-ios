@@ -421,7 +421,7 @@ final class SyncEngine: ObservableObject {
     /// is deleted (the server only emits the canonical set per project,
     /// so anything missing locally got removed server-side). Existing
     /// sections are mutated in place; new ones are inserted.
-    private func reconcileSections(_ wireSections: [Section], on project: LocalProject) {
+    private func reconcileSections(_ wireSections: [SectionDTO], on project: LocalProject) {
         let projectID = project.id
         let wantedIDs = Set(wireSections.map { LocalSection.makeID(projectID: projectID, slug: $0.slug) })
 
