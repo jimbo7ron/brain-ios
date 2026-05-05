@@ -326,14 +326,13 @@ actor BrainAPIClient {
     /// the row's `idempotencyKey` UUID into the `Idempotency-Key` header
     /// so retries are server-deduped.
     ///
-    /// Currently only the `.completeTodo` op is wired end-to-end — M36
-    /// is the first feature that will exercise the queue, and it only
-    /// needs `POST /api/v1/notes/{id}/complete`. The other cases throw
-    /// `notImplemented` until the milestones that own them (M38+) fill
-    /// them in. The dispatch shape is fixed now so those milestones
-    /// don't have to chase compile errors across the queue, the API
-    /// client, and the call sites.
-    func executeMutation(_ item: MutationQueueItem) async throws {
+    /// Returns the server's freshly-decoded `Note` for ops where the
+    /// caller needs to reconcile against the response (currently only
+    /// `.createTodo` — see the optimistic-add flow in `MutationQueue.replay`
+    /// where the local UUID stub gets its id / shortId / timestamps
+    /// patched to the server's canonical values once the POST succeeds).
+    /// All other ops return `nil`.
+    func executeMutation(_ item: MutationQueueItem) async throws -> Note? {
         let key = item.idempotencyKey.uuidString
         // Validate `resourceId` shape before splicing into a URL path.
         // The queue is local-only and SwiftData rows can't be tampered
@@ -366,6 +365,31 @@ actor BrainAPIClient {
                 idempotencyKey: key
             )
             try await performIgnoringBody(request)
+            return nil
+        case .createTodo:
+            // M44.x optimistic-add: POST /api/v1/notes with the queue
+            // item's pre-encoded `CreateNotePayload` body. The server
+            // doesn't accept a client-supplied `id` on `NoteCreate`, so
+            // the response carries a server-assigned UUID + short_id +
+            // canonical timestamps. The replayer in `MutationQueue` uses
+            // those to patch the optimistic local row (whose `id` is the
+            // client UUID we put in `resourceId`).
+            //
+            // Idempotency-Key threads through unchanged: the brain
+            // server's middleware caches the response under
+            // `(key, user, POST, /api/v1/notes)` for 24h, so a network
+            // blip that triggers a retry returns the same Note (same
+            // server id) rather than minting a duplicate. Without this
+            // header we'd risk creating the same note twice on flaky
+            // networks.
+            let request = try makeRequest(
+                method: "POST",
+                path: "/api/v1/notes",
+                body: item.payload,
+                requiresAuth: true,
+                idempotencyKey: key
+            )
+            return try await perform(request, as: Note.self)
         case .updateTodo:
             // M40: PUT /api/v1/notes/{id} with the queue item's pre-
             // encoded JSON body. The server treats unspecified fields as
@@ -381,6 +405,7 @@ actor BrainAPIClient {
                 idempotencyKey: key
             )
             try await performIgnoringBody(request)
+            return nil
         case .updateProject:
             // M40: PUT /api/v1/projects/{id}. Same shape as updateTodo;
             // the body is `UpdateProjectPayload` JSON encoded at
@@ -396,6 +421,7 @@ actor BrainAPIClient {
                 idempotencyKey: key
             )
             try await performIgnoringBody(request)
+            return nil
         case .archiveNote:
             // M44.x: DELETE /api/v1/notes/{id} — the brain server treats
             // DELETE as soft-delete / archive (see `delete_note_endpoint`
@@ -411,8 +437,8 @@ actor BrainAPIClient {
                 idempotencyKey: key
             )
             try await performIgnoringBody(request)
+            return nil
         case .uncompleteTodo,
-             .createTodo,
              .createProject,
              .addSection:
             // TODO(M41+): Wire each of these to its server endpoint.
