@@ -400,16 +400,19 @@ struct EditProjectView: View {
         dismiss()
     }
 
-    // MARK: - Section editing (direct API)
+    // MARK: - Section editing (M45 Wave 4: repository-routed)
 
-    /// Add a new section to the project. Direct call to the
-    /// `POST /api/v1/projects/{id}/sections` endpoint — see the
-    /// file-header comment for why this isn't on the queue today.
+    /// Add a new section. Routes through
+    /// `ProjectRepository.addSection`, which performs the optimistic
+    /// local insert (with a tmp-prefixed slug) and enqueues a
+    /// `.createSection` mutation. The queue's reconcile path renames
+    /// the composite id to the canonical server slug once the create
+    /// echoes back — see `MutationQueue.reconcileCreateSectionResponse`.
     private func addSection() async {
         let trimmed = newSectionName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        guard let client else {
-            errorMessage = "Server unavailable. Try again."
+        guard let repo = projectRepository else {
+            errorMessage = "Project repository unavailable. Try again."
             return
         }
 
@@ -417,29 +420,23 @@ struct EditProjectView: View {
         defer { isMutatingSection = false }
         errorMessage = nil
 
-        do {
-            let response = try await client.addProjectSection(
-                projectId: project.id,
-                name: trimmed
-            )
-            applyServerSections(response.sections)
-            newSectionName = ""
-        } catch let error as BrainAPIClient.Error {
-            errorMessage = error.userFacingMessage
-        } catch {
-            errorMessage = "Couldn't add section: \(error.localizedDescription)"
-        }
+        _ = repo.addSection(to: project, name: trimmed)
+        newSectionName = ""
+        rehydrateSections()
     }
 
-    /// Commit a section rename. Direct call to
-    /// `PATCH /api/v1/projects/{id}/sections/{slug}`. Slug is
-    /// preserved server-side so any todos in the section stay
-    /// attached.
+    /// Rename a section via the repository. Server preserves the slug
+    /// so the composite id is stable; the queue reconcile re-mirrors
+    /// the wire sections list after the round-trip.
     private func commitRename(_ slug: String) async {
         let trimmed = renameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        guard let client else {
-            errorMessage = "Server unavailable. Try again."
+        guard let repo = projectRepository else {
+            errorMessage = "Project repository unavailable. Try again."
+            return
+        }
+        guard let target = project.sections.first(where: { $0.slug == slug }) else {
+            errorMessage = "Section no longer exists."
             return
         }
 
@@ -447,66 +444,22 @@ struct EditProjectView: View {
         defer { isMutatingSection = false }
         errorMessage = nil
 
-        do {
-            let response = try await client.renameProjectSection(
-                projectId: project.id,
-                slug: slug,
-                name: trimmed
-            )
-            applyServerSections(response.sections)
-            renamingSlug = nil
-            renameDraft = ""
-        } catch let error as BrainAPIClient.Error {
-            errorMessage = error.userFacingMessage
-        } catch {
-            errorMessage = "Couldn't rename section: \(error.localizedDescription)"
-        }
+        repo.renameSection(target, to: trimmed)
+        renamingSlug = nil
+        renameDraft = ""
+        rehydrateSections()
     }
 
-    /// Reflect a server-returned `Project.sections` list into both the
-    /// local @State (so the dialog UI updates) and the SwiftData
-    /// `LocalProject.sections` (so other views observing it via
-    /// `@Query` re-render). We don't wait for the next sync — the
-    /// server's response IS the canonical view, so applying it
-    /// immediately keeps the UI from looking stale.
-    private func applyServerSections(_ wireSections: [SectionDTO]) {
-        // Update local @State for the dialog.
-        sections = wireSections
+    /// Re-snapshot `project.sections` into the local `@State`. The
+    /// repo writes to a different `ModelContext`, but the @Bindable
+    /// project's relationship resolves via the shared SwiftData
+    /// store. Calling this after each repo invocation gives the
+    /// dialog an immediate render of the optimistic stub /
+    /// post-reconcile name without waiting for SwiftData's change
+    /// coalescing.
+    private func rehydrateSections() {
+        sections = project.sections
             .sorted { $0.position < $1.position }
             .map { SectionMutationSpec(slug: $0.slug, name: $0.name, position: $0.position) }
-
-        // Mirror onto the SwiftData project so background views update.
-        // Reuse the same logic shape as `SyncEngine.reconcileSections`
-        // so this surface and the read path agree.
-        let projectID = project.id
-        let wantedIDs = Set(wireSections.map {
-            LocalSection.makeID(projectID: projectID, slug: $0.slug)
-        })
-        for existing in project.sections where !wantedIDs.contains(existing.id) {
-            modelContext.delete(existing)
-        }
-        let currentBySlug = Dictionary(
-            project.sections
-                .filter { wantedIDs.contains($0.id) }
-                .map { ($0.slug, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        for wire in wireSections {
-            if let local = currentBySlug[wire.slug] {
-                local.name = wire.name
-                local.position = wire.position
-            } else {
-                let composite = LocalSection.makeID(projectID: projectID, slug: wire.slug)
-                let local = LocalSection(
-                    id: composite,
-                    slug: wire.slug,
-                    name: wire.name,
-                    position: wire.position,
-                    project: project
-                )
-                modelContext.insert(local)
-            }
-        }
-        try? modelContext.save()
     }
 }

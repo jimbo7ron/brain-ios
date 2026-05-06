@@ -75,6 +75,51 @@ protocol OptimisticStub: PersistentModel {
     func adoptServerID(_ newID: String)
 }
 
+/// Sibling of `OptimisticStub` for models whose primary key is a
+/// composite id (e.g. `LocalSection`, keyed `"<projectID>:<slug>"` —
+/// see `LocalSection.makeID(projectID:slug:)`). Introduced in M45
+/// Wave 4 (spec §8.6) when section ops moved through the Repository
+/// path. The single-UUID `OptimisticStub.adoptServerID(_:)` doesn't
+/// fit because:
+///
+///   * Renaming a section in place means rewriting only the *slug*
+///     half of the composite — the project prefix is stable for the
+///     duration of the rename.
+///   * The "create" path mints a temporary slug client-side
+///     (`tmp-<uuid>`); reconcile rewrites it to the server's
+///     canonical slug while the project prefix is unchanged.
+///   * Optimistic-vs-canonical detection (`isOptimistic`) is a
+///     property of the slug (does it carry the `tmp-` prefix?), not
+///     a property of "we have a queued create row". The latter would
+///     be true for any queued mutation, which is not the same thing.
+///
+/// Same `#Predicate` macro caveat as `OptimisticStub`: each
+/// conformance owns its own `makeFetchByID(_:)` so the macro can
+/// resolve `$0.id` against a concrete model on iOS 17.
+protocol OptimisticCompositeStub: PersistentModel {
+
+    /// Fetch the row whose composite `id` equals `id`.
+    static func makeFetchByID(_ id: String) -> FetchDescriptor<Self>
+
+    /// Rewrite the model's composite `id` to a new value. For
+    /// `LocalSection` that means swapping the `<projectID>:<tmp-slug>`
+    /// composite for `<projectID>:<server-slug>` (and updating the
+    /// `slug` column alongside so the read-side queries stay in
+    /// agreement). Caller is responsible for ensuring no other row
+    /// already exists under `newID` at save time.
+    func adoptServerID(_ newID: String)
+
+    /// True iff this entity was inserted optimistically with a
+    /// client-side composite id and is awaiting reconciliation. For
+    /// `LocalSection` this is "does the slug start with the `tmp-`
+    /// prefix used by `ProjectRepository.addSection`?". The flag
+    /// lets reconcile paths and view code distinguish "this row is
+    /// awaiting server confirmation" from "this row IS the canonical
+    /// server state" without reaching into a separate
+    /// `MutationStatusStore` lookup.
+    var isOptimistic: Bool { get }
+}
+
 // MARK: - LocalNote conformance
 
 extension LocalNote: OptimisticStub {
@@ -106,6 +151,45 @@ extension LocalProject: OptimisticStub {
 
     func adoptServerID(_ newID: String) {
         self.id = newID
+    }
+}
+
+// MARK: - LocalSection conformance
+
+extension LocalSection: OptimisticCompositeStub {
+
+    /// Shared `tmp-` prefix used by `ProjectRepository.addSection` to
+    /// mint a placeholder slug before the server has assigned the
+    /// canonical one. Centralised here so the optimistic-detection
+    /// path (`isOptimistic`) and the call-site mint stay in
+    /// agreement — a future change to the prefix shape (e.g. `tmp_`,
+    /// or a numeric suffix) only flips one constant.
+    static let optimisticSlugPrefix = "tmp-"
+
+    static func makeFetchByID(_ id: String) -> FetchDescriptor<LocalSection> {
+        var descriptor = FetchDescriptor<LocalSection>(
+            predicate: #Predicate { $0.id == id }
+        )
+        descriptor.fetchLimit = 1
+        return descriptor
+    }
+
+    func adoptServerID(_ newID: String) {
+        // Composite id is `"<projectID>:<slug>"`. The caller hands us
+        // the full new composite; we update both the `id` column (so
+        // `@Attribute(.unique)` constraints / FetchDescriptor lookups
+        // resolve to this row) AND the `slug` column (so the read-side
+        // section-by-slug queries see the canonical slug). The two are
+        // intentionally redundant — see `LocalSection.makeID(...)` —
+        // and must stay in agreement.
+        self.id = newID
+        if let colon = newID.firstIndex(of: ":") {
+            self.slug = String(newID[newID.index(after: colon)...])
+        }
+    }
+
+    var isOptimistic: Bool {
+        slug.hasPrefix(Self.optimisticSlugPrefix)
     }
 }
 

@@ -1,6 +1,6 @@
 # M45 — Write Coordinator (iOS Phase 6)
 
-**Status**: SPEC — not implemented
+**Status**: Waves 0-3 shipped; Wave 4 in PR #38 (open). M45 closes when #38 merges.
 **Drafted**: 2026-05-05
 **Author**: drafted by Claude Opus 4.7, reviewed by an iOS-architecture specialist agent
 **Supersedes**: PR #33 (`claude/optimistic-add-everywhere`) — that PR's tactical fixes are absorbed into Wave 2 of this milestone
@@ -38,7 +38,7 @@ The duplication is worse than just LOC: each site has subtly different error han
 
 ## 3. Non-goals
 
-- **sortOrder / drag-reorder** — multi-record renumbering is its own design problem (FIFO ordering vs LWW base comparison across siblings). Tracked as a follow-up milestone, not addressed here. The Repository will expose a `repo.reorder(...)` placeholder that throws `unimplemented`.
+- **sortOrder / drag-reorder** — multi-record renumbering is its own design problem (FIFO ordering vs LWW base comparison across siblings). Tracked as **M46** ("section sortOrder + reorder", the iOS milestone immediately after M45 ships). The Repository exposes a `repo.reorderSections(...)` placeholder that throws `RepositoryError.unimplemented("reorderSections")`; locked in `ProjectRepositoryTests.testReorderSections_throwsUnimplemented`. Wave 4 review re-confirmed this stays a stub at ship — picked up in M46.
 - **Rewriting MutationQueue** — the queue's enqueue / replay / retry / poison-class logic stays. Only the reconcile internals are refactored.
 - **Bumping deploy target** — stays on iOS 17. iOS 18 SwiftData additions (`#Index`, `#Unique`, `willSave/didSave` notifications) would help marginally but aren't load-bearing.
 - **Server-side changes** — none. Client-supplied UUIDs still aren't accepted (we bridge with reconcile rename); idempotency-key-only-caches-2xx is a known small risk, separate fix.
@@ -81,8 +81,12 @@ Plumb the update response through `MutationResult.note(let updated)` and apply i
 ### 4.4 MutationStatusStore — separate observable, not a model column
 
 UI needs both:
-- Queue-level: "N pending / M failed" banner. Today's `MutationQueue.lastError`, `pendingCount`, `conflictsResolved` already cover this once we add a `failedCount` derived from rows where `nextRetryAt == .distantFuture`.
+- Queue-level: "N pending / M failed" banner. Today's `MutationQueue.lastError`, `totalCount`, `pendingCount` (derived as `totalCount - failedCount`), `failedCount`, `conflictsResolved` cover this. **Wave 4 review fix:** `pendingCount` was renamed from "raw queue depth" to derived "active pending" (poisoned rows count toward `failedCount`, not `pendingCount`) — `totalCount` is the new name for the raw COUNT(*). Pill reads `pendingCount` + `failedCount` directly without the previous hand-rolled subtraction.
 - Per-row: spinner / red dot on individual notes that are mid-flight or have failed.
+
+**Pill placement (Wave 4, locked at ship).** Overlay (`alignment: .topTrailing`) on `SignedInRootView`, with `allowsHitTesting(false)`. Visible from every tab without per-tab toolbar plumbing. Top padding is `safeAreaInsets.top + 52` (computed via a `GeometryReader` scoped to the overlay only — NOT to the root) so the pill clears both compact (44pt) and large-title (96pt) nav bars. The fixed-`8pt`-top earlier draft collided with the iPhone large-title nav bar; this is the review-fix shape.
+
+**Per-row indicator scope (Wave 4, locked at ship).** TodoRow only. Project rows and Search-result rows are tracked as a follow-up — same `MutationStatusStore` lookup, just hasn't been wired into those views yet. Captured under §8 "known gaps."
 
 Per-row state lives in a separate `@Observable MutationStatusStore` keyed `[String: Status]` where the key is the note's *current* id. The Repository populates on enqueue, the queue clears on success, the rollback path marks `.failed`. The B2 reconcile ceremony rewrites the key from clientID → serverID in lock-step.
 
@@ -91,6 +95,8 @@ Do not put `syncStatus` on `LocalNote`. It's transient state, doesn't survive ap
 ### 4.5 Multi-step ops are first-class
 
 `renameSection`, `addSection`, future `mergeProject` etc. are atomic from the user's POV. Don't compose them from `repo.update` calls. Add explicit methods that own the optimistic application + reconcile of the whole batch.
+
+**Parent-project guard (Wave 4, locked at ship — see also §8.6).** When `addSection` is called against a project whose own `.createProject` is still pending, the project's id is the *client* UUID and the server doesn't know about it yet. The repo detects this via `queue.pendingMutation(forResourceId: projectID)` and **falls back to a direct `client.addProjectSection(...)` call** (in a detached `Task`). The local optimistic `LocalSection` stub is still inserted; sync's `reconcileSections` lands the canonical row on the next foreground tick. Locked in `ProjectRepositoryTests.testAddSection_fallsBackToDirectCallWhenParentOptimistic`. Tradeoff: the direct call has no offline support — if the network is down at this exact moment, the server-side section never lands and the local optimistic stub is removed by the next sync. Acceptable: the user's preceding `.createProject` is already gated on connectivity to make progress, so by the time `addSection` fires the project is at most ~1 RTT away from existing server-side.
 
 ## 5. The contract
 
@@ -103,7 +109,7 @@ After M45 lands, iOS code conforms to:
 - **Sync engine still owns reads** (the unified delta feed). Repository is write-only.
 - **App Intents / AppDelegate callbacks** also call through Repository (or a parallel Intent-safe variant — see §8.1).
 
-A lint rule (`swiftlint custom_rules` regex on `\.modelContext\.insert\(` outside `Repository`/`Sync` modules) makes the contract enforceable.
+A lint rule (`swiftlint custom_rules` regex on `\.modelContext\.insert\(` outside `Repository`/`Sync` modules) makes the contract enforceable. **Shipped at ship (Wave 4) as `no_modelcontext_insert_outside_repository`** — currently `severity: warning` so a stray violation surfaces in PR review without blocking merge. Intent is to escalate to `severity: error` after one merge cycle proves the codebase remains clean. Tracked as a follow-up edit; do NOT escalate in M45 itself.
 
 ## 6. Components
 
@@ -265,7 +271,13 @@ Brain's server uses soft-delete (`DELETE` = archive). `repo.archive(note)` is th
 
 `LocalSection` identifies as `projectID:slug` (see `SyncEngine.swift:514`), not a single UUID. `adoptServerID(_ newID: String)` assumes single-string identity and won't fit cleanly.
 
-**Decision (deferred to Wave 4):** introduce a sibling protocol — `OptimisticCompositeStub` or similar — when `addSection` / `renameSection` migrate. Don't pre-generalize `OptimisticStub` now — Wave 0 keeps `Note` + `Project` clean, and the section variation gets the shape it actually needs when we know more.
+**Decision (Wave 4 chose):** introduced sibling protocol `OptimisticCompositeStub`; `LocalSection` conforms. `addSection` falls back to direct `client.addProjectSection` when the parent project is still optimistic (rapid create-project-then-add-section is rare; full optimistic chaining would require composite-id rewrite during the parent project's reconcile). Rename-during-create folds the new name into the pending `.createSection` payload rather than enqueuing a stale `.updateSection` against the tmp slug.
+
+### 8.7 Failed-mutation recovery surface (M45 Wave 4 known gap)
+
+The status pill renders `⚠ M` when `M` rows have poisoned (permanent failure or retry-cap exceeded), but tapping the pill is currently informational only — there's no list-of-failures sheet, no retry button, no per-row "tap to investigate" affordance. Users see the count but can't act on it from inside the app today.
+
+Tracked as **M46** follow-up (alongside section reorder). The data the surface needs (`MutationQueueItem.lastError`, `attempts`, `op`, `resourceType`, `resourceId`) is already on disk; the design question is the UX shape (sheet? row affordance? auto-retry button?). Out of scope for M45.
 
 ## 9. Tests
 

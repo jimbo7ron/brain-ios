@@ -408,6 +408,25 @@ struct ProjectUpdateFields: Hashable {
     var sortOrder: Int?
 }
 
+/// Body for `POST /api/v1/projects/{projectId}/sections` (M45 Wave 4).
+/// Mirrors the wire shape used by `BrainAPIClient.addProjectSection` —
+/// a single `name` string. Lifted into a typed Codable struct so the
+/// queue's pre-encoded payload survives a cold-launch decode cleanly
+/// (the queue stores the JSON `Data` and `executeMutation` re-uses it
+/// directly without re-encoding).
+struct CreateSectionPayload: Codable, Hashable {
+    let name: String
+}
+
+/// Body for `PATCH /api/v1/projects/{projectId}/sections/{slug}`
+/// (M45 Wave 4). Same shape as `CreateSectionPayload` — server
+/// accepts `{name}` and preserves the existing slug. Kept distinct so
+/// future per-op fields (e.g. `position` for a server-side reorder)
+/// land on the right struct.
+struct UpdateSectionPayload: Codable, Hashable {
+    let name: String
+}
+
 /// Body for `POST /api/v1/notes` — mirrors `NoteCreate` in
 /// `brain/src/brain/schemas.py`. Used by M39's quick-add flow to mint a
 /// todo (or, in future, an appointment) directly through the API. Every
