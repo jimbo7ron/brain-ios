@@ -179,6 +179,11 @@ struct NewProjectView: View {
         }
 
         _ = projectRepo.create(payload)
+        // TODO(M45 Wave 4): Server-side validation errors from create surface
+        // only via MutationStatusStore — wire the failure banner so the user
+        // sees them instead of a silent persisted-then-rolled-back stub. The
+        // pre-Wave-2 path read `BrainAPIClient.Error.userFacingMessage` here
+        // synchronously; the optimistic path makes it asynchronous.
         BrainHaptics.light()
         dismiss()
     }

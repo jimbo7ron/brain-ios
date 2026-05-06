@@ -242,9 +242,18 @@ struct QuickAddView: View {
         //   * any UUID / name  → look up the project by id then by name
         // See `src/brain/server.py` lines 1858, 2032-2044 for the
         // create/update resolution path the server takes.
+        // M45 Wave 2 review: pass `parsed.title` explicitly. Without it,
+        // `NoteRepository.create` re-derives the title by re-parsing
+        // `payload.content` — which is `parsed.bodyForServer()`, the
+        // already-stripped form. Re-parsing stripped content can yield
+        // a slightly different title than `parsed.title` on the raw
+        // input (the parser's title heuristic strips date/priority
+        // tokens, and double-stripping isn't strictly idempotent in
+        // edge cases). The repo prefers caller-supplied title when
+        // present, so passing it preserves pre-migration semantics.
         let payload = CreateNotePayload(
             content: parsed.bodyForServer(),
-            title: nil,
+            title: parsed.title.isEmpty ? nil : parsed.title,
             type: "todo",
             dueDate: parsed.dueDateISO(),
             dueTime: parsed.dueTimeHHMM(),

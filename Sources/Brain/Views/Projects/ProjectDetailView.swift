@@ -27,14 +27,14 @@ import SwiftUI
 @MainActor
 struct ProjectDetailView: View {
 
-    @Environment(\.syncEngine) private var syncEngine
     /// M45 Wave 2: inline-add now goes through `NoteRepository` rather
     /// than the direct `await client.createNote(...)` round-trip this
     /// view shipped with. The repository owns the optimistic local
-    /// insert, so the new row appears in the section instantly instead
-    /// of waiting for the network. The `\.brainAPIClient` env-key was
-    /// removed alongside the migration — no other code path in this
-    /// view used it.
+    /// insert + queue enqueue, so the new row appears in the section
+    /// instantly instead of waiting for the network. The
+    /// `\.brainAPIClient` and `\.syncEngine` env-keys were removed
+    /// alongside the migration — no other code path in this view used
+    /// them.
     @Environment(\.noteRepository) private var noteRepo
 
     /// The project this view describes. Bindable so SwiftData
@@ -265,7 +265,7 @@ struct ProjectDetailView: View {
         guard let noteRepo else {
             // Preview / non-production host. Production wires the
             // repository in `BrainApp.init`.
-            inlineAddError = "Couldn't reach the repository. Try again."
+            inlineAddError = "Couldn't add — try again."
             BrainHaptics.error()
             return
         }

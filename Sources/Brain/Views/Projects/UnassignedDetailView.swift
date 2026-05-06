@@ -255,7 +255,7 @@ struct UnassignedDetailView: View {
         guard let noteRepo else {
             // Preview / non-production host. Production wires the
             // repository in `BrainApp.init`.
-            inlineAddError = "Couldn't reach the repository. Try again."
+            inlineAddError = "Couldn't add — try again."
             BrainHaptics.error()
             return
         }

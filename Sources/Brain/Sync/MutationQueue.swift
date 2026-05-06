@@ -558,6 +558,19 @@ final class MutationQueue {
             type: LocalProject.self
         ) { stub in
             stub.copyFields(from: serverProject, parseDate: parseServerDate)
+            // M45 Wave 2: mirror the server's canonical sections onto
+            // the local project. Without this, the optimistic stub sits
+            // with empty sections (its create payload has none) until
+            // the next foreground sync (~5min Timer), so tapping into
+            // ProjectDetailView right after creating shows zero
+            // sections. The shared helper is idempotent against the B1
+            // race where SyncEngine got there first and already
+            // inserted the LocalSection rows.
+            LocalProject.reconcileSections(
+                serverProject.sections,
+                on: stub,
+                in: modelContext
+            )
         }
     }
 
@@ -918,6 +931,14 @@ extension MutationQueue {
     /// the private helper to `BrainDebugMutationQueue`.
     func debugReconcileCreateResponse(clientId: String, serverNote: Note) {
         reconcileCreateResponse(clientId: clientId, serverNote: serverNote)
+    }
+
+    /// Test-only entry point for `reconcileCreateProjectResponse`.
+    /// M45 Wave 2 review: exposes the private helper so tests can
+    /// verify section reconcile mirrors server sections onto the
+    /// optimistic stub.
+    func debugReconcileCreateProjectResponse(clientId: String, serverProject: Project) {
+        reconcileCreateProjectResponse(clientId: clientId, serverProject: serverProject)
     }
 
     /// Test-only entry point for `rollbackOptimisticStateIfNeeded`.

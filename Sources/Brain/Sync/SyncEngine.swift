@@ -501,54 +501,13 @@ final class SyncEngine: ObservableObject {
             modelContext.insert(local)
         }
 
-        reconcileSections(project.sections, on: local)
-    }
-
-    /// Bring the project's local section list into agreement with the
-    /// wire payload. Any local section whose id is not in the wire set
-    /// is deleted (the server only emits the canonical set per project,
-    /// so anything missing locally got removed server-side). Existing
-    /// sections are mutated in place; new ones are inserted.
-    private func reconcileSections(_ wireSections: [SectionDTO], on project: LocalProject) {
-        let projectID = project.id
-        let wantedIDs = Set(wireSections.map { LocalSection.makeID(projectID: projectID, slug: $0.slug) })
-
-        // Delete sections that no longer exist server-side. The server
-        // only returns the canonical section list per project, so the
-        // absence of a slug means it was removed upstream.
-        for existing in project.sections where !wantedIDs.contains(existing.id) {
-            modelContext.delete(existing)
-        }
-
-        // Upsert each wire section. Build a slug -> local lookup once
-        // (keyed off the post-delete state) so the inner loop stays
-        // O(1) per wire entry — a per-section fetch would be O(n*m).
-        // Note that `project.sections` may still include rows we just
-        // marked for deletion; SwiftData removes them on save. The
-        // slug-set check above guarantees those rows aren't picked up
-        // here because their slug isn't in `wantedIDs`.
-        let currentBySlug = Dictionary(
-            project.sections
-                .filter { wantedIDs.contains($0.id) }
-                .map { ($0.slug, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        for wire in wireSections {
-            if let local = currentBySlug[wire.slug] {
-                local.name = wire.name
-                local.position = wire.position
-            } else {
-                let composite = LocalSection.makeID(projectID: projectID, slug: wire.slug)
-                let local = LocalSection(
-                    id: composite,
-                    slug: wire.slug,
-                    name: wire.name,
-                    position: wire.position,
-                    project: project
-                )
-                modelContext.insert(local)
-            }
-        }
+        // M45 Wave 2: section reconcile lives on `LocalProject` so the
+        // MutationQueue project-create echo path can share it. The diff
+        // is idempotent (slug-keyed lookup mutates in place rather than
+        // inserting duplicates), so it's safe whether the sections row
+        // set is empty (fresh insert), already populated (subsequent
+        // sync), or partially populated (B1 race with create echo).
+        LocalProject.reconcileSections(project.sections, on: local, in: modelContext)
     }
 
     // MARK: - Note upsert
