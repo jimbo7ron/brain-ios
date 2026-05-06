@@ -274,6 +274,16 @@ final class ProjectRepositoryTests: XCTestCase {
 
         let sectionSlugs = Set(renamed.sections.map(\.slug))
         XCTAssertEqual(sectionSlugs, ["now", "next", "later"])
+
+        // Locks in the M45 Wave 2 ordering fix: `adoptServerID` must
+        // run BEFORE the section reconcile closure, so the composite
+        // ids carry the server-side project prefix. If the rename
+        // ran last, sections would land keyed on the client UUID and
+        // the next SyncEngine pass would delete + reinsert them all.
+        XCTAssertTrue(
+            renamed.sections.allSatisfy { $0.id.hasPrefix(serverID + ":") },
+            "Section composite-ids must use the server-side project id, not the client UUID"
+        )
     }
 
     /// B1-style idempotency: if SyncEngine's delta-fetch beat the
@@ -356,5 +366,16 @@ final class ProjectRepositoryTests: XCTestCase {
         let nowRow = allSections.first { $0.slug == "now" }
         XCTAssertEqual(nowRow?.name, "Now")
         XCTAssertEqual(nowRow?.position, 0)
+
+        // Same invariant as testProjectCreate_reconcileMirrorsServerSections:
+        // every surviving section must carry the server-side prefix,
+        // even when sync-race pre-existing rows were keyed on the
+        // client UUID. The Wave 2 fix renames the project before the
+        // section reconcile so the wantedIDs / wireSection insert
+        // path produces server-prefixed composite ids.
+        XCTAssertTrue(
+            allSections.allSatisfy { $0.id.hasPrefix(serverID + ":") },
+            "All section composite-ids must carry the server-side project prefix after reconcile"
+        )
     }
 }

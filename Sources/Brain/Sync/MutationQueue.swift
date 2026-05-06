@@ -599,17 +599,25 @@ final class MutationQueue {
     ///      `@Attribute(.unique)` constraint. Save immediately so the
     ///      unique slot is freed before the rename claims it.
     ///
-    ///   4. **Field copy** — invoke `copyFields` to mirror server-
+    ///   4. **adoptServerID** — rename the stub's `id` String column
+    ///      from `clientId` to `serverId`. SwiftData's
+    ///      `@Attribute(.unique)` is rechecked on save, but the
+    ///      uniqueness slot is already free thanks to step 3. Has to
+    ///      happen BEFORE the field copy (step 5) so any closure work
+    ///      that derives child-record ids from `stub.id` (notably
+    ///      `LocalProject.reconcileSections`, which builds
+    ///      `LocalSection.id` as `"<project.id>:<slug>"`) sees the
+    ///      server id, not the about-to-be-discarded client UUID.
+    ///      Otherwise the next SyncEngine pass would re-key every
+    ///      child row, costing a delete + reinsert and a transient
+    ///      `@Query` re-emit.
+    ///
+    ///   5. **Field copy** — invoke `copyFields` to mirror server-
     ///      derived fields onto the stub. The closure is per-entity so
     ///      we don't try to fold ~22-field note copies and ~7-field
     ///      project copies (with M26 default-section reconcile) under
     ///      a single contract that fits neither. The closure must NOT
-    ///      mutate `stub.id` — that's the ceremony's job in step 5.
-    ///
-    ///   5. **adoptServerID** — rename the stub's `id` String column
-    ///      from `clientId` to `serverId`. SwiftData's
-    ///      `@Attribute(.unique)` is rechecked on save, but the
-    ///      uniqueness slot is already free thanks to step 3.
+    ///      mutate `stub.id` — that's the ceremony's job in step 4.
     ///
     /// The final `modelContext.save()` is the caller's responsibility —
     /// `replay()` already calls `try modelContext.save()` after the
@@ -694,13 +702,22 @@ final class MutationQueue {
             }
         }
 
-        // Per-entity field copy first, then rename. Doing the rename
-        // last means the stub's identity is stable for the duration of
-        // the field copy — important for any closures that capture
-        // `stub.id` (none today, but cheap to preserve as an
-        // invariant).
-        copyFields(stub)
+        // Rename first, then per-entity field copy. The closure may
+        // touch child records whose composite-id includes
+        // `stub.id` as a prefix (M45 Wave 2: `LocalProject`'s
+        // `reconcileSections` builds `LocalSection.id` as
+        // `"\(project.id):\(slug)"`). If the rename ran AFTER the
+        // closure, the optimistic stub's child rows would land keyed
+        // on the client UUID; the next SyncEngine pass would then
+        // compute `wantedIDs` with the server-prefix, find no match,
+        // and delete + reinsert every child — wasted work plus a
+        // transient `@Query` re-emit that flickers any view bound to
+        // the relationship. Renaming first keeps the prefix stable.
+        // Safe for `LocalNote` too: `copyFields(from:parseDate:)`
+        // never reads `self.id`, and the dupe-delete + save above
+        // already freed the unique-id slot.
         stub.adoptServerID(serverId)
+        copyFields(stub)
 
         // M45 Wave 1: per-row status follows the rename. The
         // repository wrote `.pending` keyed on the client UUID at
