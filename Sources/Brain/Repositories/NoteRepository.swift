@@ -95,16 +95,37 @@ final class NoteRepository {
             if project == "unassigned" { return nil }
             return UUID(uuidString: project) != nil ? project : nil
         }()
+
+        // Mirror QuickAddView's optimistic seeding (review fix from
+        // M45 Wave 1): if the caller didn't provide a title, derive
+        // one from the content via the same `QuickAddParser` the view
+        // would have used. Same for tags — the server's NoteCreate
+        // schema doesn't accept a `tags` field (the server derives
+        // them from `content` via M26's NLP pipeline), so seeding
+        // them locally just keeps the optimistic row's tag chips
+        // rendered until the create echo lands. The server's
+        // authoritative tag set arrives via the next sync.
+        let parsed = QuickAddParser.parse(payload.content)
+        let optimisticTitle: String? = {
+            if let supplied = payload.title?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !supplied.isEmpty {
+                return supplied
+            }
+            let derived = parsed.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            return derived.isEmpty ? nil : derived
+        }()
+        let optimisticTagsCSV = parsed.tags.joined(separator: ",")
+
         let stub = LocalNote(
             id: clientID,
             shortId: "",
-            title: payload.title,
+            title: optimisticTitle,
             content: payload.content,
             type: payload.type,
             archived: false,
             createdAt: now,
             updatedAt: now,
-            tagsCSV: "",
+            tagsCSV: optimisticTagsCSV,
             dueDate: payload.dueDate,
             dueTime: payload.dueTime,
             completed: false,
@@ -178,6 +199,16 @@ final class NoteRepository {
         let base = note.updatedAt
 
         if let content = fields.content { note.content = content }
+        if let title = fields.title {
+            // Empty title locally surfaces as nil (matches existing
+            // EditTodoView optimistic semantics); wire payload still
+            // ships the empty string so the server clears its title.
+            note.title = title.isEmpty ? nil : title
+        }
+        if let url = fields.url {
+            // Empty URL clears locally (matches EditTodoView).
+            note.url = url.isEmpty ? nil : url
+        }
         if let dueDate = fields.dueDate {
             // The wire convention is "none" to clear; on the local
             // model we mirror that as nil so the @Query / list filters
@@ -208,6 +239,15 @@ final class NoteRepository {
         if let section = fields.section {
             note.section = section.isEmpty ? nil : section
         }
+        if let startTime = fields.startTime {
+            note.appointmentStartTime = startTime.isEmpty ? nil : startTime
+        }
+        if let endTime = fields.endTime {
+            note.appointmentEndTime = endTime.isEmpty ? nil : endTime
+        }
+        if let location = fields.location {
+            note.appointmentLocation = location.isEmpty ? nil : location
+        }
         note.updatedAt = Date()
 
         do {
@@ -221,15 +261,15 @@ final class NoteRepository {
         // changed and nothing more.
         let payload = UpdateNotePayload(
             content: fields.content,
-            title: nil, // not part of NoteUpdateFields per spec §6.1
+            title: fields.title,
             dueDate: fields.dueDate,
             priority: fields.priority,
             project: fields.projectId,
             section: fields.section,
-            url: nil,
-            startTime: nil,
-            endTime: nil,
-            location: nil
+            url: fields.url,
+            startTime: fields.startTime,
+            endTime: fields.endTime,
+            location: fields.location
         )
 
         guard let body = try? JSONEncoder().encode(payload) else {

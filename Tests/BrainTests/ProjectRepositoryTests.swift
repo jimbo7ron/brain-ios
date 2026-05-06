@@ -94,6 +94,73 @@ final class ProjectRepositoryTests: XCTestCase {
         }
     }
 
+    /// M45 Wave 1 review fix: `unarchive` is the symmetric pair to
+    /// `archive`, mirroring `NoteRepository`. Unlike notes, the server
+    /// has a working endpoint (PUT carries `archived: false`), so the
+    /// repo enqueues a real `.updateProject` op.
+    func testProjectUnarchive_flipsLocal() throws {
+        let (_, repo, queue, _, repoContext) = try makeFixture()
+
+        let project = LocalProject(
+            id: "88888888-8888-8888-8888-888888888888",
+            shortId: "p3",
+            name: "Old project",
+            sortOrder: 0,
+            archived: true
+        )
+        repoContext.insert(project)
+        try repoContext.save()
+
+        repo.unarchive(project)
+
+        // Local flip happened immediately.
+        XCTAssertFalse(project.archived)
+
+        // Queue holds an .updateProject row carrying `archived: false`.
+        let queueRows = try queue.debugModelContext.fetch(
+            FetchDescriptor<MutationQueueItem>()
+        )
+        XCTAssertEqual(queueRows.count, 1)
+        XCTAssertEqual(queueRows.first?.op, MutationOp.updateProject.rawValue)
+        XCTAssertEqual(queueRows.first?.resourceId, project.id)
+        guard let body = queueRows.first?.payload else {
+            XCTFail("queue row missing payload")
+            return
+        }
+        // `UpdateProjectPayload` is Encodable-only. Verify the wire
+        // payload via `JSONSerialization`.
+        guard
+            let json = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+        else {
+            XCTFail("queue payload not a JSON object")
+            return
+        }
+        XCTAssertEqual(json["archived"] as? Bool, false)
+    }
+
+    /// `unarchive` on an already-non-archived project is a no-op —
+    /// matches `archive`'s guard and avoids enqueuing a wasted PUT.
+    func testProjectUnarchive_noOpWhenAlreadyActive() throws {
+        let (_, repo, queue, _, repoContext) = try makeFixture()
+
+        let project = LocalProject(
+            id: "99999999-9999-9999-9999-999999999999",
+            shortId: "p4",
+            name: "Active project",
+            sortOrder: 0,
+            archived: false
+        )
+        repoContext.insert(project)
+        try repoContext.save()
+
+        repo.unarchive(project)
+
+        let queueRows = try queue.debugModelContext.fetch(
+            FetchDescriptor<MutationQueueItem>()
+        )
+        XCTAssertEqual(queueRows.count, 0)
+    }
+
     // MARK: - Section direct-call path (Wave 4 will refactor)
 
     /// Spec §8.6: `addSection` is direct-call in Wave 1. Verify the

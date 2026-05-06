@@ -208,6 +208,156 @@ final class NoteRepositoryTests: XCTestCase {
         XCTAssertEqual(queueRows.first?.baseUpdatedAt, baseUpdated)
     }
 
+    /// M45 Wave 1 review fix: `NoteUpdateFields` was expanded to cover
+    /// every field `EditTodoView.save()` already mutates (`title`,
+    /// `url`, `startTime`, `endTime`, `location`). Verify all fields
+    /// land on the local stub AND on the encoded queue payload so
+    /// Wave 2-3's view migration doesn't accidentally drop any.
+    func testUpdate_appliesAllFields() throws {
+        let (_, repo, queue, _, repoContext) = try makeFixture()
+
+        let serverID = "66666666-6666-6666-6666-666666666666"
+        let baseUpdated = Date(timeIntervalSinceReferenceDate: 0)
+        let note = LocalNote(
+            id: serverID,
+            shortId: "abc",
+            title: "old title",
+            content: "old content",
+            type: "appointment",
+            createdAt: baseUpdated,
+            updatedAt: baseUpdated,
+            priority: "low",
+            url: "https://old.example.com",
+            appointmentStartTime: "2026-01-01T09:00:00Z",
+            appointmentEndTime: "2026-01-01T10:00:00Z",
+            appointmentLocation: "old place"
+        )
+        repoContext.insert(note)
+        try repoContext.save()
+
+        let fields = NoteUpdateFields(
+            content: "new content",
+            title: "new title",
+            url: "https://new.example.com",
+            dueDate: "2026-12-31",
+            dueTime: "09:30",
+            priority: "high",
+            recurrence: "weekly",
+            projectId: "77777777-7777-7777-7777-777777777777",
+            section: "later",
+            startTime: "2026-02-02T11:00:00Z",
+            endTime: "2026-02-02T12:00:00Z",
+            location: "new place"
+        )
+        repo.update(note, fields)
+
+        // Local apply — every field reflected on the stub.
+        XCTAssertEqual(note.content, "new content")
+        XCTAssertEqual(note.title, "new title")
+        XCTAssertEqual(note.url, "https://new.example.com")
+        XCTAssertEqual(note.dueDate, "2026-12-31")
+        XCTAssertEqual(note.dueTime, "09:30")
+        XCTAssertEqual(note.priority, "high")
+        XCTAssertEqual(note.recurrence, "weekly")
+        XCTAssertEqual(note.projectId, "77777777-7777-7777-7777-777777777777")
+        XCTAssertEqual(note.section, "later")
+        XCTAssertEqual(note.appointmentStartTime, "2026-02-02T11:00:00Z")
+        XCTAssertEqual(note.appointmentEndTime, "2026-02-02T12:00:00Z")
+        XCTAssertEqual(note.appointmentLocation, "new place")
+
+        // Queue payload carries every non-nil field — decode it and
+        // verify each made the wire trip. Catches a regression where a
+        // future field is added to `NoteUpdateFields` but not threaded
+        // through to `UpdateNotePayload`.
+        let queueRows = try queue.debugModelContext.fetch(
+            FetchDescriptor<MutationQueueItem>()
+        )
+        XCTAssertEqual(queueRows.count, 1)
+        guard let body = queueRows.first?.payload else {
+            XCTFail("queue row missing payload")
+            return
+        }
+        // `UpdateNotePayload` is Encodable-only (wire DTOs are
+        // one-direction by design). Read the encoded JSON via
+        // `JSONSerialization` so we can assert each snake_case key
+        // independently.
+        guard
+            let json = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+        else {
+            XCTFail("queue payload not a JSON object")
+            return
+        }
+        XCTAssertEqual(json["content"] as? String, "new content")
+        XCTAssertEqual(json["title"] as? String, "new title")
+        XCTAssertEqual(json["url"] as? String, "https://new.example.com")
+        XCTAssertEqual(json["due_date"] as? String, "2026-12-31")
+        XCTAssertEqual(json["priority"] as? String, "high")
+        XCTAssertEqual(json["project"] as? String, "77777777-7777-7777-7777-777777777777")
+        XCTAssertEqual(json["section"] as? String, "later")
+        XCTAssertEqual(json["start_time"] as? String, "2026-02-02T11:00:00Z")
+        XCTAssertEqual(json["end_time"] as? String, "2026-02-02T12:00:00Z")
+        XCTAssertEqual(json["location"] as? String, "new place")
+    }
+
+    /// M45 Wave 1 review fix: the optimistic stub seeds `tagsCSV` and
+    /// a derived `title` so the row's chips/title don't flicker between
+    /// create and the server's reconcile. Verify both happen at the
+    /// repo layer (not just in QuickAddView).
+    func testCreate_seedsTagsAndTitle() throws {
+        let (_, repo, _, _, _) = try makeFixture()
+
+        // Content with an inline hashtag and a bare title; the
+        // QuickAddParser strips the hashtag and the cleaned title is
+        // what the optimistic row should display.
+        let payload = CreateNotePayload(
+            content: "buy milk #grocery",
+            title: nil,
+            type: "todo",
+            dueDate: nil,
+            dueTime: nil,
+            priority: nil,
+            recurrence: nil,
+            project: nil,
+            section: nil,
+            url: nil,
+            startTime: nil,
+            endTime: nil,
+            location: nil
+        )
+        let stub = repo.create(payload)
+
+        // Tag chip ready to render before any server reconcile.
+        XCTAssertEqual(stub.tagsCSV, "grocery")
+        // Derived title — parser strips the hashtag, leaving "buy milk".
+        XCTAssertEqual(stub.title, "buy milk")
+    }
+
+    /// Caller-supplied title should win over the derived one — we
+    /// don't want to silently overwrite an explicit title.
+    func testCreate_explicitTitleWinsOverDerived() throws {
+        let (_, repo, _, _, _) = try makeFixture()
+
+        let payload = CreateNotePayload(
+            content: "free-form content #tagged",
+            title: "Explicit Title",
+            type: "todo",
+            dueDate: nil,
+            dueTime: nil,
+            priority: nil,
+            recurrence: nil,
+            project: nil,
+            section: nil,
+            url: nil,
+            startTime: nil,
+            endTime: nil,
+            location: nil
+        )
+        let stub = repo.create(payload)
+        XCTAssertEqual(stub.title, "Explicit Title")
+        // Tags are still derived even when title is supplied.
+        XCTAssertEqual(stub.tagsCSV, "tagged")
+    }
+
     // MARK: - Archive
 
     /// Spec §6.1: `repo.archive` flips `archived = true` locally and

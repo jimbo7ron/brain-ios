@@ -207,6 +207,52 @@ final class ProjectRepository {
         )
     }
 
+    /// Optimistically set `archived = false` and enqueue an
+    /// `.updateProject` carrying `archived: false`. Symmetric with
+    /// `archive(_:)` and mirrors `NoteRepository.unarchive` —
+    /// added in the M45 Wave 1 review pass so Wave 3 view migrations
+    /// have the matching pair without a contract change.
+    ///
+    /// **Server endpoint**: unlike notes, the server's `ProjectUpdate`
+    /// schema *does* carry an `archived` field (verified against
+    /// `brain/src/brain/schemas.py:ProjectUpdate` and
+    /// `server.py:2219-2220`), so we enqueue a real `.updateProject`
+    /// op rather than NSLog-and-skip. The server will flip
+    /// `projects.archived` back to false when the queue replays the
+    /// PUT.
+    func unarchive(_ project: LocalProject) {
+        guard project.archived else { return }
+        let base = project.updatedAt
+        project.archived = false
+        project.updatedAt = Date()
+
+        do {
+            try modelContext.save()
+        } catch {
+            NSLog("ProjectRepository.unarchive: save failed for \(project.id): \(error)")
+        }
+
+        let payload = UpdateProjectPayload(
+            name: nil,
+            color: nil,
+            sortOrder: nil,
+            archived: false
+        )
+
+        guard let body = try? JSONEncoder().encode(payload) else {
+            NSLog("ProjectRepository.unarchive: failed to encode payload for \(project.id)")
+            return
+        }
+
+        enqueue(
+            op: .updateProject,
+            resourceType: "project",
+            resourceId: project.id,
+            payload: body,
+            baseUpdatedAt: base
+        )
+    }
+
     // MARK: - Section ops (multi-step)
 
     /// Append a section to a project. Wave 1 ships this as a direct-
