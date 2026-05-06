@@ -46,6 +46,30 @@ targets:
         # archiving for TestFlight / App Store distribution.
         CODE_SIGN_ENTITLEMENTS: Brain.entitlements
 
+  # M45 Wave 1: first XCTest target for brain-ios. Hosts the new
+  # Repository + MutationStatusStore unit tests under
+  # `Tests/BrainTests/`. Linked against the `Brain` app target via
+  # `dependencies` + `TEST_HOST` so `@testable import brain` reaches
+  # the internal types (NoteRepository, MutationStatusStore, etc.).
+  BrainTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Tests/BrainTests
+    dependencies:
+      - target: Brain
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.mindkeeper.brain.tests
+        GENERATE_INFOPLIST_FILE: YES
+        # Standard host pattern for an iOS app's XCTest bundle —
+        # injects the unit-test bundle into the Brain.app process so
+        # `@testable import brain` resolves and SwiftData /
+        # ModelContainer behave the same way they do in production.
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/brain.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/brain
+        BUNDLE_LOADER: $(TEST_HOST)
+
 # OS_ACTIVITY_MODE=disable silences the unified-logging spam from
 # CFNetwork, libsystem_*, CoreData, hapticpatternlibrary, RTI, etc.
 # in the Xcode debug console. The brain app's own NSLog/print calls
@@ -57,7 +81,15 @@ schemes:
     build:
       targets:
         Brain: all
+        BrainTests: [test]
     run:
       config: Debug
       environmentVariables:
         OS_ACTIVITY_MODE: disable
+    # M45 Wave 1: test action runs the BrainTests bundle. Invoked via
+    # `xcodebuild test -project Brain.xcodeproj -scheme Brain ...` so
+    # the Brain scheme is the single entry point for both build + test.
+    test:
+      config: Debug
+      targets:
+        - BrainTests

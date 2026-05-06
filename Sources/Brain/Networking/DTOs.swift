@@ -320,6 +320,94 @@ struct CreateProjectPayload: Encodable, Hashable {
     }
 }
 
+/// Typed diff for `NoteRepository.update(...)` (M45 Wave 1). Every
+/// field is optional; the repository serialises only the non-nil fields
+/// onto the wire `UpdateNotePayload` and ships them as the queue
+/// payload. Lives next to `CreateNotePayload` because it's the create-
+/// shape's update-shape sibling — same field surface, all-optional.
+///
+/// Why a separate struct from `UpdateNotePayload`:
+///   * `UpdateNotePayload` is the wire shape (snake_case, matches
+///     `brain/src/brain/schemas.py:NoteUpdate` 1:1). The repository
+///     contract sits one level above the wire — view callers shouldn't
+///     have to know the server's PATCH shape.
+///   * `NoteUpdateFields` carries iOS-side concepts the wire shape
+///     doesn't (e.g. a future `due_time` will land here as a typed
+///     `Date?` first, then get formatted to `"HH:MM"` on the way to
+///     the server). For Wave 1 the two are near-twins; the divergence
+///     starts in Wave 3 when typed fields land.
+///
+/// Field set (per M45 spec §6.1): `content`, `title`, `url`,
+/// `dueDate`, `priority`, `projectId`, `section`, plus the appointment
+/// trio (`startTime`, `endTime`, `location`). All optional — only
+/// non-nil fields are applied locally and sent in the update.
+///
+/// **Why no `dueTime` or `recurrence`**: the server's `NoteUpdate`
+/// schema (`brain/src/brain/schemas.py`) has no keys for either, so
+/// any value here would be silently dropped on the wire. Rather than
+/// a footgun for Wave 3 callers, the fields are omitted entirely.
+/// `LocalNote.dueTime` / `LocalNote.recurrence` still exist and are
+/// surfaced via the SyncEngine pull and other server-side write paths.
+///
+/// **Nullable-update semantics (Wave 1)**: the wire shape skips nil
+/// fields. To clear an existing value the caller passes a sentinel:
+///   * `dueDate: "none"` clears the due date (server convention).
+///   * `url: ""`, `section: ""`, `location: ""` are treated as clears
+///     locally; the wire ships the empty string and the server
+///     interprets it as a clear (or leaves the field alone, depending
+///     on the field — see `NoteUpdate` in
+///     `brain/src/brain/schemas.py`).
+///   * `projectId: "unassigned"` is the wire-side clear sentinel.
+/// A unified sentinel design (e.g. an explicit `.clear` enum case) is
+/// out of scope for Wave 1 — see TODO(M45 Wave 3) below.
+struct NoteUpdateFields: Hashable {
+    var content: String?
+    /// New title. Empty string is sent verbatim (server keeps the
+    /// title alongside `content`); pass nil to leave alone.
+    var title: String?
+    /// New URL. Empty string clears server-side per
+    /// `NoteUpdate.url` convention.
+    var url: String?
+    /// "yyyy-MM-dd", "today", "tomorrow", or `"none"` to clear.
+    var dueDate: String?
+    /// "low" | "medium" | "high".
+    var priority: String?
+    /// Project name, short id, or `"unassigned"` to clear.
+    var projectId: String?
+    /// Section slug.
+    var section: String?
+    // Appointment fields — populated when editing a "appointment"-type
+    // note. The wire shape carries `start_time` / `end_time` as
+    // ISO-8601 strings; we mirror that here rather than typed `Date`
+    // because the server stores them as flexible strings.
+    var startTime: String?
+    var endTime: String?
+    var location: String?
+    // TODO(M45 Wave 3): unify nullable-update semantics — replace the
+    // current mix of "none" / "" / "unassigned" sentinels with a typed
+    // `Optional<Optional<T>>` (`.some(nil)` = clear, `.none` = leave
+    // alone) or a per-field `.clear` enum. Wave 1 keeps the existing
+    // sentinel mix to match `UpdateNotePayload` 1:1; Wave 3's typed
+    // edit dialog migration is the natural place to clean this up.
+}
+
+/// Typed diff for `ProjectRepository.update(...)` (M45 Wave 1). Every
+/// field is optional; the repository serialises only the non-nil fields
+/// onto the wire `UpdateProjectPayload`. Same rationale as
+/// `NoteUpdateFields` — a repository-level diff that view callers can
+/// build without knowing the server's wire shape.
+///
+/// Field set (per M45 spec §6.2): `name`, `color`, `sortOrder`. The
+/// `archived` field stays out — `archive(_:)` is its own repository
+/// method per the spec (soft-delete is a distinct intent from a metadata
+/// patch).
+struct ProjectUpdateFields: Hashable {
+    var name: String?
+    /// Raw CSS colour string (e.g. `hsl(262 83% 58%)`).
+    var color: String?
+    var sortOrder: Int?
+}
+
 /// Body for `POST /api/v1/notes` — mirrors `NoteCreate` in
 /// `brain/src/brain/schemas.py`. Used by M39's quick-add flow to mint a
 /// todo (or, in future, an appointment) directly through the API. Every

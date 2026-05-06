@@ -91,6 +91,22 @@ final class MutationQueue {
     private let client: BrainAPIClient
     private let authSession: AuthSession
 
+    /// Optional per-row status tracker (M45 Wave 1). Wired in
+    /// `BrainApp.init` after both singletons exist so the queue can
+    /// notify the store of `pending → renamed → cleared` and
+    /// `pending → failed` transitions. Optional because many tests /
+    /// debug callers construct the queue without one — the queue must
+    /// keep working when the store is absent.
+    ///
+    /// **Why optional, not required:** `BrainDebugMutationQueue` and
+    /// the M45 unit tests construct a `MutationQueue` directly with
+    /// just (modelContext, client, authSession). Hard-requiring the
+    /// store would fan out a constructor argument across every call
+    /// site that doesn't care about UI status; making it optional
+    /// keeps the existing wiring untouched and lets the new wiring
+    /// land via a single line in `BrainApp.init`.
+    weak var statusStore: MutationStatusStore?
+
     // MARK: - Observable state
 
     /// True between the start and end of a `replay()` pass. The guard
@@ -223,12 +239,29 @@ final class MutationQueue {
                         serverNote: serverNote
                     )
                 }
+                // M45 Wave 1: capture the *post-reconcile* resource id
+                // before we delete the queue row. For create ops the
+                // reconcile above rewrote `item.resourceId` from the
+                // client UUID to the server id (B2 step); for non-
+                // create ops the id is unchanged. Either way, this is
+                // the key the status store is now keyed under after
+                // any rename, so it's the right key to clear.
+                let clearedId = item.resourceId
                 modelContext.delete(item)
                 try modelContext.save()
                 // Clear the surfaced error once we make any forward
                 // progress — keeps the UI from showing a stale failure
                 // string after the next attempt succeeds.
                 lastError = nil
+                // M45 Wave 1: success terminal of the per-row status
+                // lifecycle. The repository wrote `.pending` at enqueue;
+                // reconcile (if any) flipped the key to the server id;
+                // now the queue has confirmed the round-trip and the
+                // SwiftUI side has the canonical SwiftData row, so the
+                // pending indicator can come down. No-op when
+                // `statusStore` is nil — keeps tests / debug callers
+                // unencumbered (see the field doc-comment for why).
+                statusStore?.clear(clearedId)
             } catch let error as BrainAPIClient.Error {
                 switch error {
                 case .unauthorized:
@@ -626,6 +659,20 @@ final class MutationQueue {
         // invariant).
         copyFields(stub)
         stub.adoptServerID(serverId)
+
+        // M45 Wave 1: per-row status follows the rename. The
+        // repository wrote `.pending` keyed on the client UUID at
+        // enqueue; flipping the key to the server id here keeps any
+        // mid-flight UI indicator (Wave 4 territory) attached to the
+        // same SwiftData row across the rename. The corresponding
+        // *clear* fires in `replay()`'s success terminal — see the
+        // comment alongside `modelContext.delete(item)`. Splitting
+        // rename and clear matches the natural semantic boundary:
+        //   * reconcile completes the id transition (rename)
+        //   * replay's success terminal completes the lifecycle (clear)
+        // No-op when `statusStore` is nil (preview / test hosts that
+        // didn't wire the third singleton — see spec §8.3).
+        statusStore?.rename(clientId, to: serverId)
     }
 
     /// S1 rollback for the createTodo poison case. `.createTodo` is
@@ -660,6 +707,18 @@ final class MutationQueue {
         for item: MutationQueueItem,
         reason: some Error
     ) {
+        // M45 Wave 1: mark the resource as failed in the status store
+        // BEFORE deleting the stub (or returning early for non-create
+        // ops). Per spec §4.4, failed entries persist until the user
+        // dismisses, so the UI in Wave 4 can show "this row's mutation
+        // didn't land" before the row vanishes / reverts. We mark for
+        // every poison-class op (not just create), because non-create
+        // poisons (an `.archiveNote` 404 because the row was
+        // hard-deleted on web, an `.updateTodo` 422 from a malformed
+        // payload) also leave the user with stale local state worth
+        // surfacing. No-op when `statusStore` is nil.
+        statusStore?.mark(item.resourceId, .failed(reason))
+
         guard MutationOp(rawValue: item.op) == .createTodo else { return }
         let stubId = item.resourceId
         let descriptor: FetchDescriptor<LocalNote> = {
