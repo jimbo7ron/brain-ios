@@ -87,4 +87,21 @@ enum MutationOp: String, Codable, CaseIterable {
     /// `PATCH .../sections/{slug}` (rename); those land in their own
     /// cases when their UI flow ships.
     case addSection = "add_section"
+
+    /// (M45 Wave 4) `POST /api/v1/projects/{projectId}/sections` via the
+    /// Repository's optimistic create path. Differs from `.addSection`
+    /// (which was the M40 placeholder slug) in that the queue row's
+    /// `resourceId` is the composite `<projectID>:<tmp-slug>` so the
+    /// reconcile path can find the optimistic `LocalSection` stub and
+    /// rename it to the server's canonical slug. The wire payload is
+    /// `CreateSectionPayload` (`{name}`).
+    case createSection = "create_section"
+
+    /// (M45 Wave 4) `PATCH /api/v1/projects/{projectId}/sections/{slug}`
+    /// — rename a section. The server preserves `slug` server-side per
+    /// the M40 contract, so the composite id stays stable across the
+    /// rename; only the `name` column updates locally + on the wire.
+    /// Resource id is the composite `<projectID>:<slug>`. Wire payload
+    /// is `UpdateSectionPayload` (`{name}`).
+    case updateSection = "update_section"
 }

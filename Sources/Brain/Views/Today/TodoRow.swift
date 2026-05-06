@@ -40,6 +40,14 @@ struct TodoRow: View {
     /// SwiftUI previews still feel responsive — production never hits
     /// that branch.
     @Environment(\.noteRepository) private var noteRepository
+    /// M45 Wave 4 (spec §4.4 per-row indicator): observe the global
+    /// status store. Reading `status(for: note.id)` re-renders this
+    /// row whenever the dictionary mutates anywhere — at 50+ rows
+    /// that's coarse but acceptable for now (see `MutationStatusStore`
+    /// header for the rebuild-coarseness caveat). If profiling shows
+    /// it's a problem, switch to an `Equatable`-on-Status read or a
+    /// per-key Bindable wrapper.
+    @Environment(\.mutationStatusStore) private var mutationStatusStore
 
     /// Tracks whether a toggle is currently in flight. Prevents a
     /// rapid double-tap from firing two POSTs against the server
@@ -126,6 +134,15 @@ struct TodoRow: View {
             }
 
             Spacer(minLength: 0)
+
+            // M45 Wave 4: per-row status affordance. Pending rows get
+            // a small spinner (subtle — the row content is the primary
+            // signal); failed rows get a red exclamation glyph so a
+            // permanent failure surfaces inline rather than only in
+            // the queue-level pill. Both are no-rendered when the
+            // store has no entry for this id (which is the common
+            // case — fully reconciled rows clear).
+            statusIndicator
 
             if note.priority == "high" {
                 // Mirrors the web's high-priority indicator. Low /
@@ -256,6 +273,32 @@ struct TodoRow: View {
         // already landed, so the haptic fires alongside the visible
         // strike-through.
         BrainHaptics.light()
+    }
+
+    /// M45 Wave 4: per-row indicator overlay. Reads from the
+    /// MutationStatusStore on every render — the row keeps the
+    /// indicator attached across the create-echo's id rename because
+    /// the queue's `reconcileCreate<T:>` calls
+    /// `MutationStatusStore.rename(clientId, to: serverId)` in lock-
+    /// step. No-op when the store is missing (preview hosts) or when
+    /// the row's id isn't tracked.
+    @ViewBuilder
+    private var statusIndicator: some View {
+        if let status = mutationStatusStore?.status(for: note.id) {
+            switch status {
+            case .pending:
+                ProgressView()
+                    .controlSize(.mini)
+                    .accessibilityLabel("Saving")
+            case .failed:
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .accessibilityLabel("Save failed")
+            }
+        } else {
+            EmptyView()
+        }
     }
 
     /// Bottom-line metadata: due-date hint, then any tags. Matches

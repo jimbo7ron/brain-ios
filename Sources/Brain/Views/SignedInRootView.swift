@@ -45,6 +45,26 @@ struct SignedInRootView: View {
     }
 
     var body: some View {
+        rootContent
+            // M45 Wave 4: queue-level status pill (spec §4.4). Floats
+            // top-right above the per-tab nav bars so it's visible from
+            // every surface without having to inject into each
+            // `NavigationStack`'s toolbar. Hides itself when the queue
+            // is idle (no chrome unless there's something to surface).
+            .overlay(alignment: .topTrailing) {
+                MutationStatusPill(queue: mutationQueue)
+                    .padding(.trailing, 12)
+                    // Push down past the safe-area / nav-bar (~52pt
+                    // accounts for the standard nav-bar height plus
+                    // the status bar; the pill sits in the air right
+                    // of the nav-title without clipping).
+                    .padding(.top, 8)
+                    .allowsHitTesting(false)
+            }
+    }
+
+    @ViewBuilder
+    private var rootContent: some View {
         TabView(selection: $selectedTab) {
             TodayView()
                 .tabItem { Label("Today", systemImage: BrainSymbols.dueToday) }

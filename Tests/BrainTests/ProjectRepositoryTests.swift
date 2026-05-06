@@ -163,11 +163,195 @@ final class ProjectRepositoryTests: XCTestCase {
 
     // MARK: - Section direct-call path (Wave 4 will refactor)
 
-    /// Spec §8.6: `addSection` is direct-call in Wave 1. Verify the
-    /// optimistic local section insert succeeds without crashing — the
-    /// async server call fires in a Task and is allowed to fail
-    /// (no real server in tests). The test asserts on the local
-    /// SwiftData state, not the network.
+    /// Wave 4: optimistic local insert with a tmp-prefixed slug. The
+    /// queue picks up a `.createSection` row keyed on the composite
+    /// `<projectID>:<tmpSlug>` so the reconcile path can find it
+    /// later.
+    func testAddSection_optimisticInsertWithTmpSlug() throws {
+        let (_, repo, queue, store, repoContext) = try makeFixture()
+
+        let project = LocalProject(
+            id: "11111111-1111-1111-1111-111111111111",
+            shortId: "p9",
+            name: "Garden",
+            sortOrder: 0,
+            archived: false
+        )
+        repoContext.insert(project)
+        try repoContext.save()
+
+        let section = repo.addSection(to: project, name: "Pruning")
+        XCTAssertTrue(section.slug.hasPrefix(LocalSection.optimisticSlugPrefix))
+        XCTAssertEqual(section.id, LocalSection.makeID(projectID: project.id, slug: section.slug))
+        XCTAssertEqual(section.name, "Pruning")
+
+        // Queue holds a matching .createSection row keyed on the
+        // composite tmp-slug id.
+        let queueRows = try queue.debugModelContext.fetch(
+            FetchDescriptor<MutationQueueItem>()
+        )
+        XCTAssertEqual(queueRows.count, 1)
+        XCTAssertEqual(queueRows.first?.op, MutationOp.createSection.rawValue)
+        XCTAssertEqual(queueRows.first?.resourceId, section.id)
+        // Status pending under the composite id.
+        guard case .pending = store.status(for: section.id) else {
+            XCTFail("expected .pending under composite id after addSection")
+            return
+        }
+    }
+
+    /// Wave 4: server's create-echo response renames the composite id
+    /// to the canonical slug; pending mutation rows targeting the
+    /// tmp composite must be rewritten to the canonical composite.
+    func testAddSection_reconcileAdoptsServerSlug() throws {
+        let (_, repo, queue, _, repoContext) = try makeFixture()
+
+        let serverProjectID = "22222222-2222-2222-2222-222222222222"
+        let project = LocalProject(
+            id: serverProjectID,
+            shortId: "p10",
+            name: "Garden",
+            sortOrder: 0,
+            archived: false
+        )
+        repoContext.insert(project)
+        try repoContext.save()
+
+        let section = repo.addSection(to: project, name: "Pruning")
+        let tmpComposite = section.id
+
+        // Locate the queue row to hand to the reconcile.
+        guard
+            let createRow = try queue.debugModelContext.fetch(
+                FetchDescriptor<MutationQueueItem>()
+            ).first
+        else {
+            XCTFail("expected one queued row after addSection")
+            return
+        }
+
+        let canonicalSlug = "pruning"
+        let serverProject = Project(
+            id: serverProjectID,
+            shortId: "p10",
+            name: "Garden",
+            color: nil,
+            sortOrder: 0,
+            archived: false,
+            sections: [
+                SectionDTO(slug: canonicalSlug, name: "Pruning", position: 0),
+            ],
+            createdAt: nil,
+            updatedAt: nil
+        )
+
+        queue.debugReconcileCreateSectionResponse(
+            currentItem: createRow,
+            serverProject: serverProject
+        )
+        try queue.debugModelContext.save()
+
+        // Re-fetch on the repo context — composite id should be
+        // canonical now.
+        let canonicalComposite = LocalSection.makeID(
+            projectID: serverProjectID,
+            slug: canonicalSlug
+        )
+        let allSections = try repoContext.fetch(FetchDescriptor<LocalSection>())
+        XCTAssertEqual(allSections.count, 1)
+        XCTAssertEqual(allSections.first?.id, canonicalComposite)
+        XCTAssertEqual(allSections.first?.slug, canonicalSlug)
+        XCTAssertFalse(allSections.first?.isOptimistic ?? true)
+
+        // Tmp composite must no longer exist locally.
+        XCTAssertFalse(allSections.contains { $0.id == tmpComposite })
+    }
+
+    /// Wave 4: rename applies locally and enqueues `.updateSection`
+    /// against the section's composite id. Server preserves slug, so
+    /// the composite stays stable across the rename.
+    func testRenameSection_appliesLocalAndEnqueues() throws {
+        let (_, repo, queue, _, repoContext) = try makeFixture()
+
+        let projectID = "33333333-3333-3333-3333-333333333333"
+        let project = LocalProject(
+            id: projectID,
+            shortId: "p11",
+            name: "Garden",
+            sortOrder: 0,
+            archived: false
+        )
+        repoContext.insert(project)
+        let section = LocalSection(
+            id: LocalSection.makeID(projectID: projectID, slug: "pruning"),
+            slug: "pruning",
+            name: "Pruning",
+            position: 0,
+            project: project
+        )
+        repoContext.insert(section)
+        try repoContext.save()
+
+        repo.renameSection(section, to: "Heavy pruning")
+
+        XCTAssertEqual(section.name, "Heavy pruning")
+
+        let queueRows = try queue.debugModelContext.fetch(
+            FetchDescriptor<MutationQueueItem>()
+        )
+        XCTAssertEqual(queueRows.count, 1)
+        XCTAssertEqual(queueRows.first?.op, MutationOp.updateSection.rawValue)
+        XCTAssertEqual(queueRows.first?.resourceId, section.id)
+        guard let body = queueRows.first?.payload,
+              let payload = try? JSONDecoder().decode(UpdateSectionPayload.self, from: body)
+        else {
+            XCTFail("queue payload not a valid UpdateSectionPayload")
+            return
+        }
+        XCTAssertEqual(payload.name, "Heavy pruning")
+    }
+
+    /// Wave 4: when a section is still optimistic (the `.createSection`
+    /// hasn't reconciled), `renameSection` must NOT enqueue a separate
+    /// `.updateSection` against the tmp slug — instead, the rename
+    /// folds into the in-flight create's payload.
+    func testRenameSection_optimisticFoldsIntoCreatePayload() throws {
+        let (_, repo, queue, _, repoContext) = try makeFixture()
+
+        let project = LocalProject(
+            id: "44444444-4444-4444-4444-444444444444",
+            shortId: "p12",
+            name: "Garden",
+            sortOrder: 0,
+            archived: false
+        )
+        repoContext.insert(project)
+        try repoContext.save()
+
+        let section = repo.addSection(to: project, name: "Original name")
+        XCTAssertTrue(section.isOptimistic)
+
+        repo.renameSection(section, to: "Folded rename")
+
+        // Still only one queued row — the create — and its payload
+        // now carries the folded name.
+        let queueRows = try queue.debugModelContext.fetch(
+            FetchDescriptor<MutationQueueItem>()
+        )
+        XCTAssertEqual(queueRows.count, 1)
+        XCTAssertEqual(queueRows.first?.op, MutationOp.createSection.rawValue)
+        guard let body = queueRows.first?.payload,
+              let payload = try? JSONDecoder().decode(CreateSectionPayload.self, from: body)
+        else {
+            XCTFail("queue payload not a valid CreateSectionPayload")
+            return
+        }
+        XCTAssertEqual(payload.name, "Folded rename")
+    }
+
+    /// Wave 4: the pre-existing direct-call test (renamed). Verifies
+    /// the optimistic insert path doesn't crash even when the server
+    /// is unavailable (queue row stays parked locally).
     func testAddSection_insertsLocally() throws {
         let (_, repo, _, _, repoContext) = try makeFixture()
 
@@ -284,6 +468,117 @@ final class ProjectRepositoryTests: XCTestCase {
             renamed.sections.allSatisfy { $0.id.hasPrefix(serverID + ":") },
             "Section composite-ids must use the server-side project id, not the client UUID"
         )
+    }
+
+    // MARK: - Project update-response reconcile (M45 Wave 4 Part E)
+
+    /// Wave 4 Part E: the `.updateProject` PUT response should land on
+    /// the local project under the LWW guard. Single-pending case
+    /// applies the response.
+    func testProjectUpdateResponse_appliesWhenSinglePending() throws {
+        let (_, repo, queue, _, repoContext) = try makeFixture()
+
+        let serverID = "66666666-6666-6666-6666-666666666666"
+        let project = LocalProject(
+            id: serverID,
+            shortId: "p13",
+            name: "Old name",
+            sortOrder: 0,
+            archived: false,
+            updatedAt: Date().addingTimeInterval(-60)
+        )
+        repoContext.insert(project)
+        try repoContext.save()
+
+        repo.update(project, ProjectUpdateFields(name: "New name"))
+
+        // The repo enqueued one row. Hand it to the reconcile with a
+        // server response carrying the canonical state.
+        guard let pending = try queue.debugModelContext.fetch(
+            FetchDescriptor<MutationQueueItem>()
+        ).first else {
+            XCTFail("expected one queued row")
+            return
+        }
+
+        let serverProject = Project(
+            id: serverID,
+            shortId: "p13-server",
+            name: "Server-canonical name",
+            color: nil,
+            sortOrder: 7,
+            archived: false,
+            sections: [],
+            createdAt: nil,
+            updatedAt: nil
+        )
+
+        queue.debugReconcileUpdateProjectResponse(
+            currentItem: pending,
+            serverProject: serverProject
+        )
+        try queue.debugModelContext.save()
+
+        // Re-fetch on a fresh context to defeat per-context caching.
+        let storedOnQueue = try queue.debugModelContext.fetch(
+            FetchDescriptor<LocalProject>()
+        ).first
+        XCTAssertEqual(storedOnQueue?.name, "Server-canonical name")
+        XCTAssertEqual(storedOnQueue?.shortId, "p13-server")
+        XCTAssertEqual(storedOnQueue?.sortOrder, 7)
+    }
+
+    /// Wave 4 Part E: LWW guard — a second pending mutation against
+    /// the same project drops the response copy so the user's newer
+    /// edit isn't clobbered.
+    func testProjectUpdateResponse_lwwGuardDropsWhenNewerPending() throws {
+        let (_, repo, queue, _, repoContext) = try makeFixture()
+
+        let serverID = "77777777-7777-7777-7777-777777777777"
+        let project = LocalProject(
+            id: serverID,
+            shortId: "p14",
+            name: "Local newer",
+            sortOrder: 0,
+            archived: false
+        )
+        repoContext.insert(project)
+        try repoContext.save()
+
+        // First update (the one whose response we're reconciling).
+        repo.update(project, ProjectUpdateFields(name: "First edit"))
+        // Second update (the user's "newer" edit — still pending).
+        repo.update(project, ProjectUpdateFields(name: "Local newer"))
+
+        guard let firstQueued = try queue.debugModelContext.fetch(
+            FetchDescriptor<MutationQueueItem>(
+                sortBy: [SortDescriptor(\.createdAt, order: .forward)]
+            )
+        ).first else {
+            XCTFail("expected at least one queued row")
+            return
+        }
+
+        let serverProject = Project(
+            id: serverID,
+            shortId: "p14",
+            name: "Stale server response",
+            color: nil,
+            sortOrder: 0,
+            archived: false,
+            sections: [],
+            createdAt: nil,
+            updatedAt: nil
+        )
+
+        queue.debugReconcileUpdateProjectResponse(
+            currentItem: firstQueued,
+            serverProject: serverProject
+        )
+
+        // Local row should NOT have adopted the stale server response.
+        let stored = try repoContext.fetch(FetchDescriptor<LocalProject>()).first
+        XCTAssertEqual(stored?.name, "Local newer")
     }
 
     /// B1-style idempotency: if SyncEngine's delta-fetch beat the

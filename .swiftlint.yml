@@ -52,3 +52,18 @@ identifier_name:
     - y
 
 reporter: "xcode"
+
+# M45 Wave 4 (spec §5): enforce the "views never insert directly into
+# `ModelContext`" contract. All write paths must go through a
+# Repository (NoteRepository / ProjectRepository) so the optimistic
+# apply, queue enqueue, and status-store lifecycle are centralised.
+# The Repository / Sync modules are the legitimate insert sites.
+custom_rules:
+  no_modelcontext_insert_outside_repository:
+    name: "ModelContext.insert outside Repository"
+    regex: '\.modelContext\.insert\(|modelContext\.insert\('
+    included:
+      - "Sources/Brain/Views/.*"
+    message: "Use a Repository (NoteRepository / ProjectRepository) instead of inserting into the ModelContext directly. Spec: docs/M45-write-coordinator.md §5."
+    severity: warning
+

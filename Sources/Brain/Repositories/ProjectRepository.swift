@@ -255,31 +255,40 @@ final class ProjectRepository {
 
     // MARK: - Section ops (multi-step)
 
-    /// Append a section to a project. Wave 1 ships this as a direct-
-    /// call (NOT optimistic) because `LocalSection`'s composite id
-    /// (`projectID:slug`) doesn't fit the single-UUID `OptimisticStub`
-    /// protocol. Wave 4 will introduce an `OptimisticCompositeStub`
-    /// sibling and migrate this to the optimistic path; the spec
-    /// (§8.6) tracks the deferral.
+    /// Append a section to a project (M45 Wave 4). Optimistic-path
+    /// migration of the previous Wave-1 direct-call: mints a
+    /// `tmp-<uuid>`-prefixed placeholder slug, inserts the
+    /// `LocalSection` stub, and enqueues a `.createSection` row
+    /// targeting the composite id `<projectID>:<tmp-slug>`. The
+    /// queue's reconcile path (see
+    /// `MutationQueue.reconcileCreateSectionResponse`) finds the new
+    /// section in the server response by matching on the requested
+    /// `name`, renames the composite id from `tmp-<uuid>` to the
+    /// canonical server slug, and rewrites any pending mutation rows
+    /// targeting the temporary composite to the canonical one.
     ///
-    /// The async direct call returns the full project, so the next
-    /// sync delivery + change-coalescing rewrites the local
-    /// `LocalSection` set against the server's authoritative slug +
-    /// position. Returning a `LocalSection` placeholder for the caller
-    /// here means the UI (Wave 4) can stand in a row until the sync
-    /// arrives, but it's a best-effort stub and any caller that needs
-    /// the canonical server slug must wait for the next sync.
+    /// **Sync-race / parent-project safeguard:** if the parent
+    /// project's own create echo hasn't reconciled yet (rapid
+    /// "create project then add section before the create echo
+    /// returns"), the section's composite id would carry the *client*
+    /// project UUID, and the queue can't safely fire the section
+    /// create until the project rename lands. We detect this by
+    /// looking for a pending `.createProject` queue row keyed on the
+    /// parent's id and **fall back to a direct call** so the section
+    /// lands cleanly on the server-side project. Sync will deliver
+    /// the canonical section on the next foreground tick. Documented
+    /// in spec §8.6 / Wave 4 part A.
     @discardableResult
     func addSection(to project: LocalProject, name: String) -> LocalSection {
-        // Optimistic local insert with a placeholder slug derived from
-        // the name. The slug will be rewritten by the sync delta after
-        // the server's canonical slug ships back. This is best-effort
-        // — if a caller passes a name that the server rejects, the
-        // sync won't deliver a row to overwrite this one and the
-        // placeholder will sit until the user retries.
-        let placeholderSlug = "tmp-" + UUID().uuidString.lowercased().prefix(8)
+        let projectID = project.id
+        let placeholderSlug = LocalSection.optimisticSlugPrefix
+            + UUID().uuidString.lowercased().prefix(8)
+        let composite = LocalSection.makeID(
+            projectID: projectID,
+            slug: String(placeholderSlug)
+        )
         let section = LocalSection(
-            id: LocalSection.makeID(projectID: project.id, slug: String(placeholderSlug)),
+            id: composite,
             slug: String(placeholderSlug),
             name: name,
             position: project.sections.count,
@@ -290,47 +299,84 @@ final class ProjectRepository {
         do {
             try modelContext.save()
         } catch {
-            NSLog("ProjectRepository.addSection: save failed for \(project.id): \(error)")
+            NSLog("ProjectRepository.addSection: save failed for \(projectID): \(error)")
         }
 
-        // TODO(M45 Wave 4): migrate to OptimisticCompositeStub. See
-        // spec §4.5 / §8.6 for the composite-id rationale; the section
-        // case can't ride the `OptimisticStub` ceremony because
-        // `adoptServerID(_ String)` assumes a single-UUID identity.
-        guard let client else {
-            NSLog("ProjectRepository.addSection: no client; local-only insert.")
+        // Parent-project guard: if a `.createProject` is still pending
+        // for the parent, the project's own id is the client UUID and
+        // the server doesn't know about it yet. Fall back to direct
+        // call so the section lands on the server-side project; the
+        // local optimistic stub stays put and gets reconciled by the
+        // next sync delivery (sync's `reconcileSections` is
+        // idempotent against the slug-keyed lookup).
+        if let queue, let parentPending = queue.pendingMutation(forResourceId: projectID),
+           parentPending.op == MutationOp.createProject.rawValue {
+            NSLog(
+                "ProjectRepository.addSection: parent project \(projectID) " +
+                "still has a pending .createProject — falling back to direct " +
+                "call so the section attaches to the server-side project."
+            )
+            if let client {
+                Task { [client] in
+                    do {
+                        _ = try await client.addProjectSection(
+                            projectId: projectID,
+                            name: name
+                        )
+                    } catch {
+                        NSLog(
+                            "ProjectRepository.addSection: direct fallback " +
+                            "failed for \(projectID) / \(name): \(error)."
+                        )
+                    }
+                }
+            }
             return section
         }
-        Task { [client] in
-            do {
-                _ = try await client.addProjectSection(
-                    projectId: project.id,
-                    name: name
-                )
-                // Sync delta lands the canonical section; the
-                // placeholder above will be tombstoned by the sync
-                // engine's section reconcile (handled in `SyncEngine`).
-            } catch {
-                NSLog(
-                    "ProjectRepository.addSection: server call failed for " +
-                    "\(project.id) / \(name): \(error). Placeholder section " +
-                    "remains until next sync overwrites."
-                )
-            }
+
+        guard let body = try? JSONEncoder().encode(CreateSectionPayload(name: name)) else {
+            NSLog("ProjectRepository.addSection: failed to encode payload.")
+            return section
         }
+
+        enqueue(
+            op: .createSection,
+            resourceType: "section",
+            resourceId: composite,
+            payload: body,
+            baseUpdatedAt: nil
+        )
 
         return section
     }
 
-    /// Rename a section. Same direct-call rationale as `addSection` —
-    /// `LocalSection` keys on a composite id, the spec defers the
-    /// optimistic path to Wave 4. Apply the local rename and fire the
-    /// HTTP call; the sync delta reconciles the canonical state.
+    /// Rename a section (M45 Wave 4). Optimistic-path migration of
+    /// the Wave-1 direct-call: applies the new name locally and
+    /// enqueues a `.updateSection` row keyed on the section's
+    /// composite id `<projectID>:<slug>`.
+    ///
+    /// **Slug stability**: the brain server preserves the slug
+    /// server-side on rename (verified against
+    /// `BrainAPIClient.renameProjectSection`'s contract — the slug is
+    /// path-only, the body carries `{name}`). The reconcile path
+    /// re-mirrors the server's canonical sections via
+    /// `LocalProject.reconcileSections` so any drift in slug or
+    /// position is corrected in lock-step.
+    ///
+    /// **Optimistic-stub guard**: when the section is still
+    /// optimistic (`tmp-<uuid>` slug — the `.createSection` for it
+    /// hasn't reconciled yet), enqueueing an `.updateSection` against
+    /// the tmp composite would race the create. Instead, mutate the
+    /// optimistic local row's `name` in place — the create
+    /// reconcile's response carries the latest name (the server
+    /// extracts it from the request body), so the rename is
+    /// effectively folded into the in-flight create.
     func renameSection(_ section: LocalSection, to newName: String) {
         guard let project = section.project else {
             NSLog("ProjectRepository.renameSection: section has no project.")
             return
         }
+        let base = project.updatedAt
         section.name = newName
         project.updatedAt = Date()
         do {
@@ -342,28 +388,44 @@ final class ProjectRepository {
             )
         }
 
-        // TODO(M45 Wave 4): migrate to OptimisticCompositeStub.
-        guard let client else {
-            NSLog("ProjectRepository.renameSection: no client; local-only.")
-            return
-        }
-        let projectID = project.id
-        let slug = section.slug
-        Task { [client] in
-            do {
-                _ = try await client.renameProjectSection(
-                    projectId: projectID,
-                    slug: slug,
-                    name: newName
-                )
-            } catch {
+        // Optimistic-stub guard: the create echo for this section
+        // hasn't reconciled, so the queue still has a `.createSection`
+        // row targeting the tmp composite. We can't enqueue a
+        // .updateSection against a tmp slug (the server doesn't know
+        // it). The optimistic apply above is enough — the next replay
+        // of the .createSection will pick up the latest `section.name`
+        // because we never re-encode the body... wait — the payload
+        // is fixed at enqueue time. Best fallback: rewrite the queued
+        // .createSection row's payload to carry the new name. That
+        // way the eventual server create uses the renamed value.
+        if section.isOptimistic {
+            if let queue,
+               let pendingCreate = queue.pendingMutation(forResourceId: section.id),
+               pendingCreate.op == MutationOp.createSection.rawValue,
+               let body = try? JSONEncoder().encode(CreateSectionPayload(name: newName))
+            {
+                pendingCreate.payload = body
                 NSLog(
-                    "ProjectRepository.renameSection: server call failed " +
-                    "for \(projectID):\(slug): \(error). Local rename " +
-                    "remains until next sync."
+                    "ProjectRepository.renameSection: section \(section.id) " +
+                    "is still optimistic — folded the rename into the " +
+                    "pending .createSection payload."
                 )
             }
+            return
         }
+
+        guard let body = try? JSONEncoder().encode(UpdateSectionPayload(name: newName)) else {
+            NSLog("ProjectRepository.renameSection: failed to encode payload.")
+            return
+        }
+
+        enqueue(
+            op: .updateSection,
+            resourceType: "section",
+            resourceId: section.id,
+            payload: body,
+            baseUpdatedAt: base
+        )
     }
 
     /// Reorder a project's sections. Throws `unimplemented` per spec

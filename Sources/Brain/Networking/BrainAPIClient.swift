@@ -344,8 +344,23 @@ actor BrainAPIClient {
         // call site) shouldn't be able to inject path segments. UUIDs
         // are the only legal shape for the resources the queue
         // currently mutates.
-        guard let resourceId = Self.validateResourceId(item.resourceId) else {
-            throw Error.validationError(detail: "invalid resourceId on queue row: \(item.resourceId)")
+        // Validate the resource id shape based on the op. Most ops
+        // target a single-UUID resource (note / project) and run
+        // through the strict UUID validator. Section ops carry a
+        // composite `"<projectID>:<slug>"` (M45 Wave 4) so they
+        // validate component-wise inside their dispatch arm.
+        let resourceId: String
+        if let parsed = MutationOp(rawValue: item.op),
+           parsed == .createSection || parsed == .updateSection {
+            // Defer validation to the dispatch arm — it splits and
+            // validates `projectID` (UUID) + `slug` (non-empty,
+            // path-safe) before splicing into the URL.
+            resourceId = item.resourceId
+        } else {
+            guard let uuid = Self.validateResourceId(item.resourceId) else {
+                throw Error.validationError(detail: "invalid resourceId on queue row: \(item.resourceId)")
+            }
+            resourceId = uuid
         }
         guard let op = MutationOp(rawValue: item.op) else {
             // Unknown slug — almost certainly a downgrade from a build
@@ -423,10 +438,16 @@ actor BrainAPIClient {
         case .updateProject:
             // M40: PUT /api/v1/projects/{id}. Same shape as updateTodo;
             // the body is `UpdateProjectPayload` JSON encoded at
-            // enqueue. Note: this endpoint covers name/colour/sort_order
-            // /archived only — section editing rides separate endpoints
-            // and (for M40) is handled by direct API calls in
-            // `EditProjectView`, not the queue.
+            // enqueue.
+            //
+            // M45 Wave 4 (spec §4.3 deferred from Wave 3): the PUT
+            // response carries the canonical project after the server
+            // applied derivations (server-recomputed `updatedAt`,
+            // re-ordered sections list if a sort changed, etc.).
+            // Return it so the queue's replay path can apply it under
+            // the LWW guard via `reconcileUpdateProjectResponse` —
+            // mirrors the note update-response path that landed in
+            // Wave 3.
             let request = try makeRequest(
                 method: "PUT",
                 path: "/api/v1/projects/\(resourceId)",
@@ -434,8 +455,8 @@ actor BrainAPIClient {
                 requiresAuth: true,
                 idempotencyKey: key
             )
-            try await performIgnoringBody(request)
-            return nil
+            let project = try await perform(request, as: Project.self)
+            return .project(project)
         case .archiveNote:
             // M44.x: DELETE /api/v1/notes/{id} — the brain server treats
             // DELETE as soft-delete / archive (see `delete_note_endpoint`
@@ -468,6 +489,49 @@ actor BrainAPIClient {
             let request = try makeRequest(
                 method: "POST",
                 path: "/api/v1/projects",
+                body: item.payload,
+                requiresAuth: true,
+                idempotencyKey: key
+            )
+            let project = try await perform(request, as: Project.self)
+            return .project(project)
+        case .createSection:
+            // M45 Wave 4: POST /api/v1/projects/{projectId}/sections.
+            // The queue row's resourceId is the composite
+            // `"<projectID>:<tmp-slug>"`; we split out the projectID
+            // for the URL and validate it as a UUID before splicing.
+            // The wire body is the queue item's pre-encoded
+            // `CreateSectionPayload`. Server returns the full
+            // `Project` (with the new section appended); the
+            // reconcile path uses the response to rename the
+            // optimistic stub from `tmp-slug` to the canonical slug.
+            guard let split = Self.splitSectionCompositeID(resourceId) else {
+                throw Error.validationError(
+                    detail: "invalid composite section id: \(resourceId)"
+                )
+            }
+            let request = try makeRequest(
+                method: "POST",
+                path: "/api/v1/projects/\(split.projectID)/sections",
+                body: item.payload,
+                requiresAuth: true,
+                idempotencyKey: key
+            )
+            let project = try await perform(request, as: Project.self)
+            return .project(project)
+        case .updateSection:
+            // M45 Wave 4: PATCH /api/v1/projects/{projectId}/sections/{slug}.
+            // Server preserves the slug across rename, so the
+            // composite id is stable; reconcile only re-mirrors
+            // sections (name/position) onto the local project.
+            guard let split = Self.splitSectionCompositeID(resourceId) else {
+                throw Error.validationError(
+                    detail: "invalid composite section id: \(resourceId)"
+                )
+            }
+            let request = try makeRequest(
+                method: "PATCH",
+                path: "/api/v1/projects/\(split.projectID)/sections/\(split.slug)",
                 body: item.payload,
                 requiresAuth: true,
                 idempotencyKey: key
@@ -1066,6 +1130,27 @@ actor BrainAPIClient {
     fileprivate static func validateResourceId(_ raw: String) -> String? {
         guard let uuid = UUID(uuidString: raw) else { return nil }
         return uuid.uuidString.lowercased()
+    }
+
+    /// Split `LocalSection`'s composite id into the (UUID-validated)
+    /// project component and the slug component. Returns `nil` when
+    /// the composite is malformed (no colon, empty slug, or the
+    /// project component isn't a UUID). Used by the M45 Wave 4
+    /// `.createSection` / `.updateSection` dispatch arms before
+    /// splicing the components into a server URL.
+    fileprivate static func splitSectionCompositeID(_ raw: String) -> (projectID: String, slug: String)? {
+        guard let colon = raw.firstIndex(of: ":") else { return nil }
+        let projectPart = String(raw[..<colon])
+        let slug = String(raw[raw.index(after: colon)...])
+        guard !slug.isEmpty else { return nil }
+        // Path-safety: server slugs are lowercase alphanumeric +
+        // hyphen, plus the optimistic `tmp-<uuid>` shape. Reject
+        // anything else so a future bug can't smuggle path traversal
+        // into the URL.
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789-")
+        guard slug.unicodeScalars.allSatisfy(allowed.contains(_:)) else { return nil }
+        guard let projectUUID = validateResourceId(projectPart) else { return nil }
+        return (projectUUID, slug)
     }
 
     /// Wraps `URLSession.data(for:)` to convert URLError into our typed

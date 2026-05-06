@@ -121,6 +121,16 @@ final class MutationQueue {
     /// having to materialise a SwiftData `@Query` in the call site.
     private(set) var pendingCount: Int = 0
 
+    /// (M45 Wave 4) Count of poisoned queue rows — those stamped with
+    /// `nextRetryAt = .distantFuture` because the replayer hit a
+    /// permanent failure (404 / 422 / unknown op) or burned through
+    /// `maxAttempts` retries. Surfaced for the status pill so the UI
+    /// can render "↻ N pending / ⚠ M failed" without having to
+    /// materialise a SwiftData query at the call site. Refreshed
+    /// alongside `pendingCount` on every enqueue / replay / drop /
+    /// clear.
+    private(set) var failedCount: Int = 0
+
     /// User-facing copy for the most recent failure across the queue,
     /// or nil if everything is replaying / has replayed cleanly.
     /// Overwritten on every failure — surfacing only the latest matches
@@ -264,10 +274,38 @@ final class MutationQueue {
                         )
                     }
                 case .project(let serverProject):
-                    reconcileCreateProjectResponse(
-                        clientId: item.resourceId,
-                        serverProject: serverProject
-                    )
+                    // Discriminate by op: project creates run the
+                    // M45 Wave 2 reconcile, section ops (Wave 4)
+                    // run their own paths because the resourceId is
+                    // a composite `<projectID>:<slug>` rather than
+                    // a single UUID.
+                    switch MutationOp(rawValue: item.op) {
+                    case .createProject:
+                        reconcileCreateProjectResponse(
+                            clientId: item.resourceId,
+                            serverProject: serverProject
+                        )
+                    case .updateProject:
+                        reconcileUpdateProjectResponse(
+                            currentItem: item,
+                            serverProject: serverProject
+                        )
+                    case .createSection:
+                        reconcileCreateSectionResponse(
+                            currentItem: item,
+                            serverProject: serverProject
+                        )
+                    case .updateSection:
+                        reconcileUpdateSectionResponse(
+                            currentItem: item,
+                            serverProject: serverProject
+                        )
+                    default:
+                        NSLog(
+                            "MutationQueue: unexpected .project response for op \(item.op); " +
+                            "no reconcile applied."
+                        )
+                    }
                 case .none:
                     break
                 }
@@ -709,6 +747,277 @@ final class MutationQueue {
         }
     }
 
+    /// M45 Wave 4 (spec §4.3, deferred from Wave 3): apply the
+    /// server's canonical `Project` from a successful `.updateProject`
+    /// round-trip to the local row, but ONLY when no newer pending
+    /// mutation exists on the same resource. Mirrors
+    /// `reconcileUpdateResponse` (note path) — same LWW guard,
+    /// same field-copy contract — extended to also call
+    /// `LocalProject.reconcileSections` so server-side section drift
+    /// (slug regeneration, position changes) lands without waiting
+    /// for the next sync.
+    ///
+    /// **Known interaction**: archive flips ride `.updateProject` too
+    /// (per `ProjectRepository.archive`). The LWW guard would gate
+    /// off the response if another `.updateProject` is queued for the
+    /// same project (e.g. user edits metadata + flips archive in one
+    /// save); the next sync delta delivers the merged truth then.
+    /// Acceptable per §4.3 — server-derived fields may lag for one
+    /// sync cycle.
+    private func reconcileUpdateProjectResponse(
+        currentItem: MutationQueueItem,
+        serverProject: Project
+    ) {
+        let serverId = serverProject.id
+
+        // LWW guard: any other pending mutation targeting this
+        // resource means the user has enqueued a newer edit. Drop
+        // the response — applying it would clobber the queued
+        // newer edit's optimistic state.
+        let pendingDescriptor = FetchDescriptor<MutationQueueItem>(
+            predicate: #Predicate { $0.resourceId == serverId }
+        )
+        let allPending = (try? modelContext.fetch(pendingDescriptor)) ?? []
+        let otherPending = allPending.filter { $0 !== currentItem }
+        guard otherPending.isEmpty else {
+            NSLog(
+                "MutationQueue: dropping project update response for \(serverId) — " +
+                "\(otherPending.count) newer pending mutation(s) queued."
+            )
+            return
+        }
+
+        let stubDescriptor = LocalProject.makeFetchByID(serverId)
+        guard let stub = (try? modelContext.fetch(stubDescriptor))?.first else {
+            NSLog(
+                "MutationQueue: project update response for \(serverId) had no " +
+                "matching local row; next sync will reconcile."
+            )
+            return
+        }
+
+        stub.copyFields(from: serverProject, parseDate: parseServerDate)
+        // Reconcile sections too — the wire response carries the
+        // canonical list, and a server-side rename / position drift
+        // wouldn't otherwise land until the next sync.
+        LocalProject.reconcileSections(
+            serverProject.sections,
+            on: stub,
+            in: modelContext
+        )
+    }
+
+    /// M45 Wave 4: section create-echo reconcile (spec §7 / §8.6).
+    /// Differs from `reconcileCreateResponse` (note) and
+    /// `reconcileCreateProjectResponse` (project) because
+    /// `LocalSection`'s primary key is a composite
+    /// `"<projectID>:<slug>"`, not a single UUID — the W0
+    /// `OptimisticStub` ceremony's `adoptServerID(_ String)` doesn't
+    /// fit. Instead we run a tailored ceremony:
+    ///
+    ///   1. **Decode the requested name** from the queue row's
+    ///      payload (`CreateSectionPayload`). This is the load-bearing
+    ///      identifier the server canonicalised — the response is the
+    ///      full `Project`, and we find the new section by `name`
+    ///      match against the wire sections list. (Server enforces
+    ///      uniqueness on (project, name) via `name_to_slug` so the
+    ///      match is unambiguous in practice.)
+    ///
+    ///   2. **Find the optimistic stub** by composite id. The repo
+    ///      inserted it under `<projectID>:<tmp-slug>`; the queue
+    ///      row's `resourceId` is exactly that composite.
+    ///
+    ///   3. **B2 — rewrite pending mutations** targeting the tmp
+    ///      composite to point at the canonical composite. Without
+    ///      this an in-flight `.updateSection` (rename) enqueued
+    ///      after the create would 404 on the tmp slug.
+    ///
+    ///   4. **adoptServerID** — rename the stub's composite id (and
+    ///      its `slug` column in lock-step) to
+    ///      `<projectID>:<server-slug>`. Composite-stub variant of
+    ///      the W0 single-UUID rename. SwiftData's
+    ///      `@Attribute(.unique)` constraint is rechecked on save.
+    ///
+    ///   5. **Section reconcile** — call
+    ///      `LocalProject.reconcileSections(...)` against the full
+    ///      wire sections list to mirror name + position drift and
+    ///      land any sibling sections sync hasn't delivered yet.
+    ///
+    /// **Stub-missing branch**: if the optimistic stub is gone
+    /// (kill-9 + restart leaving the queue row stranded; or a
+    /// successful sync delta already inserted the canonical row
+    /// under the server slug while the create echo was in flight),
+    /// run B2 and the section reconcile and return — the
+    /// canonically-keyed row already represents the truth.
+    private func reconcileCreateSectionResponse(
+        currentItem: MutationQueueItem,
+        serverProject: Project
+    ) {
+        let composite = currentItem.resourceId
+        // Composite is `<projectID>:<tmp-slug>`. Split — if it's
+        // malformed something has gone catastrophically wrong; bail.
+        guard let colon = composite.firstIndex(of: ":") else {
+            NSLog("MutationQueue: malformed section composite id: \(composite)")
+            return
+        }
+        let projectID = String(composite[..<colon])
+
+        // Decode the original name we sent so we can find the
+        // server-canonicalised section in the response. If decoding
+        // fails (unlikely — we encoded the body ourselves at enqueue
+        // time) we still run the section reconcile as a best-effort
+        // mirror; the optimistic stub will sit with its tmp slug
+        // until the next sync drops it.
+        let requestedName = (try? JSONDecoder().decode(
+            CreateSectionPayload.self,
+            from: currentItem.payload
+        ))?.name
+
+        // Find the matching wire section by name. If the server has
+        // multiple sections with the same name (it shouldn't —
+        // server enforces unique slug-from-name per project), prefer
+        // the one whose slug DOESN'T already exist on the local
+        // project (i.e. the freshly-minted one).
+        let canonicalSlug: String? = {
+            guard let requestedName else { return nil }
+            let matches = serverProject.sections.filter { $0.name == requestedName }
+            // Pick the slug that isn't yet associated with a
+            // canonically-keyed local section — that's the new one.
+            // Falls back to first match if all are present (the
+            // request was a no-op rename collision; the server's
+            // dedupe just returned the existing row).
+            return matches.first?.slug
+        }()
+
+        // Find the local optimistic stub by tmp composite.
+        let stubDescriptor = LocalSection.makeFetchByID(composite)
+        let stub = (try? modelContext.fetch(stubDescriptor))?.first
+
+        // Find the parent project (it should already carry the
+        // server id by Wave 2 — the W0 ordering fix renamed it
+        // before any section reconcile fires). If missing we still
+        // attempt the reconcile against the wire sections via a
+        // best-effort lookup.
+        let projectDescriptor = LocalProject.makeFetchByID(projectID)
+        let localProject = (try? modelContext.fetch(projectDescriptor))?.first
+
+        if let stub, let canonicalSlug {
+            let canonicalComposite = LocalSection.makeID(
+                projectID: projectID,
+                slug: canonicalSlug
+            )
+
+            // B2: rewrite any queued mutations targeting the tmp
+            // composite to the canonical composite. Mirrors the
+            // single-UUID create-echo ceremony.
+            let pendingDescriptor = FetchDescriptor<MutationQueueItem>(
+                predicate: #Predicate { $0.resourceId == composite }
+            )
+            if let stalePending = try? modelContext.fetch(pendingDescriptor) {
+                for row in stalePending where row !== currentItem {
+                    row.resourceId = canonicalComposite
+                }
+            }
+
+            // B1: if a sync delta already inserted the canonical
+            // section under the server slug, delete it before the
+            // rename so the unique-id slot is freed. The about-to-
+            // be-renamed stub's name + position get refreshed by
+            // the section reconcile below regardless.
+            let dupeDescriptor = LocalSection.makeFetchByID(canonicalComposite)
+            if let dupe = (try? modelContext.fetch(dupeDescriptor))?.first,
+               dupe !== stub {
+                modelContext.delete(dupe)
+                do {
+                    try modelContext.save()
+                } catch {
+                    NSLog(
+                        "MutationQueue: section dupe-delete save failed " +
+                        "for tmp \(composite) -> canonical \(canonicalComposite): \(error)"
+                    )
+                }
+            }
+
+            stub.adoptServerID(canonicalComposite)
+
+            // Status store rename — keep any pending indicator
+            // attached across the composite-id rewrite.
+            statusStore?.rename(composite, to: canonicalComposite)
+        } else if let canonicalSlug {
+            // Stub missing branch — still rewrite pending mutations
+            // so a follow-on `.updateSection` against the tmp
+            // composite doesn't 404 on replay.
+            let canonicalComposite = LocalSection.makeID(
+                projectID: projectID,
+                slug: canonicalSlug
+            )
+            let pendingDescriptor = FetchDescriptor<MutationQueueItem>(
+                predicate: #Predicate { $0.resourceId == composite }
+            )
+            if let stalePending = try? modelContext.fetch(pendingDescriptor) {
+                for row in stalePending where row !== currentItem {
+                    row.resourceId = canonicalComposite
+                }
+            }
+            statusStore?.rename(composite, to: canonicalComposite)
+        }
+
+        // Mirror the full sections list so any siblings the wire
+        // payload carries land locally too. Idempotent against the
+        // just-renamed stub (slug-keyed lookup mutates in place).
+        if let localProject {
+            LocalProject.reconcileSections(
+                serverProject.sections,
+                on: localProject,
+                in: modelContext
+            )
+        }
+    }
+
+    /// M45 Wave 4: section update reconcile. Server preserves the
+    /// slug across rename, so the composite id is stable; we just
+    /// re-mirror the wire sections onto the local project to pick up
+    /// the canonical name + position. Idempotent against the LWW-
+    /// guard pattern (no second pending mutation against the same
+    /// composite means the server response is the freshest truth).
+    private func reconcileUpdateSectionResponse(
+        currentItem: MutationQueueItem,
+        serverProject: Project
+    ) {
+        let composite = currentItem.resourceId
+        guard let colon = composite.firstIndex(of: ":") else { return }
+        let projectID = String(composite[..<colon])
+
+        // LWW guard: any *other* pending mutation against this
+        // composite means the user has already enqueued a newer edit.
+        // Drop the response — applying it would clobber the local
+        // optimistic state of the queued newer edit. Mirrors the
+        // note update-response LWW guard.
+        let pendingDescriptor = FetchDescriptor<MutationQueueItem>(
+            predicate: #Predicate { $0.resourceId == composite }
+        )
+        let allPending = (try? modelContext.fetch(pendingDescriptor)) ?? []
+        let otherPending = allPending.filter { $0 !== currentItem }
+        guard otherPending.isEmpty else {
+            NSLog(
+                "MutationQueue: dropping section update response for \(composite) — " +
+                "\(otherPending.count) newer pending mutation(s) queued."
+            )
+            return
+        }
+
+        let projectDescriptor = LocalProject.makeFetchByID(projectID)
+        guard let localProject = (try? modelContext.fetch(projectDescriptor))?.first else {
+            NSLog("MutationQueue: section update reconcile: project \(projectID) missing locally")
+            return
+        }
+        LocalProject.reconcileSections(
+            serverProject.sections,
+            on: localProject,
+            in: modelContext
+        )
+    }
+
     /// Shared create-echo ceremony, generic over an `OptimisticStub`
     /// model. Performs the M45 Wave 0 sequence:
     ///
@@ -1043,12 +1352,29 @@ final class MutationQueue {
         lastError = nil
     }
 
-    /// Refresh `pendingCount` from SwiftData. Cheap — SwiftData runs a
-    /// `COUNT(*)` rather than materialising every row.
+    /// Refresh `pendingCount` and `failedCount` from SwiftData. Cheap
+    /// — SwiftData runs a `COUNT(*)` per fetch rather than
+    /// materialising every row. The two counts overlap: a poisoned
+    /// row is both pending (still on disk, won't auto-replay) and
+    /// failed (parked at `.distantFuture`). The status pill (M45
+    /// Wave 4) uses `failedCount` directly and computes "active
+    /// pending" as `pendingCount - failedCount`.
+    ///
+    /// (M45 Wave 4) Cannot use `#Predicate` on `Date == .distantFuture`
+    /// directly — the predicate macro doesn't accept the static
+    /// member. Compute against a sentinel timestamp captured into a
+    /// local `let` so the predicate compiles.
     private func refreshPendingCount() {
-        let descriptor = FetchDescriptor<MutationQueueItem>()
-        if let count = try? modelContext.fetchCount(descriptor) {
+        let totalDescriptor = FetchDescriptor<MutationQueueItem>()
+        if let count = try? modelContext.fetchCount(totalDescriptor) {
             pendingCount = count
+        }
+        let distantFuture = Date.distantFuture
+        let failedDescriptor = FetchDescriptor<MutationQueueItem>(
+            predicate: #Predicate { $0.nextRetryAt == distantFuture }
+        )
+        if let count = try? modelContext.fetchCount(failedDescriptor) {
+            failedCount = count
         }
     }
 }
@@ -1101,6 +1427,26 @@ extension MutationQueue {
     /// pass the live `MutationQueueItem` here.
     func debugReconcileUpdateResponse(currentItem: MutationQueueItem, serverNote: Note) {
         reconcileUpdateResponse(currentItem: currentItem, serverNote: serverNote)
+    }
+
+    /// (M45 Wave 4) Test-only entry point for the section create-
+    /// echo reconcile path. Lets `ProjectRepositoryTests` exercise
+    /// the composite-id rename + B2 pending-mutation rewrite without
+    /// standing up a mock client.
+    func debugReconcileCreateSectionResponse(currentItem: MutationQueueItem, serverProject: Project) {
+        reconcileCreateSectionResponse(currentItem: currentItem, serverProject: serverProject)
+    }
+
+    /// (M45 Wave 4) Test-only entry point for the section update
+    /// reconcile path.
+    func debugReconcileUpdateSectionResponse(currentItem: MutationQueueItem, serverProject: Project) {
+        reconcileUpdateSectionResponse(currentItem: currentItem, serverProject: serverProject)
+    }
+
+    /// (M45 Wave 4) Test-only entry point for the project update-
+    /// response reconcile path.
+    func debugReconcileUpdateProjectResponse(currentItem: MutationQueueItem, serverProject: Project) {
+        reconcileUpdateProjectResponse(currentItem: currentItem, serverProject: serverProject)
     }
 
     /// Test-only entry point for `rollbackOptimisticStateIfNeeded`.
