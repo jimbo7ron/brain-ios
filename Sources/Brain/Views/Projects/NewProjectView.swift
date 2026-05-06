@@ -36,8 +36,14 @@ import SwiftUI
 struct NewProjectView: View {
 
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.brainAPIClient) private var client
-    @Environment(\.syncEngine) private var syncEngine
+    /// M45 Wave 2: project create now goes through `ProjectRepository`
+    /// instead of the direct `await client.createProject(...)` round-
+    /// trip this view shipped with. The repository owns the optimistic
+    /// local insert + queue enqueue + status-store mark, so the new
+    /// project appears in the list instantly. The `\.brainAPIClient`
+    /// and `\.syncEngine` env-keys were removed — the repository owns
+    /// both responsibilities now.
+    @Environment(\.projectRepository) private var projectRepo
 
     @State private var name: String = ""
     @State private var selectedColorCSS: String?
@@ -124,7 +130,7 @@ struct NewProjectView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button {
-                        Task { await submit() }
+                        submit()
                     } label: {
                         if isCreating {
                             ProgressView()
@@ -138,17 +144,17 @@ struct NewProjectView: View {
         }
     }
 
-    /// Build the create payload, hit `POST /api/v1/projects`, then fire
-    /// a sync so the new row lands in SwiftData and the list view's
-    /// `@Query` re-renders before the user sees the dismissed sheet.
-    private func submit() async {
-        guard let client else {
-            // Should never happen in production — the environment is
-            // injected at the root scene. If it does, surface enough
-            // for the user to file a sensible bug report.
-            errorMessage = "Configuration error — please report."
-            return
-        }
+    /// Build the create payload and hand it to `ProjectRepository.create`,
+    /// which owns the optimistic local insert + queue enqueue. The
+    /// project list's `@Query` picks up the new row in the next render
+    /// pass; the queue replays the create against `POST /api/v1/projects`
+    /// in the background and reconciles the server's canonical id back
+    /// onto the same SwiftData object.
+    ///
+    /// M45 Wave 2: this used to do `await client.createProject + Task {
+    /// await syncEngine?.sync() }`. The repository owns both
+    /// responsibilities now.
+    private func submit() {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
@@ -156,31 +162,25 @@ struct NewProjectView: View {
         defer { isCreating = false }
         errorMessage = nil
 
-        do {
-            // sortOrder = nil → server assigns the default (0). Custom
-            // ordering is reachable via EditProjectView once the
-            // project exists.
-            let payload = CreateProjectPayload(
-                name: trimmed,
-                color: selectedColorCSS,
-                sortOrder: nil
-            )
-            _ = try await client.createProject(payload)
-            // Pull through sync so the new row shows up immediately in
-            // the list. We don't await it — the response from
-            // createProject is already canonical; sync just mirrors it
-            // into SwiftData for the @Query subscribers. Awaiting would
-            // delay the dismiss for no perceptible benefit.
-            Task { await syncEngine?.sync() }
-            BrainHaptics.light()
-            dismiss()
-        } catch let error as BrainAPIClient.Error {
-            errorMessage = error.userFacingMessage
-            BrainHaptics.error()
-        } catch {
-            errorMessage = "Couldn't create project: \(error.localizedDescription)"
-            BrainHaptics.error()
+        // sortOrder = nil → server assigns the default (0). Custom
+        // ordering is reachable via EditProjectView once the project
+        // exists.
+        let payload = CreateProjectPayload(
+            name: trimmed,
+            color: selectedColorCSS,
+            sortOrder: nil
+        )
+
+        guard let projectRepo else {
+            // Preview / non-production host. Production wires the
+            // repository in `BrainApp.init`.
+            errorMessage = "Configuration error — please report."
+            return
         }
+
+        _ = projectRepo.create(payload)
+        BrainHaptics.light()
+        dismiss()
     }
 }
 

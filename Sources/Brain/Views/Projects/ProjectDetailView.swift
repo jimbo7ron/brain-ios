@@ -27,8 +27,15 @@ import SwiftUI
 @MainActor
 struct ProjectDetailView: View {
 
-    @Environment(\.brainAPIClient) private var client
     @Environment(\.syncEngine) private var syncEngine
+    /// M45 Wave 2: inline-add now goes through `NoteRepository` rather
+    /// than the direct `await client.createNote(...)` round-trip this
+    /// view shipped with. The repository owns the optimistic local
+    /// insert, so the new row appears in the section instantly instead
+    /// of waiting for the network. The `\.brainAPIClient` env-key was
+    /// removed alongside the migration — no other code path in this
+    /// view used it.
+    @Environment(\.noteRepository) private var noteRepo
 
     /// The project this view describes. Bindable so SwiftData
     /// updates from the sync engine flow through without us having
@@ -165,12 +172,10 @@ struct ProjectDetailView: View {
                         }
                     ),
                     onInlineAdd: { rawText in
-                        Task {
-                            await createTodoInline(
-                                content: rawText,
-                                sectionSlug: spec.slug
-                            )
-                        }
+                        createTodoInline(
+                            content: rawText,
+                            sectionSlug: spec.slug
+                        )
                     }
                 )
             }
@@ -225,21 +230,18 @@ struct ProjectDetailView: View {
     /// Create a todo from inline-add text, scoped to `sectionSlug`. The
     /// text rides through `QuickAddParser` so trailing keywords
     /// ("tomorrow", "!high", "#tag") behave the same way they do in
-    /// `QuickAddView.submit()` — same payload shape, same server
-    /// resolution path, same post-create sync kick. Errors are
-    /// surfaced via the `inlineAddError` banner above the list; the
-    /// `InlineAddRow` keeps the user's text in place on failure (it
-    /// only clears on a successful `onCommit` callback — see
-    /// `InlineAddRow.body`).
-    private func createTodoInline(content: String, sectionSlug: String) async {
+    /// `QuickAddView.submit()`.
+    ///
+    /// M45 Wave 2: hands off to `NoteRepository.create(_:)` instead of
+    /// the original `await client.createNote(...)` round-trip. The
+    /// repository owns the optimistic insert + queue enqueue + status-
+    /// store mark, so the new row appears in the section instantly and
+    /// the SectionView's `@Query` re-renders before the user can blink.
+    /// The `inlineAddError` banner is now only used for the
+    /// preview/no-repo branch — production never reaches it.
+    private func createTodoInline(content: String, sectionSlug: String) {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-
-        guard let client else {
-            inlineAddError = "Couldn't reach the server. Try again."
-            BrainHaptics.error()
-            return
-        }
 
         let parsed = QuickAddParser.parse(trimmed)
         let bodyContent = parsed.title.isEmpty ? trimmed : parsed.bodyForServer()
@@ -260,22 +262,17 @@ struct ProjectDetailView: View {
             location: nil
         )
 
-        do {
-            _ = try await client.createNote(payload)
-            inlineAddError = nil
-            // Pull the newly-created row through the read-path sync so
-            // it appears in the section without waiting for the
-            // 5-minute foreground Timer. Same shape `QuickAddView.submit()`
-            // uses — fire-and-forget; the server already saved.
-            Task { await syncEngine?.sync() }
-            BrainHaptics.light()
-        } catch let error as BrainAPIClient.Error {
-            inlineAddError = error.userFacingMessage
+        guard let noteRepo else {
+            // Preview / non-production host. Production wires the
+            // repository in `BrainApp.init`.
+            inlineAddError = "Couldn't reach the repository. Try again."
             BrainHaptics.error()
-        } catch {
-            inlineAddError = "Couldn't save: \(error.localizedDescription)"
-            BrainHaptics.error()
+            return
         }
+
+        _ = noteRepo.create(payload)
+        inlineAddError = nil
+        BrainHaptics.light()
     }
 
     // MARK: - Header

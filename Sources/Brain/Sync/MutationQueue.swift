@@ -222,22 +222,31 @@ final class MutationQueue {
 
         while let item = nextReadyItem() {
             do {
-                let serverNote = try await client.executeMutation(item)
-                // M44.x optimistic-add reconciliation: when a `.createTodo`
-                // replay succeeds the server returns the canonical Note
-                // (with a server-assigned UUID + short_id + timestamps).
-                // The local stub was inserted at enqueue time keyed off
-                // the client UUID we put in `item.resourceId`; patch it
-                // in place so it picks up the server's id without a
-                // visible flicker. Doing this *before* deleting the
-                // queue row keeps the row's id the source of truth for
-                // matching. Other ops (complete / update / archive)
-                // return nil and skip the reconcile branch.
-                if let serverNote {
+                let serverResponse = try await client.executeMutation(item)
+                // M44.x / M45 Wave 2 optimistic-add reconciliation: when
+                // a `.createTodo` / `.createProject` replay succeeds the
+                // server returns the canonical entity (with a server-
+                // assigned UUID + short_id + timestamps). The local stub
+                // was inserted at enqueue time keyed off the client UUID
+                // we put in `item.resourceId`; patch it in place so it
+                // picks up the server's id without a visible flicker.
+                // Doing this *before* deleting the queue row keeps the
+                // row's id the source of truth for matching. Other ops
+                // (complete / update / archive) return nil and skip the
+                // reconcile branch.
+                switch serverResponse {
+                case .note(let serverNote):
                     reconcileCreateResponse(
                         clientId: item.resourceId,
                         serverNote: serverNote
                     )
+                case .project(let serverProject):
+                    reconcileCreateProjectResponse(
+                        clientId: item.resourceId,
+                        serverProject: serverProject
+                    )
+                case .none:
+                    break
                 }
                 // M45 Wave 1: capture the *post-reconcile* resource id
                 // before we delete the queue row. For create ops the
@@ -529,6 +538,26 @@ final class MutationQueue {
             type: LocalNote.self
         ) { stub in
             stub.copyFields(from: serverNote, parseDate: parseServerDate)
+        }
+    }
+
+    /// M45 Wave 2 sibling of `reconcileCreateResponse` for the project
+    /// create path. Same ceremony — B1 dedupe, B2 pending-mutation
+    /// rewrite, stub fetch, field copy, adoptServerID — generic over
+    /// `LocalProject`'s `OptimisticStub` conformance (Wave 0).
+    ///
+    /// `LocalProject.copyFields(from:parseDate:)` mirrors the field
+    /// surface a project create echo carries: name, color, sort_order,
+    /// timestamps, plus M26's default-section list (rebuilt against the
+    /// server's canonical slugs so the optimistic empty-sections stub
+    /// gets its Now/Next/Later trio without waiting for the next sync).
+    private func reconcileCreateProjectResponse(clientId: String, serverProject: Project) {
+        try? reconcileCreate(
+            clientId: clientId,
+            serverId: serverProject.id,
+            type: LocalProject.self
+        ) { stub in
+            stub.copyFields(from: serverProject, parseDate: parseServerDate)
         }
     }
 

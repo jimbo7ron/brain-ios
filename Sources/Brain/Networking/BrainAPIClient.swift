@@ -103,6 +103,8 @@ actor BrainAPIClient {
 
     // MARK: - State
 
+    // (See `MutationResponse` defined below at file scope.)
+
     private let serverURL: URL
     private let session: URLSession
     private let decoder: JSONDecoder
@@ -326,13 +328,14 @@ actor BrainAPIClient {
     /// the row's `idempotencyKey` UUID into the `Idempotency-Key` header
     /// so retries are server-deduped.
     ///
-    /// Returns the server's freshly-decoded `Note` for ops where the
-    /// caller needs to reconcile against the response (currently only
-    /// `.createTodo` — see the optimistic-add flow in `MutationQueue.replay`
-    /// where the local UUID stub gets its id / shortId / timestamps
-    /// patched to the server's canonical values once the POST succeeds).
+    /// Returns the server's freshly-decoded entity for ops where the
+    /// caller needs to reconcile against the response. `.createTodo`
+    /// returns `.note(...)` so the M44.x optimistic-add flow can patch
+    /// the client UUID stub to the server's canonical id; `.createProject`
+    /// (M45 Wave 2) returns `.project(...)` so the same ceremony fires
+    /// for projects via `LocalProject`'s `OptimisticStub` conformance.
     /// All other ops return `nil`.
-    func executeMutation(_ item: MutationQueueItem) async throws -> Note? {
+    func executeMutation(_ item: MutationQueueItem) async throws -> MutationResponse? {
         let key = item.idempotencyKey.uuidString
         // Validate `resourceId` shape before splicing into a URL path.
         // The queue is local-only and SwiftData rows can't be tampered
@@ -389,7 +392,8 @@ actor BrainAPIClient {
                 requiresAuth: true,
                 idempotencyKey: key
             )
-            return try await perform(request, as: Note.self)
+            let note = try await perform(request, as: Note.self)
+            return .note(note)
         case .updateTodo:
             // M40: PUT /api/v1/notes/{id} with the queue item's pre-
             // encoded JSON body. The server treats unspecified fields as
@@ -438,8 +442,29 @@ actor BrainAPIClient {
             )
             try await performIgnoringBody(request)
             return nil
+        case .createProject:
+            // M45 Wave 2: POST /api/v1/projects with the queue item's
+            // pre-encoded `CreateProjectPayload`. The server doesn't
+            // accept a client-supplied `id` on `ProjectCreate`, so the
+            // response carries a server-assigned UUID + short_id + the
+            // canonical M26 default sections. The replayer in
+            // `MutationQueue` uses the response to patch the optimistic
+            // local row via `LocalProject`'s `OptimisticStub` conformance
+            // — same ceremony as the note create path.
+            //
+            // Idempotency-Key threads through unchanged so a network
+            // blip that triggers a retry returns the same Project rather
+            // than minting a duplicate.
+            let request = try makeRequest(
+                method: "POST",
+                path: "/api/v1/projects",
+                body: item.payload,
+                requiresAuth: true,
+                idempotencyKey: key
+            )
+            let project = try await perform(request, as: Project.self)
+            return .project(project)
         case .uncompleteTodo,
-             .createProject,
              .addSection,
              .unarchiveNote:
             // TODO(M45 Wave 2-3 / M41+): Wire each of these to its
@@ -1101,4 +1126,19 @@ extension EnvironmentValues {
         get { self[BrainAPIClientKey.self] }
         set { self[BrainAPIClientKey.self] = newValue }
     }
+}
+
+/// Sum type returned by `BrainAPIClient.executeMutation(_:)` for ops
+/// where the queue's replay path needs to reconcile a server response
+/// against an optimistic local stub (M44.x notes / M45 Wave 2 projects).
+/// Other ops return `nil`.
+///
+/// Lives at file scope rather than inside `BrainAPIClient` so the
+/// queue's switch (`Sources/Brain/Sync/MutationQueue.swift`) can
+/// reference the cases without prefixing every site with the actor's
+/// name. Two cases today; `.note` is also the seed for the M45 Wave 3
+/// update-response reconcile (spec §4.3).
+enum MutationResponse {
+    case note(Note)
+    case project(Project)
 }
