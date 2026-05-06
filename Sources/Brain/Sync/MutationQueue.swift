@@ -236,10 +236,33 @@ final class MutationQueue {
                 // reconcile branch.
                 switch serverResponse {
                 case .note(let serverNote):
-                    reconcileCreateResponse(
-                        clientId: item.resourceId,
-                        serverNote: serverNote
-                    )
+                    // Discriminate create vs update by the queue row's
+                    // op slug. `.createTodo` runs the M44.x reconcile
+                    // (id rename + B1 dedupe + B2 pending-mutation
+                    // rewrite); `.updateTodo` runs the M45 Wave 3
+                    // update-response reconcile under the LWW guard
+                    // (spec §4.3). Both come back via `MutationResponse.note`.
+                    switch MutationOp(rawValue: item.op) {
+                    case .createTodo:
+                        reconcileCreateResponse(
+                            clientId: item.resourceId,
+                            serverNote: serverNote
+                        )
+                    case .updateTodo:
+                        reconcileUpdateResponse(
+                            currentItem: item,
+                            serverNote: serverNote
+                        )
+                    default:
+                        // Unexpected — only create/update return a
+                        // `.note` response today. If a future op slug
+                        // starts returning `.note`, add an explicit arm
+                        // here so the reconcile semantics stay obvious.
+                        NSLog(
+                            "MutationQueue: unexpected .note response for op \(item.op); " +
+                            "no reconcile applied."
+                        )
+                    }
                 case .project(let serverProject):
                     reconcileCreateProjectResponse(
                         clientId: item.resourceId,
@@ -539,6 +562,118 @@ final class MutationQueue {
         ) { stub in
             stub.copyFields(from: serverNote, parseDate: parseServerDate)
         }
+    }
+
+    /// M45 Wave 3 (spec §4.3): apply the server's canonical `Note` from
+    /// a successful `.updateTodo` round-trip to the local row, but ONLY
+    /// when no newer pending edit exists on the same resource.
+    ///
+    /// **Why this exists.** Pre-Wave-3, `.updateTodo` threw the response
+    /// away. The server applies derivations the client doesn't replicate:
+    ///   * title is re-extracted from `content` server-side (M26 NLP)
+    ///   * `updated_at` is re-stamped server-side
+    ///   * tags are re-derived from inline `#hashtag` tokens
+    /// Between the dispatch and the next sync (~5min), local state could
+    /// silently diverge from server. Applying the response immediately
+    /// closes that window — same `LocalNote.copyFields` as the create
+    /// reconcile + the SyncEngine pull path, so the field shape stays
+    /// in agreement across all three write surfaces.
+    ///
+    /// **The LWW guard.** The user can edit again before the response
+    /// for the first edit lands (rapid-save flow: tap Save → tap edit
+    /// pencil → change content → tap Save again). When that second
+    /// edit's `MutationQueueItem` is already enqueued by the time the
+    /// first edit's response lands, blindly applying the response would
+    /// clobber the user's newer optimistic state. The guard:
+    ///
+    ///   * Look for any *other* `MutationQueueItem` rows targeting the
+    ///     same `serverNote.id`. The current item being reconciled is
+    ///     excluded (it's about to be deleted by `replay()`'s success
+    ///     terminal anyway).
+    ///   * If at least one other pending row exists, drop the response —
+    ///     the user's newer edit wins; the next replay tick will dispatch
+    ///     it and reconcile fresh.
+    ///   * Otherwise apply via `LocalNote.copyFields(from:parseDate:)`.
+    ///
+    /// This mirrors the spirit of `SyncEngine.resolveConflictIfNeeded`'s
+    /// pull-side LWW (M38) — both prevent newer client state from being
+    /// clobbered by server data that's older from the user's POV — but
+    /// the trigger condition differs: the pull side compares timestamps,
+    /// while the write-response side keys on "did the user enqueue
+    /// another edit before this response landed?". The two are
+    /// complementary; neither subsumes the other.
+    ///
+    /// **Known failure mode.** A poisoned sibling row (e.g. `.notFound` /
+    /// `.validationError` / `.notImplemented` errors that have driven
+    /// `nextRetryAt = .distantFuture`) for the same `resourceId` will
+    /// trigger the LWW guard and gate this response off. The local row
+    /// stays at its pre-update value until the poisoned row is purged or
+    /// the next sync arrives (~5min foreground Timer). Acceptable per
+    /// spec §4.3 — server-derived fields like title may lag for one sync
+    /// cycle. If this becomes a user-visible issue, the LWW filter could
+    /// exclude poisoned rows (e.g. those with `nextRetryAt == .distantFuture`).
+    ///
+    /// **Idempotency.** If the local stub is missing (rare — kill-9 +
+    /// restart with the queue row surviving) we no-op. The next sync
+    /// will deliver the server's truth via the pull path.
+    ///
+    /// **Cross-context propagation.** Same pattern as
+    /// `reconcileCreateResponse`: the queue's `ModelContext` mutates the
+    /// row, the save lands in the shared SQLite store, the SwiftUI
+    /// `@Query` on a different context picks up the change. See
+    /// MutationQueue.swift's create-reconcile doc-comment for the full
+    /// rationale.
+    ///
+    /// `currentItem` is the in-flight `.updateTodo` row whose response
+    /// we're processing — passed in so the "any other pending row"
+    /// lookup can exclude it. We can't rely on PersistentIdentifier
+    /// equality across two SwiftData rows fetched in the same context
+    /// (they ARE comparable, but using `===` here is clearer about
+    /// intent and survives a future refactor that re-fetches).
+    private func reconcileUpdateResponse(
+        currentItem: MutationQueueItem,
+        serverNote: Note
+    ) {
+        let serverId = serverNote.id
+
+        // LWW guard: any other pending mutation targeting this resource
+        // means the user has already enqueued a newer edit. Drop the
+        // response copy — applying it would clobber the local optimistic
+        // state of the queued newer edit, and the user would see their
+        // typed change revert briefly until the next sync corrected it.
+        let pendingDescriptor = FetchDescriptor<MutationQueueItem>(
+            predicate: #Predicate { $0.resourceId == serverId }
+        )
+        let allPending = (try? modelContext.fetch(pendingDescriptor)) ?? []
+        let otherPending = allPending.filter { $0 !== currentItem }
+        guard otherPending.isEmpty else {
+            NSLog(
+                "MutationQueue: dropping update response for \(serverId) — " +
+                "\(otherPending.count) newer pending mutation(s) queued. " +
+                "User's later edit wins (M45 Wave 3 LWW guard)."
+            )
+            return
+        }
+
+        // No newer edit. Apply the server's canonical fields to the
+        // local row.
+        let stubDescriptor = LocalNote.makeFetchByID(serverId)
+        guard let stub = (try? modelContext.fetch(stubDescriptor))?.first else {
+            // Local row missing — extremely rare (kill-9 + restart with
+            // queue row surviving). The next sync will deliver the
+            // server's truth via the pull path. No-op here.
+            NSLog(
+                "MutationQueue: update response for \(serverId) had no " +
+                "matching local row; next sync will reconcile."
+            )
+            return
+        }
+
+        stub.copyFields(from: serverNote, parseDate: parseServerDate)
+        // No save here — `replay()`'s success terminal saves alongside
+        // the queue-row deletion so the field copy + queue-row removal
+        // land atomically. Mirrors the create-reconcile contract (see
+        // `reconcileCreate<T:>` doc-comment, "Save responsibility").
     }
 
     /// M45 Wave 2 sibling of `reconcileCreateResponse` for the project
@@ -957,6 +1092,15 @@ extension MutationQueue {
     /// optimistic stub.
     func debugReconcileCreateProjectResponse(clientId: String, serverProject: Project) {
         reconcileCreateProjectResponse(clientId: clientId, serverProject: serverProject)
+    }
+
+    /// Test-only entry point for `reconcileUpdateResponse` (M45 Wave 3).
+    /// Lets `NoteRepositoryTests` exercise the LWW guard + field-copy
+    /// semantics without standing up a full mock `BrainAPIClient`. The
+    /// test must enqueue the in-flight `.updateTodo` itself so we can
+    /// pass the live `MutationQueueItem` here.
+    func debugReconcileUpdateResponse(currentItem: MutationQueueItem, serverNote: Note) {
+        reconcileUpdateResponse(currentItem: currentItem, serverNote: serverNote)
     }
 
     /// Test-only entry point for `rollbackOptimisticStateIfNeeded`.

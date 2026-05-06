@@ -401,6 +401,16 @@ actor BrainAPIClient {
             // (only changed fields ride). The dispatch site doesn't
             // re-decode the body — it's already exactly what the server
             // expects, captured at enqueue time when the user hit Save.
+            //
+            // M45 Wave 3 (spec §4.3): the PUT response body is the
+            // canonical Note after the server applied derivations
+            // (server-extracted title from content, recomputed
+            // updatedAt, M26 NLP tag re-derivation). We decode it and
+            // return it so `MutationQueue.replay()` can apply it under
+            // the LWW guard via `reconcileUpdateResponse`. Pre-Wave-3
+            // this arm threw the response away with `performIgnoringBody`,
+            // letting local state silently diverge from server until
+            // the next sync (~5min). Decoding here closes that window.
             let request = try makeRequest(
                 method: "PUT",
                 path: "/api/v1/notes/\(resourceId)",
@@ -408,8 +418,8 @@ actor BrainAPIClient {
                 requiresAuth: true,
                 idempotencyKey: key
             )
-            try await performIgnoringBody(request)
-            return nil
+            let note = try await perform(request, as: Note.self)
+            return .note(note)
         case .updateProject:
             // M40: PUT /api/v1/projects/{id}. Same shape as updateTodo;
             // the body is `UpdateProjectPayload` JSON encoded at

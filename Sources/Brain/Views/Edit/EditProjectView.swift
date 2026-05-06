@@ -14,11 +14,17 @@
 //     not on the M40 critical path.
 //   * Archived toggle (sparingly used; tucked under Advanced).
 //
-// **Mutation routing:**
-// Project name / colour / sort_order / archived ride through the M37
-// mutation queue (`MutationOp.updateProject`) with `baseUpdatedAt`
-// populated so the M38 LWW conflict resolution can drop stale queue
-// items if the web edits the same project mid-flight.
+// **Mutation routing (M45 Wave 3):**
+// Project name / colour / sort_order metadata edits go through
+// `ProjectRepository.update(project, fields)` — the repo owns the
+// optimistic apply, the wire encode, and the queue enqueue
+// (`.updateProject`) with `baseUpdatedAt` populated so M38's pull-side
+// LWW conflict resolution can drop stale queue items if the web edits
+// the same project mid-flight.
+//
+// The "archived" toggle still rides this dialog but routes through
+// `projectRepo.archive(...)` / `projectRepo.unarchive(...)` to keep the
+// soft-delete intent distinct from a metadata patch (spec §6.2).
 //
 // Section adds and renames go through DIRECT API calls (not the queue)
 // because:
@@ -58,8 +64,12 @@ struct EditProjectView: View {
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
-    @Environment(\.mutationQueue) private var mutationQueue
     @Environment(\.brainAPIClient) private var client
+    /// M45 Wave 3: project-metadata edits route through the repo. The
+    /// view no longer reaches into `\.mutationQueue` directly — the
+    /// repository owns the optimistic apply + enqueue. Section adds /
+    /// renames still use direct API calls (see file header).
+    @Environment(\.projectRepository) private var projectRepository
 
     /// The project being edited. `@Bindable` so the optimistic local
     /// updates flow back through `@Query` subscribers without a
@@ -318,33 +328,19 @@ struct EditProjectView: View {
 
     // MARK: - Save (top-level fields)
 
-    /// Build the project-update payload, optimistically apply it
-    /// locally, enqueue a `MutationOp.updateProject`, and dismiss.
-    /// Section edits are NOT included — they ride direct API calls
-    /// from `addSection` / `commitRename` so the user gets per-row
-    /// feedback as they go.
+    /// Build a typed `ProjectUpdateFields` and hand it to the
+    /// repository. The repo applies the optimistic local mutation,
+    /// encodes the wire payload, and enqueues `.updateProject`. The
+    /// archived toggle, when changed, routes through the repo's
+    /// dedicated archive/unarchive entry points so the soft-delete
+    /// intent stays distinct from a metadata patch (spec §6.2).
+    /// Section edits are NOT included here — they ride direct API
+    /// calls from `addSection` / `commitRename` so the user gets
+    /// per-row feedback as they go (Wave 4 will migrate them).
     private func save() async {
         guard canSave else { return }
 
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        var payload = UpdateProjectPayload()
-        if trimmedName != project.name {
-            payload.name = trimmedName
-        }
-        if selectedColorCSS != project.color {
-            // The server treats a missing key as "leave alone" but an
-            // empty string would be invalid. We send the new value
-            // (which may be nil → "no colour" omits the key entirely
-            // because Encodable skips nils on Optional Strings).
-            payload.color = selectedColorCSS
-        }
-        if sortOrder != project.sortOrder {
-            payload.sortOrder = sortOrder
-        }
-        if archived != project.archived {
-            payload.archived = archived
-        }
 
         if !topLevelHasChanges {
             // No-op save. Dismiss without queuing.
@@ -352,52 +348,56 @@ struct EditProjectView: View {
             return
         }
 
-        let encoded: Data
-        do {
-            encoded = try JSONEncoder().encode(payload)
-        } catch {
-            errorMessage = "Couldn't prepare the change: \(error.localizedDescription)"
-            return
-        }
-
-        guard let queue = mutationQueue else {
-            errorMessage = "Mutation queue unavailable. Try again."
+        guard let repo = projectRepository else {
+            errorMessage = "Project repository unavailable. Try again."
             return
         }
 
         isSaving = true
         defer { isSaving = false }
 
-        applyOptimisticLocalUpdate(name: trimmedName)
-
-        do {
-            _ = try queue.enqueue(
-                op: .updateProject,
-                resourceType: "project",
-                resourceId: project.id,
-                payload: encoded,
-                baseUpdatedAt: project.updatedAt
-            )
-            // M43: medium haptic mirrors EditTodoView — the dialog
-            // committed a multi-field save and the user benefits
-            // from a stronger tactile confirmation.
-            BrainHaptics.medium()
-            dismiss()
-        } catch {
-            errorMessage = "Couldn't queue the change: \(error.localizedDescription)"
-            BrainHaptics.error()
+        // Metadata diff — only fields that differ from the live row.
+        // Empty `ProjectUpdateFields` is a no-op on the repo, but we
+        // skip the call entirely when there's nothing AND no archive
+        // flip to avoid an empty `.updateProject` enqueue.
+        var fields = ProjectUpdateFields()
+        if trimmedName != project.name {
+            fields.name = trimmedName
         }
-    }
+        if selectedColorCSS != project.color {
+            // Server treats a missing key as "leave alone"; a non-nil
+            // value (incl. empty string) is taken literally. The wire
+            // encoder skips nil Optionals so passing `nil` here means
+            // "leave alone", not "clear" — same semantic as before.
+            fields.color = selectedColorCSS
+        }
+        if sortOrder != project.sortOrder {
+            fields.sortOrder = sortOrder
+        }
+        let metadataChanged = fields.name != nil
+            || fields.color != nil
+            || fields.sortOrder != nil
+        if metadataChanged {
+            repo.update(project, fields)
+        }
 
-    /// Mirror the form values onto the live `LocalProject` so the
-    /// next render reflects the change. Don't bump `updatedAt` — the
-    /// server owns that field and the M38 LWW comparison keys off it.
-    private func applyOptimisticLocalUpdate(name: String) {
-        project.name = name
-        project.color = selectedColorCSS
-        project.sortOrder = sortOrder
-        project.archived = archived
-        try? modelContext.save()
+        // Archive flip is its own intent — route through the repo's
+        // dedicated entry point so the soft-delete vs metadata-patch
+        // distinction is visible at the call site (and so the future
+        // hard-delete path can hook the same method).
+        if archived != project.archived {
+            if archived {
+                repo.archive(project)
+            } else {
+                repo.unarchive(project)
+            }
+        }
+
+        // M43: medium haptic mirrors EditTodoView — the dialog
+        // committed a multi-field save and the user benefits from a
+        // stronger tactile confirmation.
+        BrainHaptics.medium()
+        dismiss()
     }
 
     // MARK: - Section editing (direct API)
