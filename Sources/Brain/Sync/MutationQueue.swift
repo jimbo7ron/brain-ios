@@ -603,6 +603,16 @@ final class MutationQueue {
     /// another edit before this response landed?". The two are
     /// complementary; neither subsumes the other.
     ///
+    /// **Known failure mode.** A poisoned sibling row (e.g. `.notFound` /
+    /// `.validationError` / `.notImplemented` errors that have driven
+    /// `nextRetryAt = .distantFuture`) for the same `resourceId` will
+    /// trigger the LWW guard and gate this response off. The local row
+    /// stays at its pre-update value until the poisoned row is purged or
+    /// the next sync arrives (~5min foreground Timer). Acceptable per
+    /// spec §4.3 — server-derived fields like title may lag for one sync
+    /// cycle. If this becomes a user-visible issue, the LWW filter could
+    /// exclude poisoned rows (e.g. those with `nextRetryAt == .distantFuture`).
+    ///
     /// **Idempotency.** If the local stub is missing (rare — kill-9 +
     /// restart with the queue row surviving) we no-op. The next sync
     /// will deliver the server's truth via the pull path.
