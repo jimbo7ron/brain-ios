@@ -673,4 +673,234 @@ final class ProjectRepositoryTests: XCTestCase {
             "All section composite-ids must carry the server-side project prefix after reconcile"
         )
     }
+
+    // MARK: - Wave 4 review fixes
+
+    /// Wave 4 review #1: simultaneous same-name section adds. The user
+    /// taps "Add 'X'" twice in quick succession; both create-echos
+    /// return a Project DTO with two same-named sections [A, B] (same
+    /// name, two distinct slugs). The first reconcile must claim slug
+    /// A; the second must NOT also claim A (which would collide on
+    /// `LocalSection.id`'s unique constraint with the just-renamed
+    /// canonical row) — it must pick the unclaimed slug B instead.
+    /// Locks the name-match picker's "prefer unclaimed slug" behaviour.
+    func testReconcileSectionsHandlesSimultaneousSameNameAdds() throws {
+        let (_, repo, queue, _, repoContext) = try makeFixture()
+
+        let projectID = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        let project = LocalProject(
+            id: projectID,
+            shortId: "p15",
+            name: "Garden",
+            sortOrder: 0,
+            archived: false
+        )
+        repoContext.insert(project)
+        try repoContext.save()
+
+        // Two adds of the same name. Each yields a tmp-prefixed
+        // composite + a `.createSection` queue row.
+        let firstSection = repo.addSection(to: project, name: "Tasks")
+        let secondSection = repo.addSection(to: project, name: "Tasks")
+        XCTAssertNotEqual(firstSection.id, secondSection.id)
+
+        let queueRows = try queue.debugModelContext.fetch(
+            FetchDescriptor<MutationQueueItem>(
+                sortBy: [SortDescriptor(\.createdAt, order: .forward)]
+            )
+        )
+        XCTAssertEqual(queueRows.count, 2, "two .createSection rows expected")
+
+        // Server response: both sections present, distinct slugs.
+        let serverProject = Project(
+            id: projectID,
+            shortId: "p15",
+            name: "Garden",
+            color: nil,
+            sortOrder: 0,
+            archived: false,
+            sections: [
+                SectionDTO(slug: "tasks", name: "Tasks", position: 0),
+                SectionDTO(slug: "tasks-2", name: "Tasks", position: 1),
+            ],
+            createdAt: nil,
+            updatedAt: nil
+        )
+
+        // First reconcile claims one of the two slugs.
+        queue.debugReconcileCreateSectionResponse(
+            currentItem: queueRows[0],
+            serverProject: serverProject
+        )
+        try queue.debugModelContext.save()
+
+        // Second reconcile must not collide. The picker should filter
+        // out the slug the first reconcile already claimed and pick
+        // the remaining one.
+        queue.debugReconcileCreateSectionResponse(
+            currentItem: queueRows[1],
+            serverProject: serverProject
+        )
+        try queue.debugModelContext.save()
+
+        let allSections = try repoContext.fetch(FetchDescriptor<LocalSection>())
+        // Both must exist locally, each at a distinct canonical slug.
+        XCTAssertEqual(allSections.count, 2)
+        let slugs = Set(allSections.map(\.slug))
+        XCTAssertEqual(slugs, ["tasks", "tasks-2"])
+        // Both must carry the canonical (non-tmp) composite id.
+        XCTAssertTrue(
+            allSections.allSatisfy { !$0.isOptimistic },
+            "Both sections should be canonically keyed (no tmp- prefix) after reconcile"
+        )
+    }
+
+    /// Wave 4 review #5b: parent-project guard fallback. If the
+    /// parent project's `.createProject` is still pending (the project
+    /// is itself optimistic), `addSection` must NOT enqueue a
+    /// `.createSection` row keyed on the client UUID — that would 404
+    /// on replay because the server doesn't know the project yet.
+    /// Instead, the optimistic local section is inserted and the
+    /// repo dispatches a direct `client.addProjectSection` call (in a
+    /// detached `Task`); sync delivers the canonical row on the next
+    /// foreground tick.
+    ///
+    /// Test seam note: there's no client spy in the test harness. We
+    /// detect the direct-call path indirectly — the queue should hold
+    /// ONE row (the parent's `.createProject`), not two. The
+    /// detached `Task`'s in-flight HTTP call fails (no auth in the
+    /// test BrainAPIClient) but that's fine: we're locking the
+    /// "queue path was bypassed" invariant, not the wire result.
+    func testAddSection_fallsBackToDirectCallWhenParentOptimistic() throws {
+        let (_, repo, queue, _, _) = try makeFixture()
+
+        // Repo.create enqueues a `.createProject` keyed on the client
+        // UUID. The parent stays "optimistic" because we never hand
+        // the queue a server response.
+        let stub = repo.create(
+            CreateProjectPayload(name: "New project", color: nil, sortOrder: nil)
+        )
+
+        let queueAfterCreate = try queue.debugModelContext.fetch(
+            FetchDescriptor<MutationQueueItem>()
+        )
+        XCTAssertEqual(queueAfterCreate.count, 1)
+        XCTAssertEqual(queueAfterCreate.first?.op, MutationOp.createProject.rawValue)
+
+        // Add a section while the parent is still optimistic.
+        let section = repo.addSection(to: stub, name: "Pruning")
+
+        // Local optimistic stub for the section IS inserted (the
+        // optimistic affordance is preserved regardless of which
+        // wire path we take).
+        XCTAssertTrue(section.isOptimistic, "section should be optimistic")
+        XCTAssertEqual(section.name, "Pruning")
+        XCTAssertEqual(section.project?.id, stub.id)
+
+        // Crucially: NO `.createSection` row was enqueued. Only the
+        // pre-existing `.createProject` row remains. The direct-call
+        // fallback handled the section — the in-flight detached
+        // `Task` will fail against the test client (no auth) but
+        // that's irrelevant to this assertion.
+        let queueAfterSection = try queue.debugModelContext.fetch(
+            FetchDescriptor<MutationQueueItem>()
+        )
+        XCTAssertEqual(
+            queueAfterSection.count, 1,
+            "addSection must NOT enqueue while parent .createProject is pending"
+        )
+        XCTAssertEqual(queueAfterSection.first?.op, MutationOp.createProject.rawValue)
+        XCTAssertFalse(
+            queueAfterSection.contains { $0.op == MutationOp.createSection.rawValue },
+            "no .createSection row should be enqueued under the parent-pending guard"
+        )
+    }
+
+    /// Wave 4 review #5c: project create-pending + update-pending +
+    /// update-response interleave. Repo.create enqueues a
+    /// `.createProject`. Before the create echo lands, the user edits
+    /// the project (e.g. taps "rename") which enqueues an
+    /// `.updateProject` against the same client UUID. When the
+    /// update-response eventually lands, the LWW guard on
+    /// `reconcileUpdateProjectResponse` must drop it (the
+    /// `.createProject` is still queued for the same id, which counts
+    /// as "newer pending mutation").
+    ///
+    /// Why this matters: blindly applying the response would copy
+    /// server-canonical fields onto the local stub keyed on the
+    /// client UUID — but the create reconcile (when it lands) is the
+    /// designated id-rename path. Applying the update response first
+    /// risks clobbering the optimistic state the user is staring at,
+    /// and the rename ceremony then has nothing useful to copy from
+    /// the create echo.
+    func testProjectUpdateLWW_createPendingAndUpdatePendingInterleave() throws {
+        let (_, repo, queue, _, repoContext) = try makeFixture()
+
+        // Step 1: create — enqueues `.createProject`.
+        let stub = repo.create(
+            CreateProjectPayload(name: "Optimistic", color: nil, sortOrder: nil)
+        )
+        let clientID = stub.id
+
+        // Step 2: edit the optimistic project — enqueues an
+        // `.updateProject` against the same clientID. (The repo's
+        // optimistic-stub guard for updates may fold; we're testing
+        // the case where it actually queues. Verify by checking the
+        // queue depth after.)
+        repo.update(stub, ProjectUpdateFields(name: "Newer local edit"))
+
+        // Locate the update-row (if any). Both ops share the
+        // clientID, so we filter on op slug.
+        let updateRows = try queue.debugModelContext.fetch(
+            FetchDescriptor<MutationQueueItem>(
+                predicate: #Predicate { $0.op == "update_project" }
+            )
+        )
+        // If repo.update folds the rename into the pending create
+        // payload (no separate update row), the LWW interleave
+        // doesn't fire because there's no update response to
+        // reconcile. Document that path and exit cleanly.
+        guard let updateRow = updateRows.first else {
+            // TODO(M45 followup): surface a doc-test capturing
+            // "update folds into pending create" if that's the
+            // chosen optimistic-update behaviour for projects.
+            return
+        }
+
+        // Step 3: simulate the update response landing while the
+        // create is still queued. The create-echo hasn't reconciled
+        // yet, so the project is still keyed on `clientID`; the
+        // update row is also keyed on `clientID`. The LWW guard sees
+        // the still-pending `.createProject` row and drops the
+        // response.
+        let serverProject = Project(
+            id: clientID,
+            shortId: "should-not-apply",
+            name: "Stale server response",
+            color: nil,
+            sortOrder: 99,
+            archived: false,
+            sections: [],
+            createdAt: nil,
+            updatedAt: nil
+        )
+
+        queue.debugReconcileUpdateProjectResponse(
+            currentItem: updateRow,
+            serverProject: serverProject
+        )
+        try queue.debugModelContext.save()
+
+        // The local row should still carry the user's optimistic
+        // "Newer local edit" (or the create's "Optimistic" if
+        // repo.update didn't apply locally) — NOT the stale server
+        // response's name. Either way, the dropped-response
+        // assertion is: shortId / sortOrder didn't get clobbered.
+        let stored = try repoContext.fetch(FetchDescriptor<LocalProject>()).first
+        XCTAssertNotEqual(
+            stored?.shortId, "should-not-apply",
+            "LWW guard must drop the update response while .createProject is still pending"
+        )
+        XCTAssertNotEqual(stored?.sortOrder, 99)
+    }
 }

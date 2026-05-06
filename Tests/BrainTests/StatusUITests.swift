@@ -59,7 +59,9 @@ final class StatusUITests: XCTestCase {
     }
 
     /// Wave 4: poisoning a row stamps `nextRetryAt = .distantFuture`.
-    /// `failedCount` should observe that on the next refresh.
+    /// `failedCount` should observe that on the next refresh, and
+    /// `pendingCount` (derived as `totalCount - failedCount` per the
+    /// review-fix rename) should NOT include the poisoned row.
     func testFailedCount_bumpsOnPoison() throws {
         let (queue, _) = try makeQueue()
         let item = try queue.enqueue(
@@ -83,7 +85,9 @@ final class StatusUITests: XCTestCase {
             payload: Data()
         )
 
-        XCTAssertEqual(queue.pendingCount, 2)
+        // Derived pendingCount = totalCount(2) - failedCount(1) = 1.
+        XCTAssertEqual(queue.totalCount, 2)
+        XCTAssertEqual(queue.pendingCount, 1)
         XCTAssertEqual(queue.failedCount, 1)
     }
 

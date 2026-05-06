@@ -115,11 +115,31 @@ final class MutationQueue {
     /// without stampeding the server.
     private(set) var isReplaying: Bool = false
 
-    /// Pending row count surfaced for UI ("3 actions waiting to sync"
-    /// pill in a future Settings panel). Refreshed on every enqueue and
+    /// Total queue depth (every row on disk, including poisoned ones
+    /// parked at `.distantFuture`). Refreshed on every enqueue and
     /// every replay pass so the value stays close to truth without
     /// having to materialise a SwiftData `@Query` in the call site.
-    private(set) var pendingCount: Int = 0
+    ///
+    /// **Naming note (M45 Wave 4 review):** previously called
+    /// `pendingCount`, which mislead callers — a poisoned row is
+    /// "still on disk" but isn't going to retry. The status pill
+    /// always wanted "active pending", which it computed as
+    /// `pendingCount - failedCount`. Renamed to `totalCount` and
+    /// `pendingCount` re-introduced as a derived "active pending"
+    /// (see below) so callers reading `.pendingCount` get the
+    /// intuitive value. The smoke-tests below still poke
+    /// `totalCount` directly because they're enqueue-bump tests
+    /// where the distinction doesn't matter.
+    private(set) var totalCount: Int = 0
+
+    /// Active-pending row count — `totalCount - failedCount`. This is
+    /// the value UI surfaces ("↻ N actions waiting to sync"). A
+    /// poisoned row counts toward `failedCount` and against
+    /// `pendingCount` so the two indicators don't double-count the
+    /// same row.
+    var pendingCount: Int {
+        max(0, totalCount - failedCount)
+    }
 
     /// (M45 Wave 4) Count of poisoned queue rows — those stamped with
     /// `nextRetryAt = .distantFuture` because the replayer hit a
@@ -849,6 +869,25 @@ final class MutationQueue {
     /// under the server slug while the create echo was in flight),
     /// run B2 and the section reconcile and return — the
     /// canonically-keyed row already represents the truth.
+    ///
+    /// **Atomicity asymmetry vs `reconcileCreate<T:>`.** The W0 generic
+    /// ceremony's doc-comment promises "the final save is the caller's
+    /// responsibility — `replay()` saves alongside the queue-row
+    /// deletion so rename + field copy + queue-row removal land in one
+    /// transaction." The section path partially honours that — most of
+    /// its mutations defer to `replay()`'s success terminal — BUT it
+    /// MUST save mid-method in the B1 dupe-delete branch (lines below
+    /// commented "B1: …"). The forcing function is SwiftData's
+    /// `@Attribute(.unique)` constraint on `LocalSection.id` (the
+    /// composite `<projectID>:<slug>`): if a sync delta already
+    /// inserted the canonical row, we have to free the unique-id slot
+    /// BEFORE `adoptServerID` tries to claim it — otherwise the rename
+    /// collides on save. The W0 generic helper has the exact same
+    /// asymmetry for the same reason (its B1 path saves mid-method
+    /// too) — the doc-comment overstates the contract slightly. This
+    /// is a documented, tolerated wart, not a bug; the alternative
+    /// (always defer the dupe-delete to a single trailing save) would
+    /// crash on the unique-id conflict before reaching that save.
     private func reconcileCreateSectionResponse(
         currentItem: MutationQueueItem,
         serverProject: Project
@@ -878,14 +917,56 @@ final class MutationQueue {
         // server enforces unique slug-from-name per project), prefer
         // the one whose slug DOESN'T already exist on the local
         // project (i.e. the freshly-minted one).
+        //
+        // Edge case: rapid same-name adds. User taps "Add section
+        // 'X'" twice in quick succession. Both create-echos return a
+        // Project DTO carrying [A, B] — same name "X", two slugs.
+        // The first reconcile claims slug A (renaming its tmp
+        // composite to <projectID>:A). Without filtering, the second
+        // reconcile would ALSO pick A (it's `matches.first`) and
+        // collide with the just-renamed canonical row on the
+        // unique-id constraint. Filter out composites already
+        // present locally so we deterministically prefer a slug
+        // nobody has claimed yet. The server's per-project name
+        // uniqueness already prevents most collisions; this guards
+        // the brief window where the second create's response
+        // arrives before the first reconcile completes.
         let canonicalSlug: String? = {
             guard let requestedName else { return nil }
             let matches = serverProject.sections.filter { $0.name == requestedName }
-            // Pick the slug that isn't yet associated with a
-            // canonically-keyed local section — that's the new one.
-            // Falls back to first match if all are present (the
-            // request was a no-op rename collision; the server's
-            // dedupe just returned the existing row).
+            guard !matches.isEmpty else { return nil }
+
+            // Filter to slugs whose composite id is NOT already
+            // present locally as a canonically-keyed `LocalSection`.
+            // These are the freshly-minted ones the current reconcile
+            // should claim.
+            let unclaimed = matches.filter { wireSection in
+                let composite = LocalSection.makeID(
+                    projectID: projectID,
+                    slug: wireSection.slug
+                )
+                let descriptor = LocalSection.makeFetchByID(composite)
+                return ((try? modelContext.fetch(descriptor))?.first) == nil
+            }
+
+            if let pick = unclaimed.first {
+                return pick.slug
+            }
+
+            // All matches are already locally present. Falls back to
+            // first match for the no-op-rename / pre-existing case
+            // (e.g. server's dedupe returned the existing row).
+            // Logged because in the fast-path it's an unexpected
+            // shape — the about-to-be-renamed stub is still keyed on
+            // its tmp composite, so SOME wire slug should be
+            // unclaimed. If the count regularly hits this branch
+            // we've missed an invariant.
+            NSLog(
+                "MutationQueue: section name-match picker found no " +
+                "unclaimed slug for name '\(requestedName)' on project " +
+                "\(projectID); falling back to first match. Wire slugs: " +
+                "\(matches.map(\.slug))."
+            )
             return matches.first?.slug
         }()
 
@@ -1352,13 +1433,13 @@ final class MutationQueue {
         lastError = nil
     }
 
-    /// Refresh `pendingCount` and `failedCount` from SwiftData. Cheap
+    /// Refresh `totalCount` and `failedCount` from SwiftData. Cheap
     /// — SwiftData runs a `COUNT(*)` per fetch rather than
-    /// materialising every row. The two counts overlap: a poisoned
-    /// row is both pending (still on disk, won't auto-replay) and
-    /// failed (parked at `.distantFuture`). The status pill (M45
-    /// Wave 4) uses `failedCount` directly and computes "active
-    /// pending" as `pendingCount - failedCount`.
+    /// materialising every row. The derived `pendingCount`
+    /// (`totalCount - failedCount`) gives "active pending" without a
+    /// second fetch. The status pill (M45 Wave 4) reads
+    /// `pendingCount` directly so the two indicators don't
+    /// double-count a poisoned row.
     ///
     /// (M45 Wave 4) Cannot use `#Predicate` on `Date == .distantFuture`
     /// directly — the predicate macro doesn't accept the static
@@ -1367,7 +1448,7 @@ final class MutationQueue {
     private func refreshPendingCount() {
         let totalDescriptor = FetchDescriptor<MutationQueueItem>()
         if let count = try? modelContext.fetchCount(totalDescriptor) {
-            pendingCount = count
+            totalCount = count
         }
         let distantFuture = Date.distantFuture
         let failedDescriptor = FetchDescriptor<MutationQueueItem>(

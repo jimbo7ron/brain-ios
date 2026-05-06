@@ -51,15 +51,33 @@ struct SignedInRootView: View {
             // every surface without having to inject into each
             // `NavigationStack`'s toolbar. Hides itself when the queue
             // is idle (no chrome unless there's something to surface).
+            //
+            // **Padding (M45 Wave 4 review fix).** Earlier the top
+            // padding was a fixed `8pt` with a comment claiming "~52pt
+            // accounts for the standard nav-bar." That's wrong on
+            // iPhone with a large-title nav bar (~96pt total — the
+            // pill collided with the title). The overlay sits ABOVE
+            // the TabView's per-tab `NavigationStack`s, so its
+            // `safeAreaInsets.top` is just the status bar, not the
+            // nav bar. We use a `GeometryReader` scoped to the overlay
+            // (NOT the whole root — that would force a layout pass on
+            // the entire view tree on every rotation / size change)
+            // to read the status-bar inset and add a generous offset
+            // that clears both compact (`44pt`) and large (`96pt`)
+            // nav bars without clipping. Picking the larger value
+            // is fine: on a compact nav bar the pill sits below the
+            // bar (slightly inside the content area), still readable;
+            // on a large nav bar it sits in the air to the right of
+            // the title where the rationale wanted it.
             .overlay(alignment: .topTrailing) {
-                MutationStatusPill(queue: mutationQueue)
-                    .padding(.trailing, 12)
-                    // Push down past the safe-area / nav-bar (~52pt
-                    // accounts for the standard nav-bar height plus
-                    // the status bar; the pill sits in the air right
-                    // of the nav-title without clipping).
-                    .padding(.top, 8)
-                    .allowsHitTesting(false)
+                GeometryReader { proxy in
+                    MutationStatusPill(queue: mutationQueue)
+                        .padding(.trailing, 12)
+                        .padding(.top, proxy.safeAreaInsets.top + 52)
+                        .frame(maxWidth: .infinity, alignment: .topTrailing)
+                        .allowsHitTesting(false)
+                }
+                .allowsHitTesting(false)
             }
     }
 

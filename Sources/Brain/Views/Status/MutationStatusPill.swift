@@ -42,12 +42,13 @@ struct MutationStatusPill: View {
     let queue: MutationQueue?
 
     var body: some View {
-        // `pendingCount` includes poisoned rows because they're still
-        // on disk; subtract `failedCount` so the two indicators don't
-        // double-count the same row.
-        let total = queue?.pendingCount ?? 0
+        // `pendingCount` is now the derived "active pending"
+        // (`totalCount - failedCount`) per M45 Wave 4 review fix —
+        // poisoned rows already count toward `failedCount` so reading
+        // both directly avoids the double-count the previous code did
+        // by hand.
+        let activePending = queue?.pendingCount ?? 0
         let failed = queue?.failedCount ?? 0
-        let activePending = max(0, total - failed)
 
         if activePending == 0 && failed == 0 {
             EmptyView()
