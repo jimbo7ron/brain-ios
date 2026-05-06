@@ -216,13 +216,7 @@ final class NoteRepository {
             // carries the literal "none" string (see below).
             note.dueDate = (dueDate == "none") ? nil : dueDate
         }
-        if let dueTime = fields.dueTime {
-            note.dueTime = dueTime.isEmpty ? nil : dueTime
-        }
         if let priority = fields.priority { note.priority = priority }
-        if let recurrence = fields.recurrence {
-            note.recurrence = recurrence.isEmpty ? nil : recurrence
-        }
         if let projectId = fields.projectId {
             // "unassigned" is the wire-side clear sentinel — surface
             // locally as nil so the row falls into the Unassigned

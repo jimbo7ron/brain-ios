@@ -337,21 +337,26 @@ struct CreateProjectPayload: Encodable, Hashable {
 ///     the server). For Wave 1 the two are near-twins; the divergence
 ///     starts in Wave 3 when typed fields land.
 ///
-/// Field set (per M45 spec §6.1, expanded post-Wave-1 review to cover
-/// every field `EditTodoView.save()` already mutates): `content`,
-/// `title`, `url`, `dueDate`, `dueTime`, `priority`, `recurrence`,
-/// `projectId`, `section`, plus the appointment trio (`startTime`,
-/// `endTime`, `location`). All optional — only non-nil fields are
-/// applied locally and sent in the update.
+/// Field set (per M45 spec §6.1): `content`, `title`, `url`,
+/// `dueDate`, `priority`, `projectId`, `section`, plus the appointment
+/// trio (`startTime`, `endTime`, `location`). All optional — only
+/// non-nil fields are applied locally and sent in the update.
+///
+/// **Why no `dueTime` or `recurrence`**: the server's `NoteUpdate`
+/// schema (`brain/src/brain/schemas.py`) has no keys for either, so
+/// any value here would be silently dropped on the wire. Rather than
+/// a footgun for Wave 3 callers, the fields are omitted entirely.
+/// `LocalNote.dueTime` / `LocalNote.recurrence` still exist and are
+/// surfaced via the SyncEngine pull and other server-side write paths.
 ///
 /// **Nullable-update semantics (Wave 1)**: the wire shape skips nil
 /// fields. To clear an existing value the caller passes a sentinel:
 ///   * `dueDate: "none"` clears the due date (server convention).
-///   * `url: ""`, `section: ""`, `recurrence: ""`, `dueTime: ""`,
-///     `location: ""` are treated as clears locally; the wire ships
-///     the empty string and the server interprets it as a clear (or
-///     leaves the field alone, depending on the field — see
-///     `NoteUpdate` in `brain/src/brain/schemas.py`).
+///   * `url: ""`, `section: ""`, `location: ""` are treated as clears
+///     locally; the wire ships the empty string and the server
+///     interprets it as a clear (or leaves the field alone, depending
+///     on the field — see `NoteUpdate` in
+///     `brain/src/brain/schemas.py`).
 ///   * `projectId: "unassigned"` is the wire-side clear sentinel.
 /// A unified sentinel design (e.g. an explicit `.clear` enum case) is
 /// out of scope for Wave 1 — see TODO(M45 Wave 3) below.
@@ -365,12 +370,8 @@ struct NoteUpdateFields: Hashable {
     var url: String?
     /// "yyyy-MM-dd", "today", "tomorrow", or `"none"` to clear.
     var dueDate: String?
-    /// "HH:mm". Empty string clears locally.
-    var dueTime: String?
     /// "low" | "medium" | "high".
     var priority: String?
-    /// "daily" | "weekly" | "monthly" | "weekdays". Empty string clears.
-    var recurrence: String?
     /// Project name, short id, or `"unassigned"` to clear.
     var projectId: String?
     /// Section slug.

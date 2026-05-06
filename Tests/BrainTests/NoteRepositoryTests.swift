@@ -182,9 +182,7 @@ final class NoteRepositoryTests: XCTestCase {
         let fields = NoteUpdateFields(
             content: "new content",
             dueDate: nil,
-            dueTime: nil,
             priority: "high",
-            recurrence: nil,
             projectId: nil,
             section: nil
         )
@@ -208,11 +206,17 @@ final class NoteRepositoryTests: XCTestCase {
         XCTAssertEqual(queueRows.first?.baseUpdatedAt, baseUpdated)
     }
 
-    /// M45 Wave 1 review fix: `NoteUpdateFields` was expanded to cover
-    /// every field `EditTodoView.save()` already mutates (`title`,
-    /// `url`, `startTime`, `endTime`, `location`). Verify all fields
-    /// land on the local stub AND on the encoded queue payload so
-    /// Wave 2-3's view migration doesn't accidentally drop any.
+    /// M45 Wave 1 review fix: `NoteUpdateFields` covers every field
+    /// `EditTodoView.save()` already mutates that the server's
+    /// `NoteUpdate` actually accepts (`content`, `title`, `url`,
+    /// `dueDate`, `priority`, `projectId`, `section`, plus the
+    /// appointment trio). Verify all 10 fields land on the local stub
+    /// AND on the encoded queue payload so Wave 2-3's view migration
+    /// doesn't accidentally drop any.
+    ///
+    /// `dueTime` / `recurrence` are intentionally NOT exposed on
+    /// `NoteUpdateFields` — the server's `NoteUpdate` schema has no
+    /// matching keys, so they would be silently dropped on the wire.
     func testUpdate_appliesAllFields() throws {
         let (_, repo, queue, _, repoContext) = try makeFixture()
 
@@ -240,9 +244,7 @@ final class NoteRepositoryTests: XCTestCase {
             title: "new title",
             url: "https://new.example.com",
             dueDate: "2026-12-31",
-            dueTime: "09:30",
             priority: "high",
-            recurrence: "weekly",
             projectId: "77777777-7777-7777-7777-777777777777",
             section: "later",
             startTime: "2026-02-02T11:00:00Z",
@@ -256,9 +258,7 @@ final class NoteRepositoryTests: XCTestCase {
         XCTAssertEqual(note.title, "new title")
         XCTAssertEqual(note.url, "https://new.example.com")
         XCTAssertEqual(note.dueDate, "2026-12-31")
-        XCTAssertEqual(note.dueTime, "09:30")
         XCTAssertEqual(note.priority, "high")
-        XCTAssertEqual(note.recurrence, "weekly")
         XCTAssertEqual(note.projectId, "77777777-7777-7777-7777-777777777777")
         XCTAssertEqual(note.section, "later")
         XCTAssertEqual(note.appointmentStartTime, "2026-02-02T11:00:00Z")
