@@ -127,9 +127,11 @@ final class MutationQueue {
     /// `pendingCount - failedCount`. Renamed to `totalCount` and
     /// `pendingCount` re-introduced as a derived "active pending"
     /// (see below) so callers reading `.pendingCount` get the
-    /// intuitive value. The smoke-tests below still poke
-    /// `totalCount` directly because they're enqueue-bump tests
-    /// where the distinction doesn't matter.
+    /// intuitive value. The smoke-tests below still assert on
+    /// `pendingCount`; in those enqueue-bump scenarios no rows are
+    /// poisoned, so `failedCount` is zero and the derived
+    /// `pendingCount` equals `totalCount` — the distinction
+    /// doesn't matter for those checks.
     private(set) var totalCount: Int = 0
 
     /// Active-pending row count — `totalCount - failedCount`. This is

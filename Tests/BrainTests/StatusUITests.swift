@@ -39,10 +39,10 @@ final class StatusUITests: XCTestCase {
         return (queue, store)
     }
 
-    /// Wave 4 (spec §4.4): the pill computes "active pending" as
-    /// `pendingCount - failedCount`, so when no rows are poisoned,
-    /// `failedCount` is zero and the pending indicator carries the
-    /// full count.
+    /// Wave 4 (spec §4.4): the pill reads `pendingCount` (derived as
+    /// `totalCount - failedCount` inside the queue) and `failedCount`
+    /// directly. When no rows are poisoned, `failedCount` is zero and
+    /// `pendingCount` carries the full count.
     func testFailedCount_zeroWhenNoPoison() throws {
         let (queue, _) = try makeQueue()
         XCTAssertEqual(queue.pendingCount, 0)

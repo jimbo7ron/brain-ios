@@ -37,6 +37,12 @@ struct SignedInRootView: View {
 
     @State private var selectedTab: Tab = .today
 
+    /// Top offset added to `safeAreaInsets.top` when positioning the
+    /// floating mutation-status pill. Clears both compact (`44pt`) and
+    /// large-title (`96pt`) nav bars; see the rationale comment on the
+    /// overlay below.
+    private static let pillTopOffset: CGFloat = 52
+
     enum Tab: Hashable {
         case today
         case projects
@@ -73,7 +79,7 @@ struct SignedInRootView: View {
                 GeometryReader { proxy in
                     MutationStatusPill(queue: mutationQueue)
                         .padding(.trailing, 12)
-                        .padding(.top, proxy.safeAreaInsets.top + 52)
+                        .padding(.top, proxy.safeAreaInsets.top + Self.pillTopOffset)
                         .frame(maxWidth: .infinity, alignment: .topTrailing)
                         .allowsHitTesting(false)
                 }

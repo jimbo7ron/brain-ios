@@ -856,16 +856,12 @@ final class ProjectRepositoryTests: XCTestCase {
                 predicate: #Predicate { $0.op == "update_project" }
             )
         )
-        // If repo.update folds the rename into the pending create
-        // payload (no separate update row), the LWW interleave
-        // doesn't fire because there's no update response to
-        // reconcile. Document that path and exit cleanly.
-        guard let updateRow = updateRows.first else {
-            // TODO(M45 followup): surface a doc-test capturing
-            // "update folds into pending create" if that's the
-            // chosen optimistic-update behaviour for projects.
-            return
-        }
+        // `repo.update` always enqueues an `.updateProject` row (see
+        // `ProjectRepository.swift:160-166`). If that contract drifts
+        // — e.g. someone teaches it to fold the rename into the
+        // pending `.createProject` payload — this assertion fails
+        // loudly so the LWW interleave coverage isn't silently lost.
+        let updateRow = try XCTUnwrap(updateRows.first)
 
         // Step 3: simulate the update response landing while the
         // create is still queued. The create-echo hasn't reconciled

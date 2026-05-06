@@ -267,17 +267,17 @@ The "views never touch `modelContext.insert` directly" rule should be a `swiftli
 
 Brain's server uses soft-delete (`DELETE` = archive). `repo.archive(note)` is the public API. Hard delete only appears if the user wants permanent purge — defer.
 
-### 8.6.1 Failed-mutation recovery surface (M45 Wave 4 known gap)
-
-The status pill renders `⚠ M` when `M` rows have poisoned (permanent failure or retry-cap exceeded), but tapping the pill is currently informational only — there's no list-of-failures sheet, no retry button, no per-row "tap to investigate" affordance. Users see the count but can't act on it from inside the app today.
-
-Tracked as **M46** follow-up (alongside section reorder). The data the surface needs (`MutationQueueItem.lastError`, `attempts`, `op`, `resourceType`, `resourceId`) is already on disk; the design question is the UX shape (sheet? row affordance? auto-retry button?). Out of scope for M45.
-
 ### 8.6 Composite ids — `OptimisticStub` doesn't fit `LocalSection`
 
 `LocalSection` identifies as `projectID:slug` (see `SyncEngine.swift:514`), not a single UUID. `adoptServerID(_ newID: String)` assumes single-string identity and won't fit cleanly.
 
 **Decision (Wave 4 chose):** introduced sibling protocol `OptimisticCompositeStub`; `LocalSection` conforms. `addSection` falls back to direct `client.addProjectSection` when the parent project is still optimistic (rapid create-project-then-add-section is rare; full optimistic chaining would require composite-id rewrite during the parent project's reconcile). Rename-during-create folds the new name into the pending `.createSection` payload rather than enqueuing a stale `.updateSection` against the tmp slug.
+
+### 8.7 Failed-mutation recovery surface (M45 Wave 4 known gap)
+
+The status pill renders `⚠ M` when `M` rows have poisoned (permanent failure or retry-cap exceeded), but tapping the pill is currently informational only — there's no list-of-failures sheet, no retry button, no per-row "tap to investigate" affordance. Users see the count but can't act on it from inside the app today.
+
+Tracked as **M46** follow-up (alongside section reorder). The data the surface needs (`MutationQueueItem.lastError`, `attempts`, `op`, `resourceType`, `resourceId`) is already on disk; the design question is the UX shape (sheet? row affordance? auto-retry button?). Out of scope for M45.
 
 ## 9. Tests
 
