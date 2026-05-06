@@ -440,14 +440,25 @@ actor BrainAPIClient {
             return nil
         case .uncompleteTodo,
              .createProject,
-             .addSection:
-            // TODO(M41+): Wire each of these to its server endpoint.
-            // The shape is the same as `.updateTodo`: build a request
-            // via `makeRequest(...)` with `idempotencyKey: key`, then
-            // perform/performIgnoringBody depending on whether the
-            // caller cares about the response body. Keep `body` typed
-            // via the structs in `DTOs.swift` (e.g. `UpdateNotePayload`)
-            // and encode the payload at the call site before enqueue.
+             .addSection,
+             .unarchiveNote:
+            // TODO(M45 Wave 2-3 / M41+): Wire each of these to its
+            // server endpoint. The shape is the same as `.updateTodo`:
+            // build a request via `makeRequest(...)` with
+            // `idempotencyKey: key`, then perform/performIgnoringBody
+            // depending on whether the caller cares about the response
+            // body. Keep `body` typed via the structs in `DTOs.swift`.
+            //
+            // `.unarchiveNote` (M45 Wave 1) is a special case — the
+            // server has no unarchive endpoint today (`NoteUpdate`
+            // carries no `archived` field; there's no
+            // `/notes/{id}/unarchive` route). The case exists so the
+            // repository's call shape is stable; the actual server
+            // wiring is a Wave 2-3 follow-up. Until then a queued
+            // `.unarchiveNote` will get parked by the queue's
+            // poison-class handler — which is acceptable because the
+            // repository never enqueues this op in Wave 1 (it does the
+            // local flip and logs a TODO instead).
             throw Error.notImplemented("executeMutation(\(op.rawValue))")
         }
     }

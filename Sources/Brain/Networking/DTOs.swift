@@ -320,6 +320,57 @@ struct CreateProjectPayload: Encodable, Hashable {
     }
 }
 
+/// Typed diff for `NoteRepository.update(...)` (M45 Wave 1). Every
+/// field is optional; the repository serialises only the non-nil fields
+/// onto the wire `UpdateNotePayload` and ships them as the queue
+/// payload. Lives next to `CreateNotePayload` because it's the create-
+/// shape's update-shape sibling — same field surface, all-optional.
+///
+/// Why a separate struct from `UpdateNotePayload`:
+///   * `UpdateNotePayload` is the wire shape (snake_case, matches
+///     `brain/src/brain/schemas.py:NoteUpdate` 1:1). The repository
+///     contract sits one level above the wire — view callers shouldn't
+///     have to know the server's PATCH shape.
+///   * `NoteUpdateFields` carries iOS-side concepts the wire shape
+///     doesn't (e.g. a future `due_time` will land here as a typed
+///     `Date?` first, then get formatted to `"HH:MM"` on the way to
+///     the server). For Wave 1 the two are near-twins; the divergence
+///     starts in Wave 3 when typed fields land.
+///
+/// Field set (per M45 spec §6.1): `content`, `dueDate`, `dueTime`,
+/// `priority`, `recurrence`, `projectId`, `section`. All optional —
+/// only non-nil fields are sent in the update.
+struct NoteUpdateFields: Hashable {
+    var content: String?
+    var dueDate: String?
+    var dueTime: String?
+    /// "low" | "medium" | "high".
+    var priority: String?
+    /// "daily" | "weekly" | "monthly" | "weekdays".
+    var recurrence: String?
+    /// Project name, short id, or `"unassigned"` to clear.
+    var projectId: String?
+    /// Section slug.
+    var section: String?
+}
+
+/// Typed diff for `ProjectRepository.update(...)` (M45 Wave 1). Every
+/// field is optional; the repository serialises only the non-nil fields
+/// onto the wire `UpdateProjectPayload`. Same rationale as
+/// `NoteUpdateFields` — a repository-level diff that view callers can
+/// build without knowing the server's wire shape.
+///
+/// Field set (per M45 spec §6.2): `name`, `color`, `sortOrder`. The
+/// `archived` field stays out — `archive(_:)` is its own repository
+/// method per the spec (soft-delete is a distinct intent from a metadata
+/// patch).
+struct ProjectUpdateFields: Hashable {
+    var name: String?
+    /// Raw CSS colour string (e.g. `hsl(262 83% 58%)`).
+    var color: String?
+    var sortOrder: Int?
+}
+
 /// Body for `POST /api/v1/notes` — mirrors `NoteCreate` in
 /// `brain/src/brain/schemas.py`. Used by M39's quick-add flow to mint a
 /// todo (or, in future, an appointment) directly through the API. Every

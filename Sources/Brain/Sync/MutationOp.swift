@@ -61,6 +61,19 @@ enum MutationOp: String, Codable, CaseIterable {
     /// is DELETE.
     case archiveNote = "archive_note"
 
+    /// (M45 Wave 1) Reverse of `archiveNote`. The server has no
+    /// dedicated unarchive endpoint today — `NoteUpdate` doesn't carry
+    /// an `archived` field, and there's no `POST .../{id}/unarchive`
+    /// route (verified against `brain/src/brain/server.py` at the M45
+    /// Wave 1 cut). Keep the case here so persisted slugs from a
+    /// forward-looking build still decode after a downgrade, and so
+    /// `NoteRepository.unarchive(...)` has a stable target slug to
+    /// enqueue against once Wave 2-3 wires the server endpoint. The
+    /// `executeMutation` arm currently throws `.notImplemented` — the
+    /// queue's poison-class handler will park the row, surface a
+    /// non-fatal lastError, and drain past it.
+    case unarchiveNote = "unarchive_note"
+
     // MARK: - Project lifecycle
 
     /// `POST /api/v1/projects` — create a new project.

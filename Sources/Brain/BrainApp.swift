@@ -83,6 +83,27 @@ struct BrainApp: App {
     /// environment.
     @State private var notificationManager: NotificationManager
 
+    /// (M45 Wave 1) Per-row mutation status — keyed by the resource's
+    /// current id, populated by repositories on enqueue and cleared by
+    /// the queue on success / marked failed on poison. Held as
+    /// `@State` because `MutationStatusStore` is `@Observable`.
+    /// Constructed first in `init` (before the queue or repos) since
+    /// both depend on it.
+    @State private var mutationStatusStore: MutationStatusStore
+
+    /// (M45 Wave 1) Note write contract. Owns its own `ModelContext`
+    /// (the third one) so its lifetime stays app-bound rather than
+    /// view-tree-bound. All view-side note mutations (Wave 2-3 will
+    /// migrate them) flow through this; the queue handles the network
+    /// round-trip.
+    @State private var noteRepository: NoteRepository
+
+    /// (M45 Wave 1) Project write contract. Same shape as
+    /// `noteRepository`. Section ops (`addSection` / `renameSection`)
+    /// are direct-call until Wave 4 introduces an
+    /// `OptimisticCompositeStub` for composite-id models.
+    @State private var projectRepository: ProjectRepository
+
     /// "Compact density" toggle (Settings → Display). When `true`, the
     /// root content view is wrapped in `.dynamicTypeSize(.xSmall)` to
     /// shrink fonts, paddings, and list row heights by ~14-16%. SwiftUI
@@ -252,6 +273,36 @@ struct BrainApp: App {
         )
         _mutationQueue = State(initialValue: queue)
 
+        // M45 Wave 1: per-row mutation status store + Note/Project
+        // repositories. The store has no SwiftData backing — purely
+        // in-memory `[String: Status]`. The repositories own the
+        // *third* `ModelContext` against the same container; their
+        // lifetime is the app, not the view tree (per spec §4.1).
+        // Wiring order matters:
+        //   1. Construct the status store (no deps).
+        //   2. Hand the queue a weak reference to the store so its
+        //      reconcile + replay paths can rename / clear / mark
+        //      failed (per spec §4.4).
+        //   3. Construct the repositories with both queue + store.
+        let statusStore = MutationStatusStore()
+        _mutationStatusStore = State(initialValue: statusStore)
+        queue.statusStore = statusStore
+
+        let repositoryContext = ModelContext(modelContainer)
+        let noteRepo = NoteRepository(
+            modelContext: repositoryContext,
+            queue: queue,
+            statusStore: statusStore
+        )
+        _noteRepository = State(initialValue: noteRepo)
+        let projectRepo = ProjectRepository(
+            modelContext: repositoryContext,
+            queue: queue,
+            statusStore: statusStore,
+            client: apiClient
+        )
+        _projectRepository = State(initialValue: projectRepo)
+
         // Wire the engine -> queue back-reference now that both
         // exist. `attach(mutationQueue:)` lets the foreground sync
         // Timer drain queued mutations and lets a 401 from sync
@@ -406,6 +457,16 @@ struct BrainApp: App {
                 // SettingsView can trigger registration and surface
                 // current authorization status.
                 .environment(\.notificationManager, notificationManager)
+                // M45 Wave 1: expose the new write-coordinator
+                // singletons. No views consume these yet — Wave 2-4
+                // will migrate `QuickAddView`, `EditTodoView`, etc.
+                // off their open-coded `modelContext.insert + queue.
+                // enqueue` blocks. Wiring the env keys here keeps the
+                // migration's surface change to a one-line
+                // `@Environment(\.noteRepository)` per view.
+                .environment(\.mutationStatusStore, mutationStatusStore)
+                .environment(\.noteRepository, noteRepository)
+                .environment(\.projectRepository, projectRepository)
                 // Apply the global "Compact density" cap. `.xSmall` is
                 // ~86% of the default `.large`, hitting the user-
                 // requested ~15% shrink while letting SwiftUI scale
