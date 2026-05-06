@@ -20,15 +20,21 @@
 //     server-side; we just hand off the raw string).
 //   * Tags (read-only display of tags extracted from `content`).
 //
-// **Mutation routing:**
-// Save builds an `UpdateNotePayload`, JSON-encodes it, and enqueues
-// `MutationOp.updateTodo` against the M37 mutation queue with
-// `baseUpdatedAt: note.updatedAt` (the local row's last-known server
-// `updated_at`). M38's LWW conflict resolution drops the queue item if
-// a newer server-side write lands during the offline window. The view
-// also performs an optimistic local update so the UI reflects the
-// change immediately — the queue replay reconciles server-side, and
-// the next sync brings down authoritative state.
+// **Mutation routing (M45 Wave 3):**
+// Save builds a typed `NoteUpdateFields` from the form state and hands
+// it to `NoteRepository.update(note, fields)`. The repo applies the
+// optimistic local mutation, encodes the wire `UpdateNotePayload`, and
+// enqueues `.updateTodo` with `baseUpdatedAt: note.updatedAt` (the
+// local row's last-known server `updated_at`). M38's pull-side LWW
+// conflict resolution drops the queue item if a newer server-side
+// write lands during the offline window; M45 Wave 3 (spec §4.3) adds
+// a write-side LWW guard so the server's response doesn't clobber a
+// later edit the user enqueued before the first response landed.
+//
+// Pre-Wave-3 this view open-coded the encode + enqueue + optimistic
+// apply (see `applyOptimisticLocalUpdate` in the git history). The
+// repository now owns all three so every iOS write goes through one
+// contract — see `docs/M45-write-coordinator.md`.
 //
 // What this view deliberately does NOT do:
 //   * Tag editor — tags ride along inside `content` via `#hashtag`
@@ -126,8 +132,7 @@ enum TodoContentText {
 struct EditTodoView: View {
 
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.modelContext) private var modelContext
-    @Environment(\.mutationQueue) private var mutationQueue
+    @Environment(\.noteRepository) private var noteRepository
 
     /// The todo being edited. `@Bindable` so the optimistic local
     /// updates we apply on Save flow back through SwiftUI's render
@@ -383,16 +388,24 @@ struct EditTodoView: View {
 
     // MARK: - Save
 
-    /// Build the wire payload, optimistically update the local row,
-    /// enqueue the mutation, and dismiss. Failure paths inside the
-    /// queue (network, 5xx, auth) are handled by the M37 replayer; the
-    /// view exits as soon as the row is queued.
+    /// Build a typed `NoteUpdateFields` from the form state and hand it
+    /// to `NoteRepository.update(...)`. The repository owns the
+    /// optimistic apply, the wire encode, and the queue enqueue (spec
+    /// §6.1) — this view never touches `mutationQueue` or
+    /// `modelContext` directly.
     ///
     /// We do NOT wait for the queue replay to complete before
-    /// dismissing. The replay is fire-and-forget per M37 — the user's
-    /// optimistic UI is correct, and a slow server shouldn't pin them
-    /// in the dialog. The next sync (foreground Timer or PTR) will
-    /// reconcile the authoritative state.
+    /// dismissing. The replay is fire-and-forget per M37 / M45 Wave 1 —
+    /// the user's optimistic UI is correct, and a slow server shouldn't
+    /// pin them in the dialog. The repository's response reconcile
+    /// (M45 Wave 3, spec §4.3) brings down the server's authoritative
+    /// fields under the LWW guard once the round-trip lands.
+    ///
+    /// Field diff: only fields that diverge from the live `LocalNote`
+    /// are populated. The server is forgiving on missing keys, but
+    /// narrowing the surface keeps the queue payload small and reduces
+    /// the chance of accidentally overwriting a field some other client
+    /// just changed.
     private func save() async {
         guard canSave else { return }
 
@@ -400,15 +413,9 @@ struct EditTodoView: View {
         let combinedContent = TodoContentText.join(title: trimmedTitle, notes: notes)
         let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // Build the payload — only send fields that diverge from the
-        // current server state. The server is forgiving on missing
-        // keys, but smaller payloads trim wire size and reduce the
-        // chance of accidentally over-writing a field that some other
-        // client just changed (LWW catches the worst cases, but
-        // narrowing the surface is still good hygiene).
-        var payload = UpdateNotePayload()
+        var fields = NoteUpdateFields()
         if combinedContent != note.content {
-            payload.content = combinedContent
+            fields.content = combinedContent
         }
         // Title: send the (possibly empty) title as a separate hint —
         // the server keeps the explicit title alongside `content`. We
@@ -416,119 +423,69 @@ struct EditTodoView: View {
         // sticks.
         let originalTitle = (note.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmedTitle != originalTitle {
-            payload.title = trimmedTitle
+            fields.title = trimmedTitle
         }
         // Due date: the literal string "none" clears the field, per
-        // server convention. An empty string from the user means the
-        // same thing — we translate to "none" so the wire shape is
-        // explicit.
+        // server convention (and `NoteUpdateFields.dueDate` doc-comment).
+        // An empty string from the user means the same thing — translate
+        // to "none" so the wire shape is explicit.
         let trimmedDue = dueDate.trimmingCharacters(in: .whitespaces)
         let normalisedDue = trimmedDue.isEmpty ? "none" : trimmedDue
         let originalDue = (note.dueDate ?? "").trimmingCharacters(in: .whitespaces)
         if (originalDue.isEmpty && normalisedDue != "none") ||
            (!originalDue.isEmpty && normalisedDue != originalDue) {
-            payload.dueDate = normalisedDue
+            fields.dueDate = normalisedDue
         }
         if priority != note.priority {
-            payload.priority = priority
+            fields.priority = priority
         }
         let currentProject = note.projectId ?? "unassigned"
         if projectId != currentProject {
-            payload.project = projectId
+            fields.projectId = projectId
         }
         if sectionSlug != (note.section ?? "now") {
-            payload.section = sectionSlug
+            fields.section = sectionSlug
         }
         let currentURL = (note.url ?? "")
         if trimmedURL != currentURL {
-            // Empty string explicitly clears server-side.
-            payload.url = trimmedURL
+            // Empty string explicitly clears server-side per
+            // `NoteUpdateFields.url` convention.
+            fields.url = trimmedURL
         }
 
         // Nothing changed — short-circuit the save so we don't enqueue
         // an empty PUT. Saves a wasted round-trip and keeps the queue
         // tidy.
-        if isPayloadEmpty(payload) {
+        if isFieldsEmpty(fields) {
             dismiss()
             return
         }
 
-        let encoded: Data
-        do {
-            encoded = try JSONEncoder().encode(payload)
-        } catch {
-            errorMessage = "Couldn't prepare the change: \(error.localizedDescription)"
-            return
-        }
-
-        guard let queue = mutationQueue else {
-            errorMessage = "Mutation queue unavailable. Try again."
+        guard let repo = noteRepository else {
+            errorMessage = "Note repository unavailable. Try again."
             return
         }
 
         isSaving = true
         defer { isSaving = false }
 
-        // Optimistic local mutation — apply *before* enqueue so the row
-        // re-renders immediately when the dialog dismisses. The queue's
-        // replay completes asynchronously; the next sync brings down
-        // the server's authoritative `updatedAt`.
-        applyOptimisticLocalUpdate(combinedContent: combinedContent)
-
-        do {
-            _ = try queue.enqueue(
-                op: .updateTodo,
-                resourceType: "todo",
-                resourceId: note.id,
-                payload: encoded,
-                baseUpdatedAt: note.updatedAt
-            )
-            // M43: medium haptic on a committed multi-field save.
-            // Stronger than the M36 toggle haptic (which is `.light`)
-            // because the user just typed and chose; the heavier
-            // tap reinforces the "yes, this stuck" signal.
-            BrainHaptics.medium()
-            dismiss()
-        } catch {
-            // Enqueue failure (SwiftData fault). Roll the local update
-            // back so the user can see something went wrong and retry.
-            // We don't have a clean snapshot to revert to without
-            // refetching from the server, so the simplest correct move
-            // is to surface the error and let the next sync re-apply
-            // the server's version.
-            errorMessage = "Couldn't queue the change: \(error.localizedDescription)"
-            BrainHaptics.error()
-        }
+        repo.update(note, fields)
+        // M43: medium haptic on a committed multi-field save. Stronger
+        // than the M36 toggle haptic (which is `.light`) because the
+        // user just typed and chose; the heavier tap reinforces the
+        // "yes, this stuck" signal.
+        BrainHaptics.medium()
+        dismiss()
     }
 
-    /// Apply form values to the live `LocalNote` so the next render
-    /// shows the new state. SwiftData persists the change in the same
-    /// `modelContext.save()` call. We don't bump `updatedAt` — that's
-    /// the server's job, and the M38 LWW comparison keys off the
-    /// *server's* timestamp, not ours. Setting it locally would
-    /// confuse `resolveConflictIfNeeded`.
-    private func applyOptimisticLocalUpdate(combinedContent: String) {
-        note.content = combinedContent
-        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        note.title = trimmedTitle.isEmpty ? nil : trimmedTitle
-        let trimmedDue = dueDate.trimmingCharacters(in: .whitespaces)
-        note.dueDate = trimmedDue.isEmpty ? nil : trimmedDue
-        note.priority = priority
-        note.projectId = projectId == "unassigned" ? nil : projectId
-        note.section = sectionSlug
-        let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        note.url = trimmedURL.isEmpty ? nil : trimmedURL
-        try? modelContext.save()
-    }
-
-    /// True if the payload has no fields set — every field is nil.
-    /// We don't want to enqueue a PUT with an empty body when the
-    /// user opened the dialog, made no changes, and hit Save.
-    private func isPayloadEmpty(_ payload: UpdateNotePayload) -> Bool {
-        payload.content == nil && payload.title == nil && payload.dueDate == nil &&
-        payload.priority == nil && payload.project == nil && payload.section == nil &&
-        payload.url == nil && payload.startTime == nil && payload.endTime == nil &&
-        payload.location == nil
+    /// True if the diff has no fields set — every field is nil. We
+    /// don't want to enqueue a PUT with an empty body when the user
+    /// opened the dialog, made no changes, and hit Save.
+    private func isFieldsEmpty(_ fields: NoteUpdateFields) -> Bool {
+        fields.content == nil && fields.title == nil && fields.dueDate == nil &&
+        fields.priority == nil && fields.projectId == nil && fields.section == nil &&
+        fields.url == nil && fields.startTime == nil && fields.endTime == nil &&
+        fields.location == nil
     }
 }
 

@@ -5,25 +5,19 @@
 // `web/src/components/todo-item.tsx` — checkbox on the left, title
 // + due-date hint + tag pills in the middle.
 //
-// M36 wires the checkbox to `POST /api/v1/notes/{id}/complete`:
-//   1. Capture the row's prior `completed` / `completedAt` state.
-//   2. Optimistically flip both local fields and `try? save()`.
-//   3. Fire the server call. On failure, revert the local fields and
-//      save again — SwiftUI re-renders from the SwiftData mutation.
-//
-// There's no `/uncomplete` server endpoint yet (deferred to M40), so
-// tapping an already-completed row is a no-op — we leave the strike-
-// through styling and the foreground stay-put. Spec calls this out
-// explicitly: "Fall back to 'complete only' gracefully if /uncomplete
-// doesn't exist." When M40 lands we'll branch on `note.completed`
-// here and call the new endpoint.
+// M45 Wave 3: both row-level mutations go through `NoteRepository`:
+//   * Tap-to-complete checkbox calls `noteRepo.toggleComplete(note)`,
+//     which optimistically flips `completed` + `completedAt` and
+//     enqueues `.completeTodo` / `.uncompleteTodo` against the M37
+//     queue. Pre-Wave-3 the row called `client.completeTodo(...)`
+//     directly with a hand-rolled rollback on failure (the M37+ TODO
+//     comment that lived here noted the queue migration was pending).
+//   * Trailing swipe-to-archive calls `noteRepo.archive(note)`. The
+//     repo applies the local flip and enqueues `.archiveNote`.
 //
 // Project tint: the parent view (`TodayView` / `ProjectDetailView`)
-// resolves the accent from a hoisted `[String: LocalProject]` dict
-// and passes it in, so this row does not run its own per-row
-// `@Query`. Both parents already inject `\.brainAPIClient` and the
-// SwiftData `\.modelContext` from the app scene, so the toggle has
-// everything it needs without extra plumbing.
+// resolves the accent from a hoisted `[String: LocalProject]` dict and
+// passes it in, so this row does not run its own per-row `@Query`.
 
 import SwiftData
 import SwiftUI
@@ -38,25 +32,14 @@ struct TodoRow: View {
     let accentColor: Color
 
     @Environment(\.modelContext) private var modelContext
-    /// Optional because the environment key default is `nil` (see
-    /// `BrainAPIClientKey.defaultValue`). In production `BrainApp`
-    /// always injects a real client; previews and unit hosts may not.
-    /// When the client is missing the toggle becomes a local-only
-    /// flip with no rollback — fine for previews, never hit in
-    /// production.
-    @Environment(\.brainAPIClient) private var client
-    /// Optional for the same reason as `client` — the env key
-    /// default is `nil`. In production `BrainApp` always injects a
-    /// real engine; we use it on a 401 from `completeTodo` to hand
-    /// off to `signOutDueToUnauthorized()` immediately rather than
-    /// waiting up to 5 minutes for the next sync tick to detect the
-    /// revoked key. See `toggle()` for the catch-block branching.
-    @Environment(\.syncEngine) private var syncEngine
-    /// Mutation queue used by the M44.x swipe-to-archive action.
-    /// Optional — same defaulting rationale as `client` / `syncEngine`.
-    /// In production `BrainApp` always injects a real queue; previews
-    /// fall through to a local-only archive flip with no server replay.
-    @Environment(\.mutationQueue) private var mutationQueue
+    /// M45 Wave 3: the only write surface this row reads from. Both
+    /// `archive()` and `toggle()` route through it. Optional because
+    /// the env key default is `nil` (preview / non-production hosts);
+    /// production `BrainApp.init` always wires a real repository.
+    /// When the repo is missing we fall back to a local-only flip so
+    /// SwiftUI previews still feel responsive — production never hits
+    /// that branch.
+    @Environment(\.noteRepository) private var noteRepository
 
     /// Tracks whether a toggle is currently in flight. Prevents a
     /// rapid double-tap from firing two POSTs against the server
@@ -198,32 +181,19 @@ struct TodoRow: View {
         }
     }
 
-    /// Optimistic local archive + enqueue the server-side archive
-    /// mutation. Mirrors the `toggle()` shape: capture rollback state,
-    /// flip the local row, hand off to the M37 queue. The queue replays
-    /// `DELETE /api/v1/notes/{id}` (the brain server treats DELETE as
-    /// soft-delete / archive — see `delete_note_endpoint`).
-    ///
-    /// We do NOT roll back on enqueue failure: a SwiftData fault here
-    /// is rare and surfacing it requires an inline error UI we don't
-    /// have on the row. The next sync brings down the server's
-    /// authoritative `archived` state, which is the correct recovery
-    /// path either way. If the queue is missing (preview / non-
-    /// production host), we still flip locally so SwiftUI previews
-    /// feel responsive.
+    /// M45 Wave 3: hand off to `NoteRepository.archive(...)`. The repo
+    /// flips `archived = true` locally and enqueues `.archiveNote`
+    /// (the brain server treats DELETE as soft-delete / archive — see
+    /// `delete_note_endpoint`). Pre-Wave-3 this method open-coded the
+    /// `mutationQueue.enqueue(.archiveNote, ...)` dance; the repo now
+    /// owns it.
     private func archive() {
         // Already archived — defensive guard. Shouldn't happen because
         // the row is filtered out of every list that hosts it before
         // the user can swipe, but a stale query result + a fast tap
-        // could in theory race here.
+        // could in theory race here. Mirrored on the repo too; doing
+        // the check here lets us skip the haptic on the no-op path.
         guard !note.archived else { return }
-
-        // Optimistic flip — render-immediate. The `@Query` predicates
-        // in TodayView / ProjectDetailView / UnassignedDetailView all
-        // filter on `!archived`, so the row drops out of the list as
-        // soon as `try? modelContext.save()` lands.
-        note.archived = true
-        try? modelContext.save()
 
         // Light haptic: matches the M36 complete-toggle weight rather
         // than the heavier `.medium` used for multi-field saves. An
@@ -231,113 +201,61 @@ struct TodoRow: View {
         // the haptic vocabulary consistent with the rest of the row.
         BrainHaptics.light()
 
-        guard let queue = mutationQueue else {
-            // Preview / non-production host: the local-only flip above
-            // is the entire effect. Production never hits this branch.
+        guard let repo = noteRepository else {
+            // Preview / non-production host: do a local-only flip so
+            // SwiftUI previews still feel responsive. Production never
+            // hits this branch.
+            note.archived = true
+            try? modelContext.save()
             return
         }
-
-        // Empty payload — DELETE has no body. The replay path in
-        // `BrainAPIClient.executeMutation` reads only the resourceId
-        // and idempotencyKey from the queue row.
-        do {
-            _ = try queue.enqueue(
-                op: .archiveNote,
-                resourceType: "todo",
-                resourceId: note.id,
-                payload: Data(),
-                baseUpdatedAt: note.updatedAt
-            )
-        } catch {
-            // Enqueue failure (SwiftData fault). The local archive is
-            // already applied; without a clean snapshot to revert to
-            // and no inline error UI on the row, the simplest correct
-            // move is to surface a haptic and let the next sync
-            // reconcile against the server's state. The user can
-            // always re-archive from the edit dialog if the row
-            // resurfaces.
-            BrainHaptics.error()
-        }
+        repo.archive(note)
     }
 
-    /// Flip the row to completed with optimistic UI + rollback on
-    /// failure. Spec (M36): "Optimistic update + API call. Failure
-    /// rolls back the local view." We capture the original state up
-    /// front so the rollback path doesn't have to recompute it from
-    /// possibly-already-stale fields.
+    /// M45 Wave 3 (resolves the M37+ TODO that lived in this method's
+    /// previous incarnation): hand off to
+    /// `NoteRepository.toggleComplete(...)`. The repo applies the
+    /// optimistic flip on `completed` + `completedAt`, enqueues
+    /// `.completeTodo` or `.uncompleteTodo` against the M37 queue, and
+    /// the queue's replay handles the round-trip + LWW reconcile.
     ///
-    /// We do NOT trigger `SyncEngine.sync()` after success: the next
-    /// 5-minute foreground tick (M33) or scenePhase-active rehydrate
-    /// will pick up the server's authoritative `completed_at`
-    /// timestamp. Firing sync per-tap would amplify network load on
-    /// rapid completions and racy-mutate the row we just touched.
-    /// M37 will replumb this through the mutation queue and that's
-    /// where bulk-replay-then-sync coordination belongs.
+    /// Pre-Wave-3 this method called `client.completeTodo(...)`
+    /// directly with a hand-rolled rollback on failure and a manual
+    /// 401 → `signOutDueToUnauthorized` branch. Both responsibilities
+    /// now live in the queue's `replay()` taxonomy: rollback is the
+    /// `rollbackOptimisticStateIfNeeded` path, and 401 handoff is the
+    /// queue's `handleUnauthorized()` (which mirrors the SyncEngine's
+    /// behaviour). The recovery latency stays at "next replay tick" —
+    /// in practice still seconds, since `enqueue` fires a background
+    /// `replay()` Task immediately.
     private func toggle() async {
-        // No `/uncomplete` endpoint yet (server has only `/complete`,
-        // see brain/src/brain/server.py). Re-opening a completed row
-        // is M40. Until then, tapping a done row is a deliberate
-        // no-op rather than a misleading optimistic flip that the
-        // next sync would silently revert.
+        // No `/uncomplete` endpoint on the server today (server has
+        // only `/complete`); the repo's `.uncompleteTodo` arm in
+        // `BrainAPIClient.executeMutation` throws `.notImplemented`
+        // and the queue parks the row. Until the server endpoint
+        // lands, tapping a completed row is a deliberate no-op rather
+        // than a misleading optimistic flip the queue would then
+        // poison.
         guard !note.completed else { return }
-        guard let client = client else {
-            // Preview / non-production host: do a local-only flip so
-            // SwiftUI previews still feel responsive, and skip the
-            // server call. Production never hits this branch.
+
+        isToggling = true
+        defer { isToggling = false }
+
+        guard let repo = noteRepository else {
+            // Preview / non-production host: local-only flip so
+            // previews still feel responsive. Production never hits
+            // this branch.
             note.completed = true
             note.completedAt = Date()
             try? modelContext.save()
             return
         }
 
-        isToggling = true
-        defer { isToggling = false }
-
-        // Capture rollback state.
-        let wasCompleted = note.completed
-        let originalCompletedAt = note.completedAt
-
-        // Optimistic flip — render-immediate.
-        note.completed = true
-        note.completedAt = Date()
-        try? modelContext.save()
-
-        do {
-            _ = try await client.completeTodo(noteId: note.id)
-            // Light tactile confirmation on success. Matches the iOS
-            // system idiom for a "thing happened" affordance — the
-            // web equivalent is the brief Lucide `Check` flash on
-            // todo-item.tsx. M43 routes through `BrainHaptics` so the
-            // generator is `prepare()`-warmed and the latency drops
-            // below the perceptual threshold; the M36 polish-backlog
-            // item ("`prepare()` on haptic generator") is addressed
-            // there.
-            BrainHaptics.light()
-        } catch BrainAPIClient.Error.unauthorized {
-            // 401: the device's API key was revoked (server-side
-            // sign-out, key rotation, etc.). Roll back the optimistic
-            // flip first — we don't want a stale "completed"
-            // checkmark lingering as the LoginView animates in — then
-            // hand off to the SyncEngine's centralised 401 handler.
-            // Without this branch the user would sit on a revoked
-            // key until the next 5-minute sync tick caught the same
-            // 401 and triggered the sign-out then; the polish here
-            // is that recovery latency drops from "up to 5 minutes"
-            // to "immediate".
-            note.completed = wasCompleted
-            note.completedAt = originalCompletedAt
-            try? modelContext.save()
-            await syncEngine?.signOutDueToUnauthorized()
-        } catch {
-            // Revert. Visual revert is the success signal. M43 adds
-            // an error-pattern haptic so the failure is also felt —
-            // the rollback is silent visually (we don't surface a
-            // toast), so the haptic carries the entire signal weight.
-            note.completed = wasCompleted
-            note.completedAt = originalCompletedAt
-            try? modelContext.save()
-            BrainHaptics.error()
-        }
+        repo.toggleComplete(note)
+        // Light tactile confirmation. The repo's optimistic apply has
+        // already landed, so the haptic fires alongside the visible
+        // strike-through.
+        BrainHaptics.light()
     }
 
     /// Bottom-line metadata: due-date hint, then any tags. Matches

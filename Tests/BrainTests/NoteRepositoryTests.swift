@@ -461,4 +461,300 @@ final class NoteRepositoryTests: XCTestCase {
         store.clear(serverID)
         XCTAssertNil(store.status(for: serverID))
     }
+
+    // MARK: - Toggle complete (Wave 3)
+
+    /// M45 Wave 3: `repo.toggleComplete(note)` flips `completed` /
+    /// `completedAt` locally and enqueues `.completeTodo` (or
+    /// `.uncompleteTodo` on the reverse path). One representative
+    /// test of the toggle path; the reverse direction reuses the same
+    /// code path with a different op slug.
+    func testToggleComplete_flipsCompletedAtAndCompletedField() throws {
+        let (_, repo, queue, _, repoContext) = try makeFixture()
+
+        let serverID = "44444444-4444-4444-4444-444444444444"
+        let baseUpdated = Date(timeIntervalSinceReferenceDate: 0)
+        let note = LocalNote(
+            id: serverID,
+            shortId: "tc-1",
+            title: nil,
+            content: "to complete",
+            type: "todo",
+            createdAt: baseUpdated,
+            updatedAt: baseUpdated,
+            completed: false,
+            completedAt: nil
+        )
+        repoContext.insert(note)
+        try repoContext.save()
+
+        repo.toggleComplete(note)
+
+        // Optimistic local flip — both fields move together so list
+        // styling (strike-through + completedAt-driven sort) stays
+        // coherent.
+        XCTAssertTrue(note.completed)
+        XCTAssertNotNil(note.completedAt)
+        // updatedAt bumped past the base so any updated_at-sorted
+        // @Query re-orders immediately.
+        XCTAssertGreaterThan(note.updatedAt!, baseUpdated)
+
+        // Queue holds a `.completeTodo` row with empty payload (the
+        // server reads {note_id} from the path, not the body) and the
+        // pre-toggle updatedAt as the LWW base.
+        let queueRows = try queue.debugModelContext.fetch(
+            FetchDescriptor<MutationQueueItem>()
+        )
+        XCTAssertEqual(queueRows.count, 1)
+        XCTAssertEqual(queueRows.first?.op, MutationOp.completeTodo.rawValue)
+        XCTAssertEqual(queueRows.first?.resourceId, serverID)
+        XCTAssertEqual(queueRows.first?.payload, Data())
+        XCTAssertEqual(queueRows.first?.baseUpdatedAt, baseUpdated)
+    }
+
+    // MARK: - Archive (Wave 3 — augments the Wave 1 test)
+
+    /// M45 Wave 3 sanity check that `repo.archive(...)` produces an
+    /// LWW-baseable queue row alongside the local flip. The Wave 1
+    /// `testArchive_flipsLocalAndEnqueues` covered the local + queue
+    /// row presence; this one tightens the LWW base + payload-empty
+    /// invariant that the swipe path now relies on (TodoRow no longer
+    /// open-codes the enqueue, so the contract lives entirely in the
+    /// repo).
+    func testArchive_marksLocalAndEnqueues() throws {
+        let (_, repo, queue, _, repoContext) = try makeFixture()
+
+        let serverID = "55555555-5555-5555-5555-555555555555"
+        let baseUpdated = Date(timeIntervalSinceReferenceDate: 0)
+        let note = LocalNote(
+            id: serverID,
+            shortId: "arc-1",
+            title: nil,
+            content: "to archive",
+            type: "todo",
+            createdAt: baseUpdated,
+            updatedAt: baseUpdated
+        )
+        repoContext.insert(note)
+        try repoContext.save()
+
+        repo.archive(note)
+
+        XCTAssertTrue(note.archived)
+        XCTAssertGreaterThan(note.updatedAt!, baseUpdated)
+
+        let queueRows = try queue.debugModelContext.fetch(
+            FetchDescriptor<MutationQueueItem>()
+        )
+        XCTAssertEqual(queueRows.count, 1)
+        XCTAssertEqual(queueRows.first?.op, MutationOp.archiveNote.rawValue)
+        XCTAssertEqual(queueRows.first?.resourceId, serverID)
+        XCTAssertEqual(queueRows.first?.payload, Data())
+        XCTAssertEqual(queueRows.first?.baseUpdatedAt, baseUpdated)
+    }
+
+    // MARK: - Update-response reconcile (Wave 3, spec §4.3)
+
+    /// Helper: build a `Note` DTO suitable for feeding into
+    /// `debugReconcileUpdateResponse`. Centralising the boilerplate
+    /// keeps the LWW-guard tests focused on the field that matters
+    /// (the title / content / updated_at the server reshaped).
+    private func makeServerNote(
+        id: String,
+        title: String?,
+        content: String,
+        updatedAt: String? = "2026-05-05T00:00:00Z"
+    ) -> Note {
+        Note(
+            id: id,
+            shortId: "srv-\(id.prefix(4))",
+            title: title,
+            content: content,
+            type: "todo",
+            tags: [],
+            createdAt: "2026-05-04T00:00:00Z",
+            updatedAt: updatedAt,
+            archived: false,
+            todo: nil,
+            appointment: nil
+        )
+    }
+
+    /// M45 Wave 3 (spec §4.3): if the user has enqueued a SECOND edit
+    /// before the first `.updateTodo` response lands, the response copy
+    /// must be DROPPED — applying it would clobber the user's newer
+    /// optimistic state.
+    func testUpdateNote_appliesLWWGuard_dropResponseWhenNewerEditPending() throws {
+        let (_, repo, queue, _, repoContext) = try makeFixture()
+
+        // Seed the post-create-reconcile world.
+        let serverID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        let baseUpdated = Date(timeIntervalSinceReferenceDate: 0)
+        let note = LocalNote(
+            id: serverID,
+            shortId: "upd-1",
+            title: "first local title",
+            content: "first local content",
+            type: "todo",
+            createdAt: baseUpdated,
+            updatedAt: baseUpdated,
+            priority: "medium"
+        )
+        repoContext.insert(note)
+        try repoContext.save()
+
+        // First edit — represents the in-flight update whose response
+        // we're about to receive.
+        repo.update(note, NoteUpdateFields(content: "second local content"))
+
+        // Second edit — represents the user editing again before the
+        // response lands. After this call there are TWO `.updateTodo`
+        // rows in the queue, both targeting `serverID`.
+        repo.update(note, NoteUpdateFields(content: "third local content"))
+
+        // Sanity-check: queue holds two rows for this resource. Sort
+        // by createdAt and pick the older one as the in-flight item
+        // whose response we're simulating.
+        let allBefore = try queue.debugModelContext.fetch(
+            FetchDescriptor<MutationQueueItem>(
+                sortBy: [SortDescriptor(\.createdAt, order: .forward)]
+            )
+        )
+        XCTAssertEqual(allBefore.count, 2)
+        let firstItem = allBefore[0]
+
+        // Server response for the FIRST edit. Server-derived title.
+        let serverNote = makeServerNote(
+            id: serverID,
+            title: "server-derived from second",
+            content: "server-canonical second content"
+        )
+        queue.debugReconcileUpdateResponse(currentItem: firstItem, serverNote: serverNote)
+        // Mirror replay()'s success-terminal save so any mutation the
+        // reconcile applied lands in the shared SQLite store. In the
+        // drop branch this is a no-op (no mutation), but explicitly
+        // saving keeps the test parallel with the accept branch.
+        try queue.debugModelContext.save()
+
+        // Re-fetch from the repo's context to observe the post-
+        // reconcile state (cross-context propagation: queueContext
+        // mutated and saved; repoContext picks up the change on the
+        // next fetch).
+        let descriptor = LocalNote.makeFetchByID(serverID)
+        let observed = try repoContext.fetch(descriptor).first
+        XCTAssertNotNil(observed)
+
+        // LWW guard fired: response was dropped, so the local row still
+        // reflects the user's THIRD (latest) edit, NOT the server's
+        // response copy of the second edit.
+        XCTAssertEqual(observed?.content, "third local content")
+        XCTAssertEqual(observed?.title, "first local title",
+                       "title should not have been overwritten by server-derived value")
+    }
+
+    /// Mirror image: when only the in-flight edit is pending (no newer
+    /// edit), the response IS applied — closing the silent-divergence
+    /// window the M45 spec §4.3 calls out.
+    func testUpdateNote_appliesLWWGuard_acceptsResponseWhenNoNewerEdit() throws {
+        let (_, repo, queue, _, repoContext) = try makeFixture()
+
+        let serverID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        let baseUpdated = Date(timeIntervalSinceReferenceDate: 0)
+        let note = LocalNote(
+            id: serverID,
+            shortId: "upd-2",
+            title: "local title",
+            content: "local content",
+            type: "todo",
+            createdAt: baseUpdated,
+            updatedAt: baseUpdated,
+            priority: "medium"
+        )
+        repoContext.insert(note)
+        try repoContext.save()
+
+        repo.update(note, NoteUpdateFields(content: "user-edited content"))
+
+        let allBefore = try queue.debugModelContext.fetch(
+            FetchDescriptor<MutationQueueItem>()
+        )
+        XCTAssertEqual(allBefore.count, 1)
+        let inflightItem = allBefore[0]
+
+        let serverNote = makeServerNote(
+            id: serverID,
+            title: "server canonical title",
+            content: "server canonical content"
+        )
+        queue.debugReconcileUpdateResponse(currentItem: inflightItem, serverNote: serverNote)
+        try queue.debugModelContext.save()
+
+        // Re-fetch from the repo's context — the reconcile mutated the
+        // row on the queue's context; cross-context propagation lands
+        // it on disk and a fresh fetch reads the post-reconcile state.
+        let descriptor = LocalNote.makeFetchByID(serverID)
+        let observed = try repoContext.fetch(descriptor).first
+        XCTAssertNotNil(observed)
+
+        // No newer edit pending → response applied, server's canonical
+        // fields land on the row.
+        XCTAssertEqual(observed?.content, "server canonical content")
+        XCTAssertEqual(observed?.title, "server canonical title")
+    }
+
+    /// Spec §4.3 motivating example: the server re-extracts a title
+    /// from `content` via M26 NLP. After reconcile, the local title
+    /// should reflect the server's derivation — exactly the silent-
+    /// divergence case the Wave 3 reconcile is designed to close.
+    func testUpdateNote_serverDerivedTitleAppliesAfterReconcile() throws {
+        let (_, repo, queue, _, repoContext) = try makeFixture()
+
+        let serverID = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        let baseUpdated = Date(timeIntervalSinceReferenceDate: 0)
+        let note = LocalNote(
+            id: serverID,
+            shortId: "upd-3",
+            // Pre-edit: client-side derived title from old content.
+            title: "old client-derived title",
+            content: "old content body",
+            type: "todo",
+            createdAt: baseUpdated,
+            updatedAt: baseUpdated,
+            priority: "medium"
+        )
+        repoContext.insert(note)
+        try repoContext.save()
+
+        // User edits content; the client doesn't re-derive a title
+        // locally (matches the production EditTodoView path — the form
+        // ships content but leaves title alone unless the user
+        // explicitly types one).
+        repo.update(note, NoteUpdateFields(content: "Buy milk\n\nremember 2 percent"))
+
+        let allBefore = try queue.debugModelContext.fetch(
+            FetchDescriptor<MutationQueueItem>()
+        )
+        XCTAssertEqual(allBefore.count, 1)
+        let inflightItem = allBefore[0]
+
+        // Simulate the M26 NLP server-side title derivation: server
+        // pulls the first line ("Buy milk") and ships it as the
+        // canonical title alongside the content.
+        let serverNote = makeServerNote(
+            id: serverID,
+            title: "Buy milk",
+            content: "Buy milk\n\nremember 2 percent"
+        )
+        queue.debugReconcileUpdateResponse(currentItem: inflightItem, serverNote: serverNote)
+        try queue.debugModelContext.save()
+
+        let descriptor = LocalNote.makeFetchByID(serverID)
+        let observed = try repoContext.fetch(descriptor).first
+        XCTAssertNotNil(observed)
+
+        // Server's canonical title now lives on the local row — the
+        // pre-edit "old client-derived title" is gone.
+        XCTAssertEqual(observed?.title, "Buy milk")
+        XCTAssertEqual(observed?.content, "Buy milk\n\nremember 2 percent")
+    }
 }
