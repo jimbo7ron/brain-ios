@@ -132,6 +132,9 @@ extension LocalNote {
     /// `adoptServerID(_:)` on the M45 ceremony path so the dedupe-then-
     /// rename ordering stays explicit at the call site.
     func copyFields(from note: Note, parseDate: (String?) -> Date?) {
+        // IMPORTANT: must not read `self.id`. MutationQueue.reconcileCreate
+        // relies on this — see the rename-before-copyFields ordering rationale
+        // in MutationQueue.swift's reconcileCreate doc-comment.
         let createdAt = parseDate(note.createdAt)
         let updatedAt = parseDate(note.updatedAt)
         let tagsCSV = note.tags.joined(separator: ",")
@@ -181,6 +184,9 @@ extension LocalProject {
     /// `adoptServerID(_:)` on the M45 ceremony path. M26's default-
     /// section reconcile is owned by the caller (or by SyncEngine).
     func copyFields(from project: Project, parseDate: (String?) -> Date?) {
+        // IMPORTANT: must not read `self.id`. MutationQueue.reconcileCreate
+        // relies on this — see the rename-before-copyFields ordering rationale
+        // in MutationQueue.swift's reconcileCreate doc-comment.
         self.shortId = project.shortId
         self.name = project.name
         self.color = project.color
@@ -188,5 +194,54 @@ extension LocalProject {
         self.archived = project.archived
         self.createdAt = parseDate(project.createdAt)
         self.updatedAt = parseDate(project.updatedAt)
+    }
+
+    /// Bring `project.sections` into agreement with the wire payload.
+    /// Mirrors `SyncEngine.reconcileSections` but lives here so the
+    /// M45 Wave 2 project-create reconcile path (`MutationQueue`) can
+    /// share the diff-and-insert logic without each call site open-
+    /// coding the same dedupe.
+    ///
+    /// Idempotency (B1): if a sync delta already inserted the canonical
+    /// `LocalSection` rows for this project while the create echo was
+    /// in flight, the slug-keyed lookup mutates them in place rather
+    /// than inserting duplicates against `LocalSection.id`'s
+    /// `@Attribute(.unique)` constraint.
+    ///
+    /// The caller is responsible for `modelContext.save()`.
+    static func reconcileSections(
+        _ wireSections: [SectionDTO],
+        on project: LocalProject,
+        in modelContext: ModelContext
+    ) {
+        let projectID = project.id
+        let wantedIDs = Set(wireSections.map { LocalSection.makeID(projectID: projectID, slug: $0.slug) })
+
+        for existing in project.sections where !wantedIDs.contains(existing.id) {
+            modelContext.delete(existing)
+        }
+
+        let currentBySlug = Dictionary(
+            project.sections
+                .filter { wantedIDs.contains($0.id) }
+                .map { ($0.slug, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        for wire in wireSections {
+            if let local = currentBySlug[wire.slug] {
+                local.name = wire.name
+                local.position = wire.position
+            } else {
+                let composite = LocalSection.makeID(projectID: projectID, slug: wire.slug)
+                let local = LocalSection(
+                    id: composite,
+                    slug: wire.slug,
+                    name: wire.name,
+                    position: wire.position,
+                    project: project
+                )
+                modelContext.insert(local)
+            }
+        }
     }
 }

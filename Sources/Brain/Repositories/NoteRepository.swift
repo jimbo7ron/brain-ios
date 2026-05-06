@@ -90,6 +90,16 @@ final class NoteRepository {
     func create(_ payload: CreateNotePayload) -> LocalNote {
         let clientID = UUID().uuidString.lowercased()
         let now = Date()
+        // TODO(M45 Wave 3+): If the supplied `payload.project` is the
+        // *client* UUID of a project whose own create echo hasn't
+        // landed yet (rapid project create → immediate inline add),
+        // shipping that UUID to the server will 404 — the server has
+        // never heard of the client UUID. Either block inline-add
+        // until the parent project's reconcile completes, or queue
+        // the inline note against a sentinel that the queue rewrites
+        // on parent-project reconcile (idempotent against the rename).
+        // Pre-existing edge case; Wave 2 makes it more reachable but
+        // doesn't introduce it.
         let resolvedProjectID: String? = {
             guard let project = payload.project else { return nil }
             if project == "unassigned" { return nil }

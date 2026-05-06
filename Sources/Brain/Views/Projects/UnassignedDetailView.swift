@@ -36,8 +36,13 @@ import SwiftUI
 @MainActor
 struct UnassignedDetailView: View {
 
-    @Environment(\.brainAPIClient) private var client
     @Environment(\.syncEngine) private var syncEngine
+    /// M45 Wave 2: inline-add now goes through `NoteRepository`. The
+    /// repository owns the optimistic insert + queue enqueue, so the
+    /// new row lands in the list instantly. The `\.brainAPIClient`
+    /// env-key was removed alongside the migration — no other code
+    /// path in this view used it.
+    @Environment(\.noteRepository) private var noteRepo
 
     /// All todos in the working set, narrowed to type `"todo"` only at
     /// the SwiftData layer. We then filter for `!archived` and
@@ -141,7 +146,7 @@ struct UnassignedDetailView: View {
                     placeholder: "Add to Unassigned",
                     accessibilityIdentifier: "unassigned.inline-add",
                     onCommit: { rawText in
-                        Task { await createTodoInline(content: rawText) }
+                        createTodoInline(content: rawText)
                     }
                 )
             } header: {
@@ -217,18 +222,16 @@ struct UnassignedDetailView: View {
     /// Create a todo from inline-add text in the Unassigned bucket.
     /// Threads the `"unassigned"` sentinel through as the `project`
     /// field — the server resolves this to `project_id = NULL` on
-    /// insert (`src/brain/server.py:1858, 2032-2044`). Same payload
-    /// shape as `ProjectDetailView.createTodoInline` so trailing
-    /// keywords behave identically.
-    private func createTodoInline(content: String) async {
+    /// insert (`src/brain/server.py:1858, 2032-2044`); the
+    /// `NoteRepository` mirrors that locally by storing `nil` for
+    /// `projectId` so the new row lands in this Unassigned bucket's
+    /// `@Query` (which filters on `projectId == nil`).
+    ///
+    /// M45 Wave 2: hands off to `NoteRepository.create(_:)` instead of
+    /// the original `await client.createNote(...)` round-trip.
+    private func createTodoInline(content: String) {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-
-        guard let client else {
-            inlineAddError = "Couldn't reach the server. Try again."
-            BrainHaptics.error()
-            return
-        }
 
         let parsed = QuickAddParser.parse(trimmed)
         let bodyContent = parsed.title.isEmpty ? trimmed : parsed.bodyForServer()
@@ -249,18 +252,17 @@ struct UnassignedDetailView: View {
             location: nil
         )
 
-        do {
-            _ = try await client.createNote(payload)
-            inlineAddError = nil
-            Task { await syncEngine?.sync() }
-            BrainHaptics.light()
-        } catch let error as BrainAPIClient.Error {
-            inlineAddError = error.userFacingMessage
+        guard let noteRepo else {
+            // Preview / non-production host. Production wires the
+            // repository in `BrainApp.init`.
+            inlineAddError = "Couldn't add — try again."
             BrainHaptics.error()
-        } catch {
-            inlineAddError = "Couldn't save: \(error.localizedDescription)"
-            BrainHaptics.error()
+            return
         }
+
+        _ = noteRepo.create(payload)
+        inlineAddError = nil
+        BrainHaptics.light()
     }
 
     /// Open-section header. Matches the visual cadence of
