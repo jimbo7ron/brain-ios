@@ -132,6 +132,9 @@ extension LocalNote {
     /// `adoptServerID(_:)` on the M45 ceremony path so the dedupe-then-
     /// rename ordering stays explicit at the call site.
     func copyFields(from note: Note, parseDate: (String?) -> Date?) {
+        // IMPORTANT: must not read `self.id`. MutationQueue.reconcileCreate
+        // relies on this — see the rename-before-copyFields ordering rationale
+        // in MutationQueue.swift's reconcileCreate doc-comment.
         let createdAt = parseDate(note.createdAt)
         let updatedAt = parseDate(note.updatedAt)
         let tagsCSV = note.tags.joined(separator: ",")
@@ -181,6 +184,9 @@ extension LocalProject {
     /// `adoptServerID(_:)` on the M45 ceremony path. M26's default-
     /// section reconcile is owned by the caller (or by SyncEngine).
     func copyFields(from project: Project, parseDate: (String?) -> Date?) {
+        // IMPORTANT: must not read `self.id`. MutationQueue.reconcileCreate
+        // relies on this — see the rename-before-copyFields ordering rationale
+        // in MutationQueue.swift's reconcileCreate doc-comment.
         self.shortId = project.shortId
         self.name = project.name
         self.color = project.color

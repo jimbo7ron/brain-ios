@@ -617,7 +617,8 @@ final class MutationQueue {
     ///      we don't try to fold ~22-field note copies and ~7-field
     ///      project copies (with M26 default-section reconcile) under
     ///      a single contract that fits neither. The closure must NOT
-    ///      mutate `stub.id` — that's the ceremony's job in step 4.
+    ///      mutate `stub.id` — it's already at its final (server) value
+    ///      by this point in the ceremony (step 4 ran first).
     ///
     /// The final `modelContext.save()` is the caller's responsibility —
     /// `replay()` already calls `try modelContext.save()` after the
