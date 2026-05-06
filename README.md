@@ -26,6 +26,12 @@ HTTP API at `https://api.mindkeeper.io`. SwiftUI + SwiftData, iOS 17+.
 > triggers. See the
 > [iOS roadmap](https://github.com/jimbo7ron/brain/blob/main/docs/ios-roadmap.md)
 > for the full milestone plan.
+>
+> **v0.2 in flight (M45 — Write Coordinator):** every CRUD path now
+> flows through a single `Repository` contract with optimistic UI,
+> server reconcile under a last-write-wins guard, an app-wide status
+> pill, and per-row pending / failed indicators. Section ops are
+> optimistic too. See [`docs/M45-write-coordinator.md`](docs/M45-write-coordinator.md).
 
 ## Prerequisites
 
@@ -102,12 +108,37 @@ user-facing releases (0.1.0 → 0.2.0).
 
 ## Releases
 
+- **v0.2.x — Write Coordinator (M45, in flight 2026-05-06)** — every
+  iOS write (add / edit / archive / section add / section rename)
+  goes through a single `Repository` contract with optimistic UI:
+  the change appears instantly, the server response reconciles in
+  the background, and a last-write-wins guard prevents server-derived
+  fields (NLP-extracted titles, slugs) from clobbering local edits
+  the user has made since dispatch. New status pill in the toolbar
+  surfaces pending / failed mutations app-wide; per-row spinners and
+  red dots show in-flight or failed todos. Section operations are
+  optimistic too via `OptimisticCompositeStub`. Internal-only
+  refactor — see [`docs/M45-write-coordinator.md`](docs/M45-write-coordinator.md)
+  for the architecture.
 - **v0.1.0 (build 1) — 2026-05-05** — first internal TestFlight build,
   shipped as *Mindkeeper*. Includes basic CRUD across notes / todos /
   appointments, swipe-to-archive on todos, compact-density list
   rows, dark mode, haptics, Siri shortcuts, and Search.
   *Not in v0.1:* push notifications (waiting on APNs `.p8` on the
   prod server), final app icon (placeholder only).
+
+## Architecture
+
+iOS writes flow through a single `Repository` contract (M45). Every
+mutation (create / update / archive / section op) is dispatched
+optimistically: the local SwiftData store is updated immediately, a
+queued mutation is sent to the server, and the response is reconciled
+back into the store under a per-field last-write-wins guard so
+server-derived fields (e.g. NLP-parsed titles, generated slugs) flow
+back without overwriting local edits the user has typed since
+dispatch. Pending / failed state is exposed via `MutationStatusStore`
+and rendered as a toolbar status pill plus per-row indicators. See
+[`docs/M45-write-coordinator.md`](docs/M45-write-coordinator.md).
 
 ## Roadmap
 
