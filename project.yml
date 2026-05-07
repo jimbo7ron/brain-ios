@@ -70,6 +70,27 @@ targets:
         TEST_HOST: $(BUILT_PRODUCTS_DIR)/brain.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/brain
         BUNDLE_LOADER: $(TEST_HOST)
 
+  # Tier 2 e2e harness: XCUITest target. Drives the running Brain.app
+  # via `XCUIApplication` with `-uiTesting` injected, which swaps in
+  # `FakeBrainURLProtocol` for the URL session and bootstraps a
+  # signed-in `AuthSession` so tests start from the SignedInRootView
+  # without touching real credentials. Distinct from `BrainTests`:
+  # UI tests run in a separate runner process and only see the app's
+  # public surface through accessibility identifiers.
+  BrainUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Tests/BrainUITests
+    dependencies:
+      - target: Brain
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.mindkeeper.brain.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: Brain
+
 # OS_ACTIVITY_MODE=disable silences the unified-logging spam from
 # CFNetwork, libsystem_*, CoreData, hapticpatternlibrary, RTI, etc.
 # in the Xcode debug console. The brain app's own NSLog/print calls
@@ -82,6 +103,7 @@ schemes:
       targets:
         Brain: all
         BrainTests: [test]
+        BrainUITests: [test]
     run:
       config: Debug
       environmentVariables:
@@ -93,3 +115,4 @@ schemes:
       config: Debug
       targets:
         - BrainTests
+        - BrainUITests

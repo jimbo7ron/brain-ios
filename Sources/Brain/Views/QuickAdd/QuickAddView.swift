@@ -166,6 +166,8 @@ struct QuickAddView: View {
                         }
                     }
                     .disabled(!canSubmit)
+                    // Tier 2 e2e harness: stable XCUITest hook.
+                    .accessibilityIdentifier("quick-add.submit")
                 }
             }
         }

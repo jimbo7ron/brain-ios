@@ -129,7 +129,14 @@ struct BrainApp: App {
             LocalSyncState.self,
             MutationQueueItem.self,
         ])
-        let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
+        // Tier 2 e2e harness: under `-uiTesting` use an in-memory store
+        // so SwiftData state does not leak between test methods. The
+        // `BrainTestMode.isUITesting` flag is `false` in production
+        // launches, so the on-disk store path is unchanged for users.
+        let configuration = ModelConfiguration(
+            schema: schema,
+            isStoredInMemoryOnly: BrainTestMode.isUITesting
+        )
 
         let modelContainer: ModelContainer
         do {
@@ -224,10 +231,33 @@ struct BrainApp: App {
         // "Keychain error" to nil — in either case we fall back to the
         // built-in default. The API key is similarly optional: it's
         // absent on first launch and after sign-out.
-        let storedServer = (try? KeychainStore.load(.serverURL)) ?? nil
-        let serverURL = storedServer.flatMap(URL.init(string:)) ?? defaultBrainServerURL
-        let storedApiKey = (try? KeychainStore.load(.apiKey)) ?? nil
-        let apiClient = BrainAPIClient(serverURL: serverURL, apiKey: storedApiKey)
+        // Tier 2 e2e harness: under `-uiTesting` swap in a URLSession
+        // backed by `FakeBrainURLProtocol` and a fake server URL. The
+        // production `BrainAPIClient` actor is kept as-is (no protocol
+        // extraction); the fake intercepts at the URLSession layer so
+        // every consumer (sync engine, mutation queue, repositories,
+        // intents bridge) sees the same actor type as in production.
+        let serverURL: URL
+        let storedApiKey: String?
+        let session: URLSession
+        if BrainTestMode.isUITesting {
+            // Reset the in-memory fake state at process launch so each
+            // test method starts from a clean slate. XCUITest can
+            // additionally seed via `-uiTestingSeed*` flags handled
+            // below, mirroring the test fixtures pattern from
+            // `Tests/BrainTests`.
+            FakeBrainState.shared.reset()
+            Self.applyUITestingSeeds()
+            serverURL = BrainTestMode.testServerURL
+            storedApiKey = BrainTestMode.testApiKey
+            session = URLSession.brainTestModeSession()
+        } else {
+            let storedServer = (try? KeychainStore.load(.serverURL)) ?? nil
+            serverURL = storedServer.flatMap(URL.init(string:)) ?? defaultBrainServerURL
+            storedApiKey = (try? KeychainStore.load(.apiKey)) ?? nil
+            session = .shared
+        }
+        let apiClient = BrainAPIClient(serverURL: serverURL, apiKey: storedApiKey, session: session)
         self.apiClient = apiClient
 
         // AuthSession reads Keychain itself in its initialiser. We
@@ -239,7 +269,21 @@ struct BrainApp: App {
         // load-bearing once M41 wires up Background App Refresh; fix
         // there is to defer the read until first unlock rather than
         // bouncing the user to LoginView.
-        let authSession = AuthSession()
+        // Tier 2 e2e harness: under `-uiTesting` skip the LoginView
+        // entirely by bootstrapping the session as `.signedIn`. The
+        // synthetic credentials are placeholders — they're never sent
+        // to a real server because `FakeBrainURLProtocol` intercepts.
+        let authSession: AuthSession
+        if BrainTestMode.isUITesting {
+            authSession = AuthSession(
+                state: .signedIn(
+                    userId: BrainTestMode.testUserID,
+                    email: BrainTestMode.testUserEmail
+                )
+            )
+        } else {
+            authSession = AuthSession()
+        }
         self.authSession = authSession
 
         // SyncEngine writes via its own `ModelContext`. We deliberately
@@ -339,6 +383,67 @@ struct BrainApp: App {
         BrainIntentsBridge.authSession = authSession
         BrainIntentsBridge.mutationQueue = queue
         BrainIntentsBridge.modelContainer = modelContainer
+    }
+
+    /// Tier 2 e2e harness: parse XCUITest seed flags from
+    /// `ProcessInfo.arguments` and apply them to `FakeBrainState`.
+    ///
+    /// Two flag families are supported. Each consumes either one or
+    /// two arguments:
+    ///   * `-uiTestingSeedTodo "<title>"`                    — seed an
+    ///       unassigned todo due today (lands in TodayView's "Due
+    ///       today" section), with a server-assigned UUID.
+    ///   * `-uiTestingSeedTodoWithID "<title>" "<uuid>"`     — seed
+    ///       with a deterministic id so the UI test can locate the
+    ///       resulting `todo-row-<uuid>` element directly.
+    ///   * `-uiTestingSeedProject "<name>"`                  — seed a
+    ///       project (uses M26 default sections).
+    ///   * `-uiTestingSeedProjectWithID "<name>" "<uuid>"`   — seed
+    ///       with a deterministic id; UI test addresses
+    ///       `project-row-<uuid>` directly.
+    ///
+    /// Multiple occurrences are honoured so a test can seed several
+    /// records in one launch. Tests that need richer fixtures should
+    /// extend `FakeBrainState` with their own seed methods rather than
+    /// growing this flag set unbounded.
+    private static func applyUITestingSeeds() {
+        let args = ProcessInfo.processInfo.arguments
+        var index = 0
+        let todayISO: String = {
+            let f = DateFormatter()
+            f.calendar = Calendar(identifier: .gregorian)
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.dateFormat = "yyyy-MM-dd"
+            f.timeZone = TimeZone.current
+            return f.string(from: Date())
+        }()
+        while index < args.count {
+            let arg = args[index]
+            if arg == "-uiTestingSeedTodo", index + 1 < args.count {
+                let title = args[index + 1]
+                _ = FakeBrainState.shared.seedTodo(content: title, dueDate: todayISO)
+                index += 2
+                continue
+            }
+            if arg == "-uiTestingSeedTodoWithID", index + 2 < args.count {
+                let title = args[index + 1]
+                let id = args[index + 2]
+                _ = FakeBrainState.shared.seedTodo(content: title, dueDate: todayISO, forcedID: id)
+                index += 3
+                continue
+            }
+            if arg == "-uiTestingSeedProject", index + 1 < args.count {
+                _ = FakeBrainState.shared.seedProject(name: args[index + 1])
+                index += 2
+                continue
+            }
+            if arg == "-uiTestingSeedProjectWithID", index + 2 < args.count {
+                _ = FakeBrainState.shared.seedProject(name: args[index + 1], forcedID: args[index + 2])
+                index += 3
+                continue
+            }
+            index += 1
+        }
     }
 
     /// Heuristic: is `error` plausibly a SwiftData / Core Data schema

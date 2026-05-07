@@ -188,6 +188,11 @@ struct ProjectListView: View {
                             openTodoCount: openCountsByProjectID[project.id] ?? 0
                         )
                     }
+                    // Tier 2 e2e harness: per-row hook keyed by id so
+                    // a test that just created/seeded a project can
+                    // navigate into it by id rather than fishing for
+                    // its name in the list view.
+                    .accessibilityIdentifier("project-row-\(project.id)")
                     .contextMenu {
                         // M40 — long-press → Edit lands the
                         // edit-project dialog. Archive remains a
@@ -224,6 +229,8 @@ struct ProjectListView: View {
                     Image(systemName: "plus")
                 }
                 .accessibilityLabel("New project")
+                // Tier 2 e2e harness: stable XCUITest hook.
+                .accessibilityIdentifier("projects.new-project-button")
             }
         }
         .sheet(isPresented: $isCreatingProject) {

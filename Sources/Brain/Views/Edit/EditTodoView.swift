@@ -247,6 +247,8 @@ struct EditTodoView: View {
                         }
                     }
                     .disabled(!canSave)
+                    // Tier 2 e2e harness hook.
+                    .accessibilityIdentifier("edit-todo.save-button")
                 }
             }
             .onAppear { hydrateFromNote() }
@@ -261,6 +263,8 @@ struct EditTodoView: View {
             TextField("Title", text: $title)
                 .textInputAutocapitalization(.sentences)
                 .submitLabel(.next)
+                // Tier 2 e2e harness hook.
+                .accessibilityIdentifier("edit-todo.title-field")
             TextField(
                 "Notes (optional). Markdown supported.",
                 text: $notes,

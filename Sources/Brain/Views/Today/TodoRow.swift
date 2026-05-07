@@ -114,6 +114,8 @@ struct TodoRow: View {
             .buttonStyle(.borderless)
             .accessibilityLabel(note.completed ? "Completed" : "Mark complete")
             .accessibilityHint(note.completed ? "Reopening is coming in a future update." : "")
+            // Tier 2 e2e harness: per-row complete-toggle hook.
+            .accessibilityIdentifier("todo-complete-\(note.id)")
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(displayTitle)
@@ -121,6 +123,9 @@ struct TodoRow: View {
                     .strikethrough(note.completed)
                     .foregroundStyle(note.completed ? Color.secondary : Color.primary)
                     .lineLimit(2)
+                    // Tier 2 e2e harness: title hook so tests can
+                    // assert on the displayed string after an edit.
+                    .accessibilityIdentifier("todo-title-\(note.id)")
 
                 if !subline.isEmpty {
                     HStack(spacing: 8) {

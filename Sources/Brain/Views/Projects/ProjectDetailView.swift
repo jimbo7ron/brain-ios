@@ -218,6 +218,8 @@ struct ProjectDetailView: View {
                     Image(systemName: BrainSymbols.edit)
                 }
                 .accessibilityLabel("Edit project")
+                // Tier 2 e2e harness hook.
+                .accessibilityIdentifier("project-detail.edit-button")
             }
         }
         .sheet(isPresented: $isEditPresented) {

@@ -309,6 +309,8 @@ struct TodayView: View {
         .padding(.bottom, 16)
         .accessibilityLabel("Quick add")
         .accessibilityHint("Opens a quick-add sheet to capture a new todo.")
+        // Tier 2 e2e harness: stable XCUITest hook for the FAB.
+        .accessibilityIdentifier("today.quick-add-button")
     }
 
     /// Build a `TodoRow` for `note`, resolving its project's accent
