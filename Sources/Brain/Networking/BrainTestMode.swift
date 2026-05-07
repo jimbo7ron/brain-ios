@@ -23,6 +23,15 @@
 // Production builds default to `isUITesting == false`; the wiring in
 // `BrainApp.init` short-circuits cleanly when the flag is unset, so
 // shipping this file in the production target has no runtime cost.
+//
+// Production-binary cleanup: the entire file is `#if DEBUG`-gated so
+// the synthetic test credentials and the `-uiTesting` predicate are
+// stripped from Release builds (no `class-dump` / `strings(1)` exposure
+// of the placeholder API key, and no dead test-mode branch sitting in
+// the shipping binary). All call sites in production code are
+// themselves `#if DEBUG`-guarded so this gate doesn't break Release.
+
+#if DEBUG
 
 import Foundation
 
@@ -55,3 +64,5 @@ enum BrainTestMode {
     /// using `*.brain.test` keeps the intent obvious in any logs.
     static let testServerURL: URL = URL(string: "https://uitest.brain.test")!  // swiftlint:disable:this force_unwrapping
 }
+
+#endif // DEBUG

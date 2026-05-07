@@ -70,6 +70,15 @@ final class CoreCRUDTests: XCTestCase {
     /// Test 2 — Edit a seeded todo's content, assert the new title
     /// renders in place. The seed uses a deterministic id so we can
     /// locate the row's `todo-title-<id>` element directly.
+    ///
+    /// Verifies the edit flow round-trips *within-process*: the PUT
+    /// reaches the in-process fake server (`FakeBrainURLProtocol`) and
+    /// the SwiftData `@Query` driving the row reflects the new content.
+    /// Cross-process / on-disk persistence is NOT exercised — the fake's
+    /// state is in-memory and `XCUIApplication` spawns a fresh process
+    /// per test method, which `FakeBrainState.shared.reset()` then
+    /// wipes at launch. A future M46 test seam will assert against the
+    /// fake's snapshot directly to tighten this guarantee.
     func testEditTodoContent_persistsChange() {
         let id = TestApp.TestID.editTodo
         let app = TestApp.launchSignedIn(

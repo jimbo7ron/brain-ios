@@ -42,6 +42,15 @@
 //   * POST /api/v1/projects/{projectId}/sections
 //
 // Future PRs will extend the fake as more tests demand more endpoints.
+//
+// Production-binary cleanup: the entire file is `#if DEBUG`-gated so
+// the fake server, its in-memory state, and the `URLSession` factory
+// are stripped from Release builds. The XCUITest target compiles in
+// Debug, so the test bundle still resolves these symbols. Production
+// call sites (`BrainApp.init`, `SyncEngine.startForegroundTimerIfNeeded`)
+// guard their references with their own `#if DEBUG` blocks.
+
+#if DEBUG
 
 import Foundation
 
@@ -661,3 +670,5 @@ extension URLSession {
         return URLSession(configuration: config)
     }
 }
+
+#endif // DEBUG

@@ -133,9 +133,17 @@ struct BrainApp: App {
         // so SwiftData state does not leak between test methods. The
         // `BrainTestMode.isUITesting` flag is `false` in production
         // launches, so the on-disk store path is unchanged for users.
+        // Production-binary cleanup: the test-mode flag is gated behind
+        // `#if DEBUG` so Release builds never reference `BrainTestMode`
+        // at all — the configuration is unconditionally on-disk.
+        #if DEBUG
+        let storedInMemoryOnly = BrainTestMode.isUITesting
+        #else
+        let storedInMemoryOnly = false
+        #endif
         let configuration = ModelConfiguration(
             schema: schema,
-            isStoredInMemoryOnly: BrainTestMode.isUITesting
+            isStoredInMemoryOnly: storedInMemoryOnly
         )
 
         let modelContainer: ModelContainer
@@ -240,6 +248,7 @@ struct BrainApp: App {
         let serverURL: URL
         let storedApiKey: String?
         let session: URLSession
+        #if DEBUG
         if BrainTestMode.isUITesting {
             // Reset the in-memory fake state at process launch so each
             // test method starts from a clean slate. XCUITest can
@@ -257,6 +266,15 @@ struct BrainApp: App {
             storedApiKey = (try? KeychainStore.load(.apiKey)) ?? nil
             session = .shared
         }
+        #else
+        // Production: no test-mode branch in the binary. `BrainTestMode`
+        // and `FakeBrainURLProtocol` are themselves `#if DEBUG`-gated
+        // so they're not even compiled into Release.
+        let storedServer = (try? KeychainStore.load(.serverURL)) ?? nil
+        serverURL = storedServer.flatMap(URL.init(string:)) ?? defaultBrainServerURL
+        storedApiKey = (try? KeychainStore.load(.apiKey)) ?? nil
+        session = .shared
+        #endif
         let apiClient = BrainAPIClient(serverURL: serverURL, apiKey: storedApiKey, session: session)
         self.apiClient = apiClient
 
@@ -274,6 +292,7 @@ struct BrainApp: App {
         // synthetic credentials are placeholders — they're never sent
         // to a real server because `FakeBrainURLProtocol` intercepts.
         let authSession: AuthSession
+        #if DEBUG
         if BrainTestMode.isUITesting {
             authSession = AuthSession(
                 state: .signedIn(
@@ -284,6 +303,9 @@ struct BrainApp: App {
         } else {
             authSession = AuthSession()
         }
+        #else
+        authSession = AuthSession()
+        #endif
         self.authSession = authSession
 
         // SyncEngine writes via its own `ModelContext`. We deliberately
@@ -406,6 +428,10 @@ struct BrainApp: App {
     /// records in one launch. Tests that need richer fixtures should
     /// extend `FakeBrainState` with their own seed methods rather than
     /// growing this flag set unbounded.
+    ///
+    /// `#if DEBUG`-gated: callers (the test-mode branch in `init`) are
+    /// gated on the same flag, and `FakeBrainState` itself is too.
+    #if DEBUG
     private static func applyUITestingSeeds() {
         let args = ProcessInfo.processInfo.arguments
         var index = 0
@@ -445,6 +471,7 @@ struct BrainApp: App {
             index += 1
         }
     }
+    #endif // DEBUG
 
     /// Heuristic: is `error` plausibly a SwiftData / Core Data schema
     /// mismatch (where wiping + retrying might recover) rather than a

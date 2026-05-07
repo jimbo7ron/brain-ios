@@ -204,9 +204,12 @@ final class SyncEngine: ObservableObject {
         // be test-driven so XCUITest assertions land on a deterministic
         // store. The Timer would race the test by firing a second
         // sync against the in-memory fake server while assertions run.
-        // No-op silently — `BrainTestMode.isUITesting` is `false` in
-        // production builds so this branch is dead code there.
+        // Production-binary cleanup: `BrainTestMode` itself is
+        // `#if DEBUG`-gated, so this guard is too — Release builds
+        // never reference `BrainTestMode`.
+        #if DEBUG
         if BrainTestMode.isUITesting { return }
+        #endif
         // Tolerance lets the system coalesce ticks with other timers,
         // saving battery. A 30-second tolerance on a 5-minute interval
         // is well within the spec's "approx 5 min" cadence.
