@@ -61,6 +61,8 @@ struct NewProjectView: View {
                     TextField("Project name", text: $name)
                         .textInputAutocapitalization(.words)
                         .submitLabel(.done)
+                        // Tier 2 e2e harness hook.
+                        .accessibilityIdentifier("new-project.name-field")
                 }
                 Section("Colour") {
                     // Same FlowChips palette + selection styling as
@@ -139,6 +141,8 @@ struct NewProjectView: View {
                         }
                     }
                     .disabled(!canCreate)
+                    // Tier 2 e2e harness hook.
+                    .accessibilityIdentifier("new-project.create-button")
                 }
             }
         }

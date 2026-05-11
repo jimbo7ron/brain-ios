@@ -235,6 +235,8 @@ struct EditProjectView: View {
             HStack(spacing: 8) {
                 TextField("New section", text: $newSectionName)
                     .textInputAutocapitalization(.words)
+                    // Tier 2 e2e harness hook.
+                    .accessibilityIdentifier("edit-project.new-section-field")
                 Button {
                     Task { await addSection() }
                 } label: {
@@ -249,6 +251,8 @@ struct EditProjectView: View {
                     newSectionName.trimmingCharacters(in: .whitespaces).isEmpty
                 )
                 .buttonStyle(.borderedProminent)
+                // Tier 2 e2e harness hook.
+                .accessibilityIdentifier("edit-project.add-section-button")
             }
         } header: {
             Text("Sections")

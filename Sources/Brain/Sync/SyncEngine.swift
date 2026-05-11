@@ -200,6 +200,16 @@ final class SyncEngine: ObservableObject {
     /// guarantees teardown.
     private func startForegroundTimerIfNeeded() {
         guard foregroundTimer == nil else { return }
+        // Tier 2 e2e harness: under `-uiTesting` we want every sync to
+        // be test-driven so XCUITest assertions land on a deterministic
+        // store. The Timer would race the test by firing a second
+        // sync against the in-memory fake server while assertions run.
+        // Production-binary cleanup: `BrainTestMode` itself is
+        // `#if DEBUG`-gated, so this guard is too — Release builds
+        // never reference `BrainTestMode`.
+        #if DEBUG
+        if BrainTestMode.isUITesting { return }
+        #endif
         // Tolerance lets the system coalesce ticks with other timers,
         // saving battery. A 30-second tolerance on a 5-minute interval
         // is well within the spec's "approx 5 min" cadence.
