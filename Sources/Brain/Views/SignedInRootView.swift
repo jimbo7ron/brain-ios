@@ -37,6 +37,10 @@ struct SignedInRootView: View {
 
     @State private var selectedTab: Tab = .today
 
+    /// Drives the failed-changes sheet presented when the user taps the
+    /// red "⚠ M" indicator on the status pill.
+    @State private var showFailures = false
+
     /// Top offset added to `safeAreaInsets.top` when positioning the
     /// floating mutation-status pill. Clears both compact (`44pt`) and
     /// large-title (`96pt`) nav bars; see the rationale comment on the
@@ -77,13 +81,29 @@ struct SignedInRootView: View {
             // the title where the rationale wanted it.
             .overlay(alignment: .topTrailing) {
                 GeometryReader { proxy in
-                    MutationStatusPill(queue: mutationQueue)
-                        .padding(.trailing, 12)
-                        .padding(.top, proxy.safeAreaInsets.top + Self.pillTopOffset)
-                        .frame(maxWidth: .infinity, alignment: .topTrailing)
-                        .allowsHitTesting(false)
+                    MutationStatusPill(
+                        queue: mutationQueue,
+                        onTapFailed: { showFailures = true }
+                    )
+                    .padding(.trailing, 12)
+                    .padding(.top, proxy.safeAreaInsets.top + Self.pillTopOffset)
+                    .frame(maxWidth: .infinity, alignment: .topTrailing)
                 }
-                .allowsHitTesting(false)
+                // Only intercept touches when there's a failed indicator
+                // to tap. With no failures the pill is purely
+                // informational (the pending spinner), so the overlay
+                // must let touches fall through to the content below.
+                // Even when enabled, only the small failed Button
+                // captures — the GeometryReader's empty area and the
+                // pill's expanded frame draw nothing hit-testable, so
+                // the rest of the screen (incl. per-tab nav bars) stays
+                // reachable.
+                .allowsHitTesting((mutationQueue?.failedCount ?? 0) > 0)
+            }
+            .sheet(isPresented: $showFailures) {
+                if let mutationQueue {
+                    MutationFailuresView(queue: mutationQueue)
+                }
             }
     }
 

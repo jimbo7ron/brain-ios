@@ -541,6 +541,102 @@ final class MutationQueue {
         }
     }
 
+    // MARK: - Failure inspection & recovery (M45 Wave 4 follow-up)
+
+    /// Every poisoned queue row — those parked at
+    /// `nextRetryAt == .distantFuture` because the replayer hit a
+    /// permanent failure (404 / 422 / unknown op) or burned through
+    /// `maxAttempts` retries. Sorted by `createdAt` so the failures
+    /// sheet lists them in the order the user created them. Powers the
+    /// tap-through surface behind the status pill so "why didn't my edit
+    /// save?" has an answer the user can read and act on, not just a
+    /// red count.
+    ///
+    /// Returns the live SwiftData rows (not a snapshot) so the caller can
+    /// pass one straight back into `retry(_:)` / `discard(_:)`. The same
+    /// `distantFuture`-sentinel caveat as `refreshPendingCount()` applies
+    /// — the predicate can't reference `Date.distantFuture` directly, so
+    /// we capture it into a local first.
+    func failedItems() -> [MutationQueueItem] {
+        let distantFuture = Date.distantFuture
+        let descriptor = FetchDescriptor<MutationQueueItem>(
+            predicate: #Predicate { $0.nextRetryAt == distantFuture },
+            sortBy: [SortDescriptor(\.createdAt, order: .forward)]
+        )
+        return (try? modelContext.fetch(descriptor)) ?? []
+    }
+
+    /// Un-poison a parked row and kick a replay. Resets the backoff
+    /// state (`attempts = 0`, `nextRetryAt = nil`) so `nextReadyItem()`
+    /// picks it up on the next pass, clears the row's captured error, and
+    /// flips the per-row status back to `.pending` so any inline
+    /// indicator shows progress again. Reached from the failures sheet's
+    /// "Retry" action.
+    ///
+    /// A retry of a genuinely-permanent failure (malformed body, a
+    /// resource deleted on the server) will simply re-poison on the next
+    /// pass and resurface in the sheet — that's intended. The useful
+    /// cases are the recoverable ones the count can't distinguish: a
+    /// route-not-found after the server URL is fixed, or a transient
+    /// failure that exhausted its retry cap during an outage that has
+    /// since cleared.
+    func retry(_ item: MutationQueueItem) {
+        item.attempts = 0
+        item.nextRetryAt = nil
+        item.lastError = nil
+        try? modelContext.save()
+        statusStore?.mark(item.resourceId, .pending)
+        refreshPendingCount()
+        Task { await self.replay() }
+    }
+
+    /// Un-poison every parked row in one pass, then kick a single
+    /// replay. Same per-row reset as `retry(_:)`; batching the save +
+    /// replay avoids N replay storms when the user taps "Retry all".
+    func retryAllFailed() {
+        let items = failedItems()
+        guard !items.isEmpty else { return }
+        for item in items {
+            item.attempts = 0
+            item.nextRetryAt = nil
+            item.lastError = nil
+            statusStore?.mark(item.resourceId, .pending)
+        }
+        try? modelContext.save()
+        refreshPendingCount()
+        Task { await self.replay() }
+    }
+
+    /// Drop a parked row without retrying — the user has decided the
+    /// change isn't worth keeping (e.g. a validation error they can't
+    /// fix from the device). Clears the per-row status so any inline red
+    /// indicator comes down. Optimistic local state, if any, is left for
+    /// the next sync to reconcile against the server's truth; a poisoned
+    /// `.createTodo` already had its stub rolled back at poison time, so
+    /// discarding it leaves nothing behind.
+    func discard(_ item: MutationQueueItem) {
+        let clearedId = item.resourceId
+        modelContext.delete(item)
+        try? modelContext.save()
+        statusStore?.clear(clearedId)
+        refreshPendingCount()
+    }
+
+    /// Drop every parked row in one pass. Same semantics as
+    /// `discard(_:)` per row; batched so "Discard all" is a single save.
+    /// Does NOT touch non-poisoned rows — an in-flight pending mutation
+    /// is left to replay normally.
+    func discardAllFailed() {
+        let items = failedItems()
+        guard !items.isEmpty else { return }
+        for item in items {
+            statusStore?.clear(item.resourceId)
+            modelContext.delete(item)
+        }
+        try? modelContext.save()
+        refreshPendingCount()
+    }
+
     // MARK: - Internal helpers
 
     /// Patch the local optimistic stub (keyed by the client-minted
