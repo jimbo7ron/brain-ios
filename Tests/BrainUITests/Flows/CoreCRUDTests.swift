@@ -214,14 +214,26 @@ final class CoreCRUDTests: XCTestCase {
 
         app.tabBars.buttons["Projects"].tap()
 
+        // Cold-launch headroom. This is the longest chain of any CRUD
+        // test (Projects list → seeded row → pushed detail → edit
+        // sheet), so when it runs first in a cold suite it eats the
+        // app-install + first-launch + fake-server-sync cost before the
+        // seeded project even renders. The default 5s `awaitExistence`
+        // window can expire on the post-navigation waits under that
+        // load (observed: edit-button query timing out at ~16s into a
+        // cold first launch). `awaitExistence` returns the instant the
+        // element appears, so a generous timeout is free on the happy
+        // path and only buys slack on a slow machine.
+        let coldLaunchTimeout: TimeInterval = 30
+
         let row = app.otherElements["project-row-\(id)"]
         // ProjectRow is wrapped in NavigationLink; the link surfaces as
         // an `otherElement` or `cell` depending on the iOS version. Try
         // both before falling back to a static-text query on the name.
-        if !row.waitForExistence(timeout: 5) {
+        if !row.waitForExistence(timeout: coldLaunchTimeout) {
             // Fallback: tap the row containing the project name.
             let nameText = app.staticTexts["Inbox+"]
-            XCTAssertTrue(nameText.awaitExistence(timeout: 5))
+            XCTAssertTrue(nameText.awaitExistence(timeout: coldLaunchTimeout))
             nameText.tap()
         } else {
             row.tap()
@@ -229,22 +241,22 @@ final class CoreCRUDTests: XCTestCase {
 
         // Open the edit sheet.
         let editButton = app.buttons["project-detail.edit-button"]
-        XCTAssertTrue(editButton.awaitExistence(timeout: 5))
+        XCTAssertTrue(editButton.awaitExistence(timeout: coldLaunchTimeout))
         editButton.tap()
 
         // Add a "Drafts" section.
         let sectionField = app.textFields["edit-project.new-section-field"]
-        XCTAssertTrue(sectionField.awaitExistence())
+        XCTAssertTrue(sectionField.awaitExistence(timeout: coldLaunchTimeout))
         sectionField.tap()
         sectionField.typeText("Drafts")
 
         let addSection = app.buttons["edit-project.add-section-button"]
-        XCTAssertTrue(addSection.awaitExistence())
+        XCTAssertTrue(addSection.awaitExistence(timeout: coldLaunchTimeout))
         addSection.tap()
 
         // The new section should render in the sections list inside
         // the same edit sheet.
         let drafts = app.staticTexts["Drafts"]
-        XCTAssertTrue(drafts.awaitExistence(timeout: 5))
+        XCTAssertTrue(drafts.awaitExistence(timeout: coldLaunchTimeout))
     }
 }
