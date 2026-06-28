@@ -108,6 +108,14 @@ user-facing releases (0.1.0 → 0.2.0).
 
 ## Releases
 
+- **v0.4.0 (build 4) — 2026-06-29** — failed-mutation recovery. The
+  toolbar status pill's red "⚠ M" indicator is now tappable: it opens
+  a **Failed changes** sheet listing each poisoned queue row (the
+  action in plain language, the resource, and the captured error) with
+  per-row **Retry** / **Discard** plus Retry-all / Discard-all. Retry
+  un-poisons the row and kicks a replay; discard drops it. Surfaces a
+  recovery path that previously only existed via Console logs or a
+  debug-menu queue drain (PR #42).
 - **v0.2.x — Write Coordinator (M45, in flight 2026-05-06)** — every
   iOS write (add / edit / archive / section add / section rename)
   goes through a single `Repository` contract with optimistic UI:
