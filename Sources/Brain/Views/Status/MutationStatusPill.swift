@@ -41,6 +41,12 @@ struct MutationStatusPill: View {
     /// idle" branch.
     let queue: MutationQueue?
 
+    /// Invoked when the user taps the red "⚠ M failed" indicator. When
+    /// nil (previews, the pending-only path) the failed indicator is
+    /// inert — the pending spinner is always purely informational. The
+    /// host wires this to present `MutationFailuresView`.
+    var onTapFailed: (() -> Void)? = nil
+
     var body: some View {
         // `pendingCount` is now the derived "active pending"
         // (`totalCount - failedCount`) per M45 Wave 4 review fix —
@@ -67,16 +73,7 @@ struct MutationStatusPill: View {
                     .accessibilityLabel("\(activePending) pending writes")
                 }
                 if failed > 0 {
-                    Label {
-                        Text("\(failed)")
-                            .font(.caption2.monospacedDigit())
-                    } icon: {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.caption2)
-                    }
-                    .labelStyle(.titleAndIcon)
-                    .foregroundStyle(.red)
-                    .accessibilityLabel("\(failed) failed writes")
+                    failedIndicator(count: failed)
                 }
             }
             .padding(.horizontal, 8)
@@ -84,6 +81,36 @@ struct MutationStatusPill: View {
             .background(
                 Capsule().fill(Color.secondary.opacity(0.12))
             )
+        }
+    }
+
+    /// The red "⚠ M" indicator. When `onTapFailed` is wired it's a
+    /// `Button` so the user can tap through to the failed-changes sheet;
+    /// otherwise it's the same inert `Label` it always was (previews /
+    /// pending-only hosts). The visual is identical either way — the
+    /// `.plain` button style keeps the custom red styling and the
+    /// `contentShape` makes the whole glyph+count the tap target.
+    @ViewBuilder
+    private func failedIndicator(count: Int) -> some View {
+        let label = Label {
+            Text("\(count)")
+                .font(.caption2.monospacedDigit())
+        } icon: {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.caption2)
+        }
+        .labelStyle(.titleAndIcon)
+        .foregroundStyle(.red)
+
+        if let onTapFailed {
+            Button(action: onTapFailed) {
+                label.contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(count) failed writes")
+            .accessibilityHint("Shows the changes that didn't save")
+        } else {
+            label.accessibilityLabel("\(count) failed writes")
         }
     }
 }

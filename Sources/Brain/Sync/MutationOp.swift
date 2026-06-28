@@ -104,4 +104,24 @@ enum MutationOp: String, Codable, CaseIterable {
     /// Resource id is the composite `<projectID>:<slug>`. Wire payload
     /// is `UpdateSectionPayload` (`{name}`).
     case updateSection = "update_section"
+
+    /// Human-readable description of the action, phrased as the user's
+    /// intent rather than the HTTP route. Surfaced by the failed-changes
+    /// sheet (`MutationFailuresView`) so a parked row reads as "Edit
+    /// to-do" rather than `update_todo`. Kept exhaustive (no `default`)
+    /// so adding a new op forces a label decision here.
+    var displayName: String {
+        switch self {
+        case .completeTodo: return "Complete to-do"
+        case .uncompleteTodo: return "Reopen to-do"
+        case .createTodo: return "Create to-do"
+        case .updateTodo: return "Edit to-do"
+        case .archiveNote: return "Delete note"
+        case .unarchiveNote: return "Restore note"
+        case .createProject: return "Create project"
+        case .updateProject: return "Edit project"
+        case .addSection, .createSection: return "Add section"
+        case .updateSection: return "Rename section"
+        }
+    }
 }
