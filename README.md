@@ -113,6 +113,12 @@ Always `--bump-build`: App Store Connect rejects an upload whose
 
 ## Releases
 
+- **v0.7.0 (build 8) — 2026-06-30** — **Upcoming appointments** on the
+  Today view. The Today screen previously showed only appointments
+  starting today; it now adds an "Upcoming" section listing the next 6
+  days of appointments grouped by day (same relative-day headers as
+  "Coming up"), so a synced multi-day calendar — e.g. a TrainingPeaks
+  training plan — is visible across the week (PR #46).
 - **v0.6.0 (build 7) — 2026-06-30** — rename the project-less todo
   bucket **"Unassigned" → "Inbox"** throughout: the sidebar row, detail
   view, and project picker now read "Inbox", and the type names
