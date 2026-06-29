@@ -149,6 +149,27 @@ struct TodayView: View {
             .map { $0.0 }
     }
 
+    /// Appointments in the next `comingUpDays` days (excluding today),
+    /// grouped by their local day. Mirrors `comingUpDays` for todos: the
+    /// start time is naive local wall-clock, so its `yyyy-MM-dd` prefix is
+    /// the local day and string-compares against `todayISO` / `horizonISO`
+    /// exactly like a todo's `dueDate`.
+    private var upcomingAppointmentDays: [(date: String, appointments: [LocalNote])] {
+        var grouped: [String: [LocalNote]] = [:]
+        for note in appointments {
+            guard let raw = note.appointmentStartTime else { continue }
+            let day = String(raw.prefix(10))
+            if day > todayISO && day <= horizonISO {
+                grouped[day, default: []].append(note)
+            }
+        }
+        return grouped.keys.sorted().map { key in
+            (key, (grouped[key] ?? []).sorted {
+                ($0.appointmentStartTime ?? "") < ($1.appointmentStartTime ?? "")
+            })
+        }
+    }
+
     var body: some View {
         NavigationStack {
             ZStack(alignment: .bottomTrailing) {
@@ -242,6 +263,33 @@ struct TodayView: View {
                         symbol: BrainSymbols.location,
                         // Web maps Appointments → `--section-later` (slate/zinc).
                         tint: BrainColors.slate.color
+                    )
+                }
+
+                // Upcoming appointments (tomorrow → horizon), grouped by day
+                // with the same relative-day subheaders as "Coming up". Lets
+                // the user see the week ahead — e.g. a synced training plan —
+                // instead of only today's appointments.
+                Section {
+                    if upcomingAppointmentDays.isEmpty {
+                        EmptySectionLine(text: "No appointments in the next \(TodayDate.comingUpDays) days.")
+                    } else {
+                        ForEach(upcomingAppointmentDays, id: \.date) { day in
+                            Text(TodayDate.relativeDayLabel(forISO: day.date))
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(.secondary)
+                                .textCase(.uppercase)
+                                .listRowBackground(Color.clear)
+                                .listRowSeparator(.hidden)
+                            ForEach(day.appointments, id: \.id) { AppointmentRow(note: $0) }
+                        }
+                    }
+                } header: {
+                    TodaySectionHeader(
+                        title: "Upcoming",
+                        symbol: BrainSymbols.comingUp,
+                        tint: BrainColors.slate.color,
+                        trailingNote: "next \(TodayDate.comingUpDays) days"
                     )
                 }
         }
