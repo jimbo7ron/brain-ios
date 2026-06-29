@@ -10,7 +10,7 @@
 //                                        into hermetic test mode (fake
 //                                        server, in-memory store,
 //                                        signed-in session).
-//   * `-uiTestingSeedTodo "<title>"`   — seeds an unassigned todo due
+//   * `-uiTestingSeedTodo "<title>"`   — seeds an inbox todo due
 //                                        today (so it lands in
 //                                        TodayView's "Due today"
 //                                        section).

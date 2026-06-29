@@ -340,7 +340,7 @@ struct SectionView: View {
     @Binding var isDoneTrayExpanded: Bool
     /// Invoked when the user submits inline-add text at the bottom of
     /// this section's open todos. The parent (`ProjectDetailView` /
-    /// `UnassignedDetailView`) owns the project context, so it threads
+    /// `InboxDetailView`) owns the project context, so it threads
     /// the project id + section slug onto the wire payload — the
     /// section block just hands up the raw user-typed text.
     var onInlineAdd: (String) -> Void

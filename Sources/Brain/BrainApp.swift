@@ -413,7 +413,7 @@ struct BrainApp: App {
     /// Two flag families are supported. Each consumes either one or
     /// two arguments:
     ///   * `-uiTestingSeedTodo "<title>"`                    — seed an
-    ///       unassigned todo due today (lands in TodayView's "Due
+    ///       inbox todo due today (lands in TodayView's "Due
     ///       today" section), with a server-assigned UUID.
     ///   * `-uiTestingSeedTodoWithID "<title>" "<uuid>"`     — seed
     ///       with a deterministic id so the UI test can locate the

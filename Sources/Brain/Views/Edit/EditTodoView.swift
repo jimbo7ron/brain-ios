@@ -13,7 +13,7 @@
 //     because the server stores due_date as a flexible string and we
 //     want to preserve that latitude on iOS too.
 //   * Priority (segmented: Low / Medium / High).
-//   * Project (picker, with "Unassigned" sentinel).
+//   * Project (picker, with "Inbox" sentinel).
 //   * Section (segmented: drawn from the selected project's sections,
 //     or DEFAULT_SECTIONS — Now/Next/Later — when no project is set).
 //   * URL (single-line text — server resolves GitHub PR/issue metadata
@@ -151,10 +151,10 @@ struct EditTodoView: View {
     @State private var notes: String = ""
     @State private var dueDate: String = ""
     @State private var priority: String = "medium"
-    /// Project id, or `"unassigned"` for "no project". Matches the
+    /// Project id, or `"inbox"` for "no project". Matches the
     /// server's sentinel — see `NoteUpdate.project` in
     /// `brain/src/brain/schemas.py`.
-    @State private var projectId: String = "unassigned"
+    @State private var projectId: String = "inbox"
     @State private var sectionSlug: String = "now"
     @State private var url: String = ""
 
@@ -182,7 +182,7 @@ struct EditTodoView: View {
     /// to the canonical Now/Next/Later trio when no project is picked
     /// (matches the web dialog's behaviour).
     private var sectionOptions: [(slug: String, name: String)] {
-        if projectId == "unassigned" {
+        if projectId == "inbox" {
             return defaultSectionOptions
         }
         guard let project = projects.first(where: { $0.id == projectId }) else {
@@ -298,7 +298,7 @@ struct EditTodoView: View {
     private var organisationSection: some View {
         Section("Project") {
             Picker("Project", selection: $projectId) {
-                Text("— Inbox —").tag("unassigned")
+                Text("— Inbox —").tag("inbox")
                 ForEach(projects, id: \.id) { project in
                     Text(project.name).tag(project.id)
                 }
@@ -385,7 +385,7 @@ struct EditTodoView: View {
         notes = split.notes
         dueDate = note.dueDate ?? ""
         priority = note.priority
-        projectId = note.projectId ?? "unassigned"
+        projectId = note.projectId ?? "inbox"
         sectionSlug = note.section ?? "now"
         url = note.url ?? ""
     }
@@ -443,7 +443,7 @@ struct EditTodoView: View {
         if priority != note.priority {
             fields.priority = priority
         }
-        let currentProject = note.projectId ?? "unassigned"
+        let currentProject = note.projectId ?? "inbox"
         if projectId != currentProject {
             fields.projectId = projectId
         }
