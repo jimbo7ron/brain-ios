@@ -143,7 +143,7 @@ struct UnassignedDetailView: View {
                 // button so the user can capture rapidly without
                 // summoning a sheet for one line of text.
                 InlineAddRow(
-                    placeholder: "Add to Unassigned",
+                    placeholder: "Add to Inbox",
                     accessibilityIdentifier: "unassigned.inline-add",
                     onCommit: { rawText in
                         createTodoInline(content: rawText)
@@ -175,7 +175,7 @@ struct UnassignedDetailView: View {
         // as compact chrome rather than full-height entries.
         .listSectionSpacing(.compact)
         .environment(\.defaultMinListRowHeight, 32)
-        .navigationTitle("Unassigned")
+        .navigationTitle("Inbox")
         .navigationBarTitleDisplayMode(.large)
         .refreshable {
             // PTR pulls the freshly-created row through the sync
