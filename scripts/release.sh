@@ -25,6 +25,15 @@
 
 set -euo pipefail
 
+# Put the system bin ahead of Homebrew. Xcode's `-exportArchive`
+# IPA-packaging step shells out to `rsync -E` (extended attributes);
+# `/usr/bin/rsync` is Apple's openrsync, which understands it, but a
+# Homebrew rsync 3.x earlier in PATH gets picked up for the spawned
+# peer process and rejects `--extended-attributes` ("unknown option"),
+# failing the export with a cryptic "Copy failed". Prepending /usr/bin
+# makes both ends resolve to openrsync.
+export PATH="/usr/bin:$PATH"
+
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
