@@ -239,7 +239,7 @@ struct UpdateNotePayload: Encodable, Hashable {
     var dueDate: String?
     /// "low" | "medium" | "high".
     var priority: String?
-    /// Project name, short id, or `"unassigned"` to clear.
+    /// Project name, short id, or `"inbox"` to clear.
     var project: String?
     /// Section slug.
     var section: String?
@@ -357,7 +357,7 @@ struct CreateProjectPayload: Encodable, Hashable {
 ///     interprets it as a clear (or leaves the field alone, depending
 ///     on the field — see `NoteUpdate` in
 ///     `brain/src/brain/schemas.py`).
-///   * `projectId: "unassigned"` is the wire-side clear sentinel.
+///   * `projectId: "inbox"` is the wire-side clear sentinel.
 /// A unified sentinel design (e.g. an explicit `.clear` enum case) is
 /// out of scope for Wave 1 — see TODO(M45 Wave 3) below.
 struct NoteUpdateFields: Hashable {
@@ -372,7 +372,7 @@ struct NoteUpdateFields: Hashable {
     var dueDate: String?
     /// "low" | "medium" | "high".
     var priority: String?
-    /// Project name, short id, or `"unassigned"` to clear.
+    /// Project name, short id, or `"inbox"` to clear.
     var projectId: String?
     /// Section slug.
     var section: String?
@@ -384,7 +384,7 @@ struct NoteUpdateFields: Hashable {
     var endTime: String?
     var location: String?
     // TODO(M45 Wave 3): unify nullable-update semantics — replace the
-    // current mix of "none" / "" / "unassigned" sentinels with a typed
+    // current mix of "none" / "" / "inbox" sentinels with a typed
     // `Optional<Optional<T>>` (`.some(nil)` = clear, `.none` = leave
     // alone) or a per-field `.clear` enum. Wave 1 keeps the existing
     // sentinel mix to match `UpdateNotePayload` 1:1; Wave 3's typed

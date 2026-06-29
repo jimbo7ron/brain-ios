@@ -12,8 +12,8 @@
 //   * the queue holds a matching `.createTodo` / `.createProject` row
 //     keyed on the same client UUID
 //   * the status store has a `.pending` entry for that id
-//   * projectId / section / "unassigned" sentinel mapping match the
-//     spec (UnassignedDetailView in particular threads the sentinel
+//   * projectId / section / "inbox" sentinel mapping match the
+//     spec (InboxDetailView in particular threads the sentinel
 //     through to a local `nil` — see `NoteRepository.create`'s
 //     `resolvedProjectID` resolution)
 //
@@ -215,16 +215,16 @@ final class ViewMigrationTests: XCTestCase {
         XCTAssertEqual(queueRows.first?.op, MutationOp.createTodo.rawValue)
     }
 
-    // MARK: - UnassignedDetailView migration
+    // MARK: - InboxDetailView migration
 
-    /// Mirrors `UnassignedDetailView.createTodoInline(content:)` post-
-    /// migration. The view threads `"unassigned"` (the server-side
+    /// Mirrors `InboxDetailView.createTodoInline(content:)` post-
+    /// migration. The view threads `"inbox"` (the server-side
     /// clear sentinel) as the wire payload's `project`. The
     /// repository must surface this locally as `projectId == nil` so
-    /// the unassigned bucket's `@Query` (`projectId == nil`) picks
+    /// the inbox bucket's `@Query` (`projectId == nil`) picks
     /// the row up — if the literal sentinel string survived into
     /// SwiftData, the row would orphan into "neither bucket".
-    func testUnassignedDetailView_inlineAddSurfacesAsNilProjectIDLocally() throws {
+    func testInboxDetailView_inlineAddSurfacesAsNilProjectIDLocally() throws {
         let f = try makeNoteFixture()
 
         let payload = CreateNotePayload(
@@ -235,7 +235,7 @@ final class ViewMigrationTests: XCTestCase {
             dueTime: nil,
             priority: nil,
             recurrence: nil,
-            project: ProjectListView.unassignedProjectID,
+            project: ProjectListView.inboxProjectID,
             section: nil,
             url: nil,
             startTime: nil,
@@ -245,10 +245,10 @@ final class ViewMigrationTests: XCTestCase {
 
         let stub = f.repo.create(payload)
 
-        // The "unassigned" sentinel goes out on the wire (the queue
+        // The "inbox" sentinel goes out on the wire (the queue
         // row's payload should still carry it so the server clears
         // `project_id` to NULL) but locally surfaces as nil so the
-        // Unassigned @Query picks the row up.
+        // Inbox @Query picks the row up.
         XCTAssertNil(stub.projectId)
 
         let queueRows = try f.queue.debugModelContext.fetch(
@@ -260,7 +260,7 @@ final class ViewMigrationTests: XCTestCase {
         // to leak into the bytes the queue replays.
         let body = try XCTUnwrap(queueRows.first?.payload)
         let decoded = try JSONDecoder().decode(WireCreateNote.self, from: body)
-        XCTAssertEqual(decoded.project, "unassigned")
+        XCTAssertEqual(decoded.project, "inbox")
     }
 
     // MARK: - NewProjectView migration
@@ -306,8 +306,8 @@ final class ViewMigrationTests: XCTestCase {
 }
 
 /// Small Decodable mirror of the wire shape used by
-/// `testUnassignedDetailView_inlineAddSurfacesAsNilProjectIDLocally`
-/// to assert the "unassigned" sentinel survives into the queue
+/// `testInboxDetailView_inlineAddSurfacesAsNilProjectIDLocally`
+/// to assert the "inbox" sentinel survives into the queue
 /// payload. `CreateNotePayload` itself is `Encodable`-only so we use
 /// this private decoder shape for the round-trip.
 private struct WireCreateNote: Decodable {

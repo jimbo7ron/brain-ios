@@ -1,9 +1,9 @@
-// UnassignedDetailView.swift
+// InboxDetailView.swift
 // brain-ios
 //
-// Detail surface for the synthetic "Unassigned" virtual project.
+// Detail surface for the synthetic "Inbox" virtual project.
 // Mirrors `web/src/app/projects/[id]/page.tsx` lines 30-33, where the
-// route param `unassigned` is special-cased to render todos with no
+// route param `inbox` is special-cased to render todos with no
 // `project_id`. The brain server treats the same string as a sentinel
 // for `WHERE project_id IS NULL` (`src/brain/server.py:1722-1723,
 // 1751`), so the iOS surface stays in sync with the same backing
@@ -14,7 +14,7 @@
 //   1. There's no `LocalProject` to bind — the row's data is "the
 //      complement of all projects", which a `@Query` filter expresses
 //      naturally but a `@Bindable var project` cannot.
-//   2. Unassigned doesn't have user-defined sections. The web renders
+//   2. Inbox doesn't have user-defined sections. The web renders
 //      it as a single flat list, so we do the same here — no Now /
 //      Next / Later split, no per-section "+" affordances. The
 //      simpler shape reads better on a phone.
@@ -22,10 +22,10 @@
 //      (no name, no color, no sections), so the toolbar drops the
 //      Edit button that `ProjectDetailView` carries. The long-press
 //      Archive / Edit menu is also absent on the sidebar row — see
-//      `ProjectListView.UnassignedRow`.
+//      `ProjectListView.InboxRow`.
 //
-// Add affordance: a "+ Add to Unassigned" button presents
-// `QuickAddView` with `projectID: "unassigned"`, threading the
+// Add affordance: a "+ Add to Inbox" button presents
+// `QuickAddView` with `projectID: "inbox"`, threading the
 // sentinel through to the server's create path so the new todo lands
 // with NULL `project_id`. Edit / complete on existing rows continue
 // to work via the M40 dialog and M36 toggle.
@@ -34,7 +34,7 @@ import SwiftData
 import SwiftUI
 
 @MainActor
-struct UnassignedDetailView: View {
+struct InboxDetailView: View {
 
     @Environment(\.syncEngine) private var syncEngine
     /// M45 Wave 2: inline-add now goes through `NoteRepository`. The
@@ -51,7 +51,7 @@ struct UnassignedDetailView: View {
     /// (the macro chokes on 3+ conditions when one operand is an
     /// `Optional` field). Sort is applied in Swift too so the
     /// predicate stays trivial.
-    @Query(filter: UnassignedDetailView.todoPredicate)
+    @Query(filter: InboxDetailView.todoPredicate)
     private var todosRaw: [LocalNote]
 
     /// Minimal predicate the SwiftData macro can compile in
@@ -104,7 +104,7 @@ struct UnassignedDetailView: View {
     private var openCount: Int { openTodos.count }
     private var doneCount: Int { doneTodos.count }
 
-    /// Neutral grey accent, matching the sidebar row. Unassigned has
+    /// Neutral grey accent, matching the sidebar row. Inbox has
     /// no `LocalProject.color` to sample, so we deliberately render
     /// rows in the same secondary tint to read as "system bucket"
     /// rather than "user-coloured project".
@@ -124,7 +124,7 @@ struct UnassignedDetailView: View {
                     Text(inlineAddError)
                         .font(.caption2)
                         .foregroundStyle(.red)
-                        .accessibilityIdentifier("unassigned.inline-add.error")
+                        .accessibilityIdentifier("inbox.inline-add.error")
                         .listRowSeparator(.hidden)
                 }
             }
@@ -144,7 +144,7 @@ struct UnassignedDetailView: View {
                 // summoning a sheet for one line of text.
                 InlineAddRow(
                     placeholder: "Add to Inbox",
-                    accessibilityIdentifier: "unassigned.inline-add",
+                    accessibilityIdentifier: "inbox.inline-add",
                     onCommit: { rawText in
                         createTodoInline(content: rawText)
                     }
@@ -219,12 +219,12 @@ struct UnassignedDetailView: View {
 
     // MARK: - Inline add
 
-    /// Create a todo from inline-add text in the Unassigned bucket.
-    /// Threads the `"unassigned"` sentinel through as the `project`
+    /// Create a todo from inline-add text in the Inbox bucket.
+    /// Threads the `"inbox"` sentinel through as the `project`
     /// field — the server resolves this to `project_id = NULL` on
     /// insert (`src/brain/server.py:1858, 2032-2044`); the
     /// `NoteRepository` mirrors that locally by storing `nil` for
-    /// `projectId` so the new row lands in this Unassigned bucket's
+    /// `projectId` so the new row lands in this Inbox bucket's
     /// `@Query` (which filters on `projectId == nil`).
     ///
     /// M45 Wave 2: hands off to `NoteRepository.create(_:)` instead of
@@ -244,7 +244,7 @@ struct UnassignedDetailView: View {
             dueTime: parsed.dueTimeHHMM(),
             priority: parsed.priority?.rawValue,
             recurrence: parsed.recurrence?.rawValue,
-            project: ProjectListView.unassignedProjectID,
+            project: ProjectListView.inboxProjectID,
             section: nil,
             url: nil,
             startTime: nil,
@@ -288,7 +288,7 @@ struct UnassignedDetailView: View {
     }
 }
 
-// No #Preview — UnassignedDetailView relies on a SwiftData
+// No #Preview — InboxDetailView relies on a SwiftData
 // `@Query` which needs a `modelContainer` injected by the host
 // scene. Mirrors `ProjectDetailView`, which also omits a preview
 // for the same reason.

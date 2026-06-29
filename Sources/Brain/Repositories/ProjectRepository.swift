@@ -86,7 +86,7 @@ final class ProjectRepository {
     /// lands them locally. The optimistic local row therefore ships
     /// with an empty `sections` relationship — UI that depends on
     /// section presence (project detail screens) should fall back to
-    /// the unassigned bucket until the sync delivery completes.
+    /// the inbox bucket until the sync delivery completes.
     @discardableResult
     func create(_ payload: CreateProjectPayload) -> LocalProject {
         let clientID = UUID().uuidString.lowercased()

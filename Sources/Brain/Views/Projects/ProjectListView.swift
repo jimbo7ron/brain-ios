@@ -6,15 +6,15 @@
 // for the list shape and feeds into `ProjectDetailView`, which
 // mirrors `web/src/app/projects/[id]/page.tsx`.
 //
-// "Unassigned" virtual project (mirror web): adds an "Unassigned" row
+// "Inbox" virtual project (mirror web): adds an "Inbox" row
 // at the top of the sidebar, backed not by a `LocalProject` but by a
 // fan-out filter on `LocalNote.projectId == nil`. The literal string
-// `"unassigned"` in the navigation path resolves to
-// `UnassignedDetailView` rather than a real project lookup. The brain
-// server treats `project_id=unassigned` as a sentinel for
+// `"inbox"` in the navigation path resolves to
+// `InboxDetailView` rather than a real project lookup. The brain
+// server treats `project_id=inbox` as a sentinel for
 // `WHERE project_id IS NULL` (`src/brain/server.py:1722-1723, 1751`),
 // so the iOS surface stays in sync with the same data the web sidebar
-// reveals at `/projects/unassigned`.
+// reveals at `/projects/inbox`.
 //
 // Adaptive chrome: this view is built around `NavigationSplitView`
 // rather than `NavigationStack`, so on iPad we get a sidebar +
@@ -40,14 +40,14 @@ import SwiftUI
 @MainActor
 struct ProjectListView: View {
 
-    /// Sentinel string the navigation path uses for the "Unassigned"
+    /// Sentinel string the navigation path uses for the "Inbox"
     /// virtual project. Mirrors the URL slug the web uses
-    /// (`/projects/unassigned`) and the server's filter sentinel
-    /// (`?project_id=unassigned`). Kept as a `static let` so call
+    /// (`/projects/inbox`) and the server's filter sentinel
+    /// (`?project_id=inbox`). Kept as a `static let` so call
     /// sites — including the navigation destination branch and
-    /// `UnassignedDetailView`'s wire payload — share a single source
+    /// `InboxDetailView`'s wire payload — share a single source
     /// of truth.
-    static let unassignedProjectID: String = "unassigned"
+    static let inboxProjectID: String = "inbox"
 
     @Environment(\.syncEngine) private var syncEngine
 
@@ -82,34 +82,34 @@ struct ProjectListView: View {
     private var openProjectTodos: [LocalNote]
 
     /// Raw todo working set (just `type == "todo"`) — narrowed to
-    /// "open, non-archived, no project" in `openUnassignedTodos`
+    /// "open, non-archived, no project" in `openInboxTodos`
     /// below. Predicate is kept minimal because the SwiftData
     /// `#Predicate` macro under Xcode 26 times out on 4-condition AND
     /// forms with an optional comparison (`projectId == nil`); the
     /// remaining filters are cheap to apply in Swift over the small
     /// per-user dataset SwiftData publishes.
-    @Query(filter: ProjectListView.unassignedTodoPredicate)
-    private var openUnassignedTodosRaw: [LocalNote]
+    @Query(filter: ProjectListView.inboxTodoPredicate)
+    private var openInboxTodosRaw: [LocalNote]
 
-    private static let unassignedTodoPredicate: Predicate<LocalNote> = #Predicate { note in
+    private static let inboxTodoPredicate: Predicate<LocalNote> = #Predicate { note in
         note.type == "todo"
     }
 
-    /// Swift-narrowed Unassigned working set: open, non-archived,
+    /// Swift-narrowed Inbox working set: open, non-archived,
     /// no-project todos. Drives the open-count chip on the row.
     /// The row itself is rendered unconditionally (mirroring the web
-    /// sidebar's hardcoded `/projects/unassigned` link in
+    /// sidebar's hardcoded `/projects/inbox` link in
     /// `web/src/app/layout.tsx:39`), so we no longer gate visibility
     /// on this set being non-empty — discoverability matters more
     /// than a zero-count chip.
-    private var openUnassignedTodos: [LocalNote] {
-        openUnassignedTodosRaw.filter {
+    private var openInboxTodos: [LocalNote] {
+        openInboxTodosRaw.filter {
             !$0.completed && !$0.archived && $0.projectId == nil
         }
     }
 
-    /// Open-todo count surfaced on the synthetic "Unassigned" row.
-    private var unassignedOpenCount: Int { openUnassignedTodos.count }
+    /// Open-todo count surfaced on the synthetic "Inbox" row.
+    private var inboxOpenCount: Int { openInboxTodos.count }
 
     /// `projectId` → open-todo count. Rebuilt per render — cheap
     /// (linear scan over a small list) and SwiftUI's diffing means
@@ -170,9 +170,9 @@ struct ProjectListView: View {
     @ViewBuilder
     private var sidebar: some View {
         List(selection: $selectedProjectID) {
-            // "Unassigned" virtual project — always rendered at the
+            // "Inbox" virtual project — always rendered at the
             // top of the sidebar, matching the web's hardcoded
-            // `/projects/unassigned` link (`web/src/app/layout.tsx:39`).
+            // `/projects/inbox` link (`web/src/app/layout.tsx:39`).
             // QuickAdd-created undated/unprojected todos need a
             // permanent surface to land in regardless of current
             // count, so we never gate visibility. Kept deliberately
@@ -180,12 +180,12 @@ struct ProjectListView: View {
             // menu (Edit / Archive don't apply to a synthetic row),
             // and so it sits above real projects regardless of their
             // `sortOrder`.
-            NavigationLink(value: ProjectListView.unassignedProjectID) {
-                UnassignedRow(openTodoCount: unassignedOpenCount)
+            NavigationLink(value: ProjectListView.inboxProjectID) {
+                InboxRow(openTodoCount: inboxOpenCount)
             }
 
             if projects.isEmpty {
-                // Empty-state copy still renders below the Unassigned
+                // Empty-state copy still renders below the Inbox
                 // row when the user has no real projects — points
                 // them at the web for project creation (iOS create is
                 // a follow-up). Suppressed once the user has at least
@@ -277,13 +277,13 @@ struct ProjectListView: View {
             Text("“\(project.name)” will be moved to your archive. You can restore it from the web.")
         }
         .navigationDestination(for: String.self) { projectID in
-            // Branch on the literal `"unassigned"` sentinel before
+            // Branch on the literal `"inbox"` sentinel before
             // attempting a real project lookup — mirrors the web's
             // `/projects/[id]` route handler (see
             // `web/src/app/projects/[id]/page.tsx` lines 30-33) which
             // special-cases the same value.
-            if projectID == ProjectListView.unassignedProjectID {
-                UnassignedDetailView()
+            if projectID == ProjectListView.inboxProjectID {
+                InboxDetailView()
             } else if let project = projects.first(where: { $0.id == projectID }) {
                 // Resolve the id back into the live `LocalProject` so
                 // the detail view can subscribe to changes via
@@ -325,8 +325,8 @@ struct ProjectListView: View {
     /// branch is only reachable on regular-width layouts.
     @ViewBuilder
     private var detailPane: some View {
-        if selectedProjectID == ProjectListView.unassignedProjectID {
-            UnassignedDetailView()
+        if selectedProjectID == ProjectListView.inboxProjectID {
+            InboxDetailView()
         } else if let id = selectedProjectID,
                   let project = projects.first(where: { $0.id == id }) {
             ProjectDetailView(project: project)
@@ -340,15 +340,15 @@ struct ProjectListView: View {
     }
 }
 
-// MARK: - Unassigned row
+// MARK: - Inbox row
 
-/// Sidebar row for the synthetic "Unassigned" virtual project.
+/// Sidebar row for the synthetic "Inbox" virtual project.
 /// Visually distinct from `ProjectRow` (no color dot — there's no
 /// `LocalProject.color` to sample — and a tray icon instead) so the
 /// user reads it as a system-provided bucket rather than something
 /// they created. Open-todo count chip mirrors the real-project
 /// rendering for consistency.
-struct UnassignedRow: View {
+struct InboxRow: View {
 
     let openTodoCount: Int
 
@@ -374,7 +374,7 @@ struct UnassignedRow: View {
             }
         }
         .contentShape(Rectangle())
-        .accessibilityIdentifier("project-list.unassigned-row")
+        .accessibilityIdentifier("project-list.inbox-row")
     }
 }
 

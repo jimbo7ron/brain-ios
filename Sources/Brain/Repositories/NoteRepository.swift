@@ -84,7 +84,7 @@ final class NoteRepository {
     /// The optimistic stub's `projectId` only resolves cleanly when the
     /// payload's `project` is a UUID — server names ("Inbox") need a
     /// server-side resolution step that the next sync delivers.
-    /// "unassigned" is the server-side clear sentinel and surfaces
+    /// "inbox" is the server-side clear sentinel and surfaces
     /// locally as `nil`.
     @discardableResult
     func create(_ payload: CreateNotePayload) -> LocalNote {
@@ -102,7 +102,7 @@ final class NoteRepository {
         // doesn't introduce it.
         let resolvedProjectID: String? = {
             guard let project = payload.project else { return nil }
-            if project == "unassigned" { return nil }
+            if project == "inbox" { return nil }
             return UUID(uuidString: project) != nil ? project : nil
         }()
 
@@ -228,10 +228,10 @@ final class NoteRepository {
         }
         if let priority = fields.priority { note.priority = priority }
         if let projectId = fields.projectId {
-            // "unassigned" is the wire-side clear sentinel — surface
-            // locally as nil so the row falls into the Unassigned
+            // "inbox" is the wire-side clear sentinel — surface
+            // locally as nil so the row falls into the Inbox
             // bucket immediately.
-            if projectId == "unassigned" {
+            if projectId == "inbox" {
                 note.projectId = nil
             } else if UUID(uuidString: projectId) != nil {
                 note.projectId = projectId

@@ -32,7 +32,7 @@ enum BrainDebugEditDialogChecks {
         payload.title = "Ship migration"
         payload.dueDate = "2026-05-12"
         payload.priority = "high"
-        payload.project = "unassigned"
+        payload.project = "inbox"
         payload.section = "now"
         payload.url = "https://example.com"
 

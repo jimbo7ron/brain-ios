@@ -27,7 +27,7 @@ import SwiftUI
 
 /// Modal sheet that converts free-form text into a todo. Presented
 /// from the FAB on `TodayView`, from per-project surfaces (e.g. the
-/// "Unassigned" virtual project), and from the per-section "+" row on
+/// "Inbox" virtual project), and from the per-section "+" row on
 /// `ProjectDetailView` — each callsite threads a project id (and
 /// optionally a section slug) through the optional context init so
 /// the new todo lands in the right bucket without an extra round-trip.
@@ -48,7 +48,7 @@ struct QuickAddView: View {
 
     /// Optional project id to pre-fill on the wire payload. The
     /// server's `NoteCreate.project` field accepts either a project
-    /// name, a project id, or the literal sentinel `"unassigned"`
+    /// name, a project id, or the literal sentinel `"inbox"`
     /// (which clears any inferred project association). `nil` means
     /// "no project context — let the server's defaults apply"
     /// (Inbox-style capture from the Today FAB).
@@ -72,7 +72,7 @@ struct QuickAddView: View {
     /// Designated init. All three context parameters default to `nil`
     /// so existing callsites (the Today FAB) keep their previous
     /// behaviour — no project, no section, no caption. New callsites
-    /// pass `projectID: "unassigned"` (the Unassigned virtual project)
+    /// pass `projectID: "inbox"` (the Inbox virtual project)
     /// or a real project UUID (optionally with a section slug) to
     /// scope the capture.
     init(
@@ -220,7 +220,7 @@ struct QuickAddView: View {
     /// dance. The repository's `ModelContext` lives on the same
     /// `ModelContainer` as the SwiftUI environment context, so the
     /// `@Query` subscribers in `TodayView` / `ProjectDetailView` /
-    /// `UnassignedDetailView` pick up the new row in the next render
+    /// `InboxDetailView` pick up the new row in the next render
     /// pass — same UX as the open-coded path this replaces.
     ///
     /// M45 Wave 2: this used to do `modelContext.insert + save +
@@ -240,7 +240,7 @@ struct QuickAddView: View {
         // Wire-payload `project` — pass through the prefilled id verbatim.
         // The server resolves three cases:
         //   * `nil`            → leave any inferred association alone
-        //   * `"unassigned"`   → clear `project_id` to NULL (sentinel)
+        //   * `"inbox"`   → clear `project_id` to NULL (sentinel)
         //   * any UUID / name  → look up the project by id then by name
         // See `src/brain/server.py` lines 1858, 2032-2044 for the
         // create/update resolution path the server takes.

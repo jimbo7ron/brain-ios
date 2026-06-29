@@ -502,7 +502,7 @@ final class FakeBrainURLProtocol: URLProtocol {
             content: content,
             title: title,
             type: type,
-            projectID: (projectID == "unassigned") ? nil : projectID,
+            projectID: (projectID == "inbox") ? nil : projectID,
             section: section,
             dueDate: dueDate,
             completed: false
