@@ -51,6 +51,12 @@ struct ProjectListView: View {
 
     @Environment(\.syncEngine) private var syncEngine
 
+    /// Owns the optimistic archive flip + queue enqueue. Same handle the
+    /// `EditProjectView` "Advanced → Archived" toggle routes through, so
+    /// the long-press Archive action below is the exact same intent with
+    /// a faster path to it.
+    @Environment(\.projectRepository) private var projectRepository
+
     /// All non-archived projects, ordered by the server's `sortOrder`.
     /// `@Query` re-runs whenever SwiftData publishes a change, so the
     /// list refreshes immediately after the next sync writes a new
@@ -139,6 +145,14 @@ struct ProjectListView: View {
     /// thread through — the sheet always starts from a blank form.
     @State private var isCreatingProject: Bool = false
 
+    /// The project a long-press → Archive is about to soft-delete, held
+    /// while its confirmation dialog is up. `sheet(item:)`-style optional
+    /// so the dialog carries the row context; nil dismisses it. Archive
+    /// drops the project out of the `archived == false` query, so it
+    /// vanishes from the list — we confirm first to make that one tap
+    /// less surprising than the deliberate toggle-and-save in Edit.
+    @State private var projectToArchive: LocalProject?
+
     var body: some View {
         NavigationSplitView {
             sidebar
@@ -195,15 +209,17 @@ struct ProjectListView: View {
                     .accessibilityIdentifier("project-row-\(project.id)")
                     .contextMenu {
                         // M40 — long-press → Edit lands the
-                        // edit-project dialog. Archive remains a
-                        // placeholder (M41 wires `MutationOp.archive
-                        // Project` end-to-end).
-                        Button {
-                            // M41: archive flow
+                        // edit-project dialog. Archive routes through the
+                        // same `ProjectRepository.archive` the Edit
+                        // dialog's "Advanced → Archived" toggle uses;
+                        // it was a disabled placeholder until the repo
+                        // grew that entry point (M45 Wave 1).
+                        Button(role: .destructive) {
+                            projectToArchive = project
                         } label: {
                             Label("Archive", systemImage: BrainSymbols.archive)
                         }
-                        .disabled(true)
+                        .accessibilityIdentifier("project-row.archive-\(project.id)")
 
                         Button {
                             projectToEdit = project
@@ -238,6 +254,27 @@ struct ProjectListView: View {
         }
         .sheet(item: $projectToEdit) { project in
             EditProjectView(project: project)
+        }
+        .confirmationDialog(
+            "Archive Project",
+            isPresented: Binding(
+                get: { projectToArchive != nil },
+                set: { if !$0 { projectToArchive = nil } }
+            ),
+            presenting: projectToArchive
+        ) { project in
+            Button("Archive “\(project.name)”", role: .destructive) {
+                projectRepository?.archive(project)
+                projectToArchive = nil
+            }
+            .accessibilityIdentifier("project.archive-confirm")
+            Button("Cancel", role: .cancel) { projectToArchive = nil }
+        } message: { project in
+            // Archived projects drop out of the iOS list (the query is
+            // `archived == false`) and iOS has no archived-projects
+            // surface to reach them again, so be explicit that restore
+            // lives on the web.
+            Text("“\(project.name)” will be moved to your archive. You can restore it from the web.")
         }
         .navigationDestination(for: String.self) { projectID in
             // Branch on the literal `"unassigned"` sentinel before

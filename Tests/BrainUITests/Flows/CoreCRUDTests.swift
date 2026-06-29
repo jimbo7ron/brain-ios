@@ -259,4 +259,46 @@ final class CoreCRUDTests: XCTestCase {
         let drafts = app.staticTexts["Drafts"]
         XCTAssertTrue(drafts.awaitExistence(timeout: coldLaunchTimeout))
     }
+
+    /// Test 7 — Long-press a project → Archive, confirm, and assert the
+    /// row leaves the Projects list (the list query is `archived ==
+    /// false`, so an archived project drops out optimistically).
+    func testLongPressArchiveProject_removesFromList() {
+        let id = TestApp.TestID.sectionProj
+        let app = TestApp.launchSignedIn(
+            seedingProjectsWithIDs: [(name: "Throwaway", id: id)]
+        )
+
+        app.tabBars.buttons["Projects"].tap()
+
+        // Same cold-launch headroom as the section test — this is the
+        // other Projects-list flow that pays the first-launch + seed
+        // sync cost before the seeded row renders.
+        let coldLaunchTimeout: TimeInterval = 30
+
+        let name = app.staticTexts["Throwaway"]
+        XCTAssertTrue(name.awaitExistence(timeout: coldLaunchTimeout))
+
+        // Long-press the row to raise the context menu, then tap Archive.
+        name.press(forDuration: 1.0)
+
+        let archive = app.buttons["project-row.archive-\(id)"]
+        XCTAssertTrue(archive.awaitExistence(timeout: coldLaunchTimeout))
+        archive.tap()
+
+        // Confirm the destructive action in the confirmation dialog.
+        // `.firstMatch` because a `confirmationDialog` action-sheet
+        // button surfaces in more than one place in the query tree, so
+        // a bare identifier lookup is ambiguous ("multiple matching
+        // elements").
+        let confirm = app.buttons["project.archive-confirm"].firstMatch
+        XCTAssertTrue(confirm.awaitExistence(timeout: coldLaunchTimeout))
+        confirm.tap()
+
+        // The project should disappear from the list once archived.
+        XCTAssertTrue(
+            name.waitForNonExistence(timeout: coldLaunchTimeout),
+            "Archived project should leave the Projects list"
+        )
+    }
 }
