@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- App Store distribution. `destination: upload` makes
+	     `xcodebuild -exportArchive` push straight to App Store Connect,
+	     so there's no separate altool step. -->
+	<key>method</key>
+	<string>app-store-connect</string>
+	<key>destination</key>
+	<string>upload</string>
+
+	<!-- Xcode-managed signing: with `-allowProvisioningUpdates` and an
+	     App Store Connect API key, xcodebuild mints the Apple
+	     Distribution cert + provisioning profile on demand. -->
+	<key>signingStyle</key>
+	<string>automatic</string>
+	<key>teamID</key>
+	<string>XCHXTX3N92</string>
+
+	<!-- Symbols help App Store Connect symbolicate crash reports. -->
+	<key>uploadSymbols</key>
+	<true/>
+
+	<!-- We manage the build number in project.yml; don't let Xcode
+	     bump it out from under us. -->
+	<key>manageAppVersionAndBuildNumber</key>
+	<false/>
+</dict>
+</plist>
