@@ -108,6 +108,13 @@ user-facing releases (0.1.0 → 0.2.0).
 
 ## Releases
 
+- **v0.5.0 (build 5) — 2026-06-29** — long-press **Archive** on a
+  project. The Projects-list context menu's Archive action was a
+  disabled placeholder; it now routes through the same
+  `ProjectRepository.archive` the Edit dialog's "Advanced → Archived"
+  toggle uses, behind a confirmation dialog. Archived projects drop out
+  of the list optimistically (restore from the web) (PR #43). First
+  release shipped through the headless `scripts/release.sh` pipeline.
 - **v0.4.0 (build 4) — 2026-06-29** — failed-mutation recovery. The
   toolbar status pill's red "⚠ M" indicator is now tappable: it opens
   a **Failed changes** sheet listing each poisoned queue row (the
