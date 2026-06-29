@@ -96,15 +96,20 @@ brain-ios/
 The `.xcodeproj` is **not** committed — regenerate it with `xcodegen generate`
 whenever `project.yml` changes or when you first clone the repo.
 
-## TestFlight builds
+## Releasing / TestFlight
 
-Before each archive uploaded to App Store Connect, **bump
-`CURRENT_PROJECT_VERSION` in `project.yml`** (1 → 2 → 3 …) and re-run
-`xcodegen generate`. App Store Connect rejects uploads whose
-`(MARKETING_VERSION, CURRENT_PROJECT_VERSION)` pair has been seen
-before, so re-archiving without a bump fails with a duplicate-build
-error. `MARKETING_VERSION` only needs to change between
-user-facing releases (0.1.0 → 0.2.0).
+The whole archive + upload cycle is scripted and headless — see
+[`docs/RELEASE.md`](docs/RELEASE.md) for the full runbook (one-time
+signing setup, troubleshooting). The short version:
+
+```bash
+scripts/release.sh --version 0.6.0 --bump-build   # new user-facing version
+scripts/release.sh --bump-build                   # same version, next build
+```
+
+Always `--bump-build`: App Store Connect rejects an upload whose
+`(MARKETING_VERSION, CURRENT_PROJECT_VERSION)` pair it has already seen.
+`MARKETING_VERSION` only changes between user-facing releases.
 
 ## Releases
 

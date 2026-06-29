@@ -54,3 +54,6 @@ Brain.xcodeproj/
 # App Store Connect release secrets + local build artifacts
 scripts/.release.env
 build/
+
+# Local Claude Code worktrees (not shared)
+.claude/worktrees/
