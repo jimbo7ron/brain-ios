@@ -23,11 +23,11 @@ struct AppointmentRow: View {
     /// "10:00 AM – 11:00 AM" (or "10:00 – 11:00" depending on locale)
     /// if both ends present, "10:00 AM" if only the start, empty
     /// string if neither. Server emits naive
-    /// `yyyy-MM-dd'T'HH:mm:ss[.SSSSSS][Z]` timestamps; production
-    /// server is pinned to UTC (per roadmap M28), so we parse them
-    /// in UTC and render with `DateFormatter` in the user's current
-    /// locale + `TimeZone.current` — a 10:00 UTC appointment shows
-    /// as 11:00 in BST, 03:00 in PT, etc.
+    /// `yyyy-MM-dd'T'HH:mm:ss[.SSSSSS][Z]` timestamps that are
+    /// wall-clock/local time. `ServerDate` parses them in
+    /// `TimeZone.current` and we render with `DateFormatter` in the
+    /// user's current locale + `TimeZone.current`, so the wall-clock
+    /// value is shown unchanged (a 10:00 appointment reads as 10:00).
     private var timeRange: String {
         let start = formatClock(note.appointmentStartTime)
         let end = formatClock(note.appointmentEndTime)
@@ -47,8 +47,8 @@ struct AppointmentRow: View {
 
     /// Shared short-time formatter. Picks up the user's current
     /// locale and timezone automatically (e.g. "10:00 AM" in en_US,
-    /// "10:00" in en_GB) — `TimeZone.current` is the explicit
-    /// reminder that we're crossing the UTC → local boundary here.
+    /// "10:00" in en_GB). `TimeZone.current` matches the parser's zone
+    /// so the wall-clock value round-trips without an offset shift.
     private static let displayTimeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.timeStyle = .short

@@ -358,7 +358,7 @@ struct UnassignedRow: View {
                 .frame(width: 12, height: 12)
                 .foregroundStyle(.secondary)
 
-            Text("Unassigned")
+            Text("Inbox")
                 .font(.callout)
                 .lineLimit(1)
                 .truncationMode(.tail)

@@ -298,7 +298,7 @@ struct EditTodoView: View {
     private var organisationSection: some View {
         Section("Project") {
             Picker("Project", selection: $projectId) {
-                Text("— Unassigned —").tag("unassigned")
+                Text("— Inbox —").tag("unassigned")
                 ForEach(projects, id: \.id) { project in
                     Text(project.name).tag(project.id)
                 }
