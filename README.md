@@ -113,6 +113,12 @@ Always `--bump-build`: App Store Connect rejects an upload whose
 
 ## Releases
 
+- **v0.6.0 (build 7) — 2026-06-30** — rename the project-less todo
+  bucket **"Unassigned" → "Inbox"** throughout: the sidebar row, detail
+  view, and project picker now read "Inbox", and the type names
+  (`InboxDetailView`/`InboxRow`), identifiers, accessibility IDs, and the
+  `inbox` wire sentinel match. The server accepts the legacy `unassigned`
+  spelling for back-compat, so older installs keep working (PR #44, #45).
 - **v0.5.0 (build 5) — 2026-06-29** — long-press **Archive** on a
   project. The Projects-list context menu's Archive action was a
   disabled placeholder; it now routes through the same
