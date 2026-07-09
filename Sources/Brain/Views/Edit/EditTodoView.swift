@@ -433,8 +433,19 @@ struct EditTodoView: View {
         // server convention (and `NoteUpdateFields.dueDate` doc-comment).
         // An empty string from the user means the same thing — translate
         // to "none" so the wire shape is explicit.
+        // Resolve natural-language dates ("today", "this monday") to ISO
+        // before sending, mirroring the create path (QuickAddParser). The
+        // edit screen used to send the raw string, so "This Monday" reached
+        // the server verbatim and 400'd ("Could not parse due_date"). If the
+        // client can't parse it, fall back to the raw string and let the
+        // server be the final judge.
         let trimmedDue = dueDate.trimmingCharacters(in: .whitespaces)
-        let normalisedDue = trimmedDue.isEmpty ? "none" : trimmedDue
+        let normalisedDue: String
+        if trimmedDue.isEmpty {
+            normalisedDue = "none"
+        } else {
+            normalisedDue = QuickAddParser.resolveDueDateISO(trimmedDue) ?? trimmedDue
+        }
         let originalDue = (note.dueDate ?? "").trimmingCharacters(in: .whitespaces)
         if (originalDue.isEmpty && normalisedDue != "none") ||
            (!originalDue.isEmpty && normalisedDue != originalDue) {
