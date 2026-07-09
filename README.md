@@ -113,6 +113,14 @@ Always `--bump-build`: App Store Connect rejects an upload whose
 
 ## Releases
 
+- **v0.7.1 (build 9) — 2026-07-09** — **fix stuck "Failed changes".**
+  Editing a todo's due date to a natural-language phrase like "This
+  Monday" sent the raw text to the server, which rejected it with a 400
+  and the change stuck in the offline queue. The edit screen now resolves
+  the phrase to an ISO date before sending — the same step the quick-add
+  create path already did — and understands the "this &lt;weekday&gt;"
+  form. Paired with a server fix that also accepts "this &lt;weekday&gt;"
+  and stops 404ing Inbox-created todos (brain#48) (PR #47).
 - **v0.7.0 (build 8) — 2026-06-30** — **Upcoming appointments** on the
   Today view. The Today screen previously showed only appointments
   starting today; it now adds an "Upcoming" section listing the next 6
