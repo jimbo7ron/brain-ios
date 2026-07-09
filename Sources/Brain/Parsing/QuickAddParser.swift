@@ -385,6 +385,16 @@ enum QuickAddParser {
             }
         }
 
+        // `this monday` / `this mon` — the upcoming occurrence, same as a
+        // bare weekday (if today is that weekday it rolls to next week).
+        // Mirrors the server's `parse_date_string`.
+        if phrase.hasPrefix("this ") {
+            let rest = String(phrase.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+            if let target = weekdayIndex(forName: rest) {
+                return nextWeekdayOccurrence(after: startOfToday, target: target, skipNextWeek: false, calendar: calendar)
+            }
+        }
+
         // Bare weekday name — next occurrence (today counts as 7 days
         // out, not 0). Matches the server.
         if let target = weekdayIndex(forName: phrase) {
@@ -392,6 +402,26 @@ enum QuickAddParser {
         }
 
         return nil
+    }
+
+    /// Resolve a free-text due-date phrase ("today", "this monday",
+    /// "2026-05-12") to a `yyyy-MM-dd` string for the wire payload, or
+    /// `nil` if it can't be parsed. The edit screen uses this so a typed
+    /// natural-language date is resolved client-side before it reaches the
+    /// server — the create path already does this via `dueDateISO()`.
+    /// An already-ISO string round-trips unchanged.
+    static func resolveDueDateISO(_ text: String, now: Date = Date(), calendar: Calendar = .current) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty,
+              let date = resolveDatePhrase(trimmed, now: now, calendar: calendar) else {
+            return nil
+        }
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
     }
 
     /// Map a time fragment (`9am`, `15:00`, `9:30am`) to a `Date` whose
